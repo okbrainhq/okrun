@@ -8,6 +8,8 @@
 	<string>OkrunVM</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.okrun.vm</string>
+	<key>CFBundleIconFile</key>
+	<string>OkrunVM.png</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

@@ -260,6 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        installAppIcon()
         buildWindow()
 
         do {
@@ -284,6 +285,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         }
 
         return false
+    }
+
+    private func installAppIcon() {
+        guard let iconURL = Bundle.main.url(forResource: "OkrunVM", withExtension: "png"),
+              let icon = NSImage(contentsOf: iconURL) else {
+            return
+        }
+
+        NSApp.applicationIconImage = icon
     }
 
     private func buildWindow() {
