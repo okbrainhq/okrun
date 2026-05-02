@@ -245,6 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     private var window: NSWindow!
     private var vmView = VZVirtualMachineView()
     private var projectPopUp = NSPopUpButton()
+    private var createInstanceButton = NSButton(title: "New Instance", target: nil, action: nil)
     private var createProjectButton = NSButton(title: "New", target: nil, action: nil)
     private var deleteProjectButton = NSButton(title: "Delete", target: nil, action: nil)
     private var statusLabel = NSTextField(labelWithString: "Preparing")
@@ -278,13 +279,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        do {
-            try InstanceLauncher.spawnChild()
-        } catch {
-            setStatus("Launch failed", detail: error.localizedDescription)
+        if !flag {
+            window.makeKeyAndOrderFront(nil)
         }
 
-        return false
+        return true
     }
 
     private func installAppIcon() {
@@ -310,6 +309,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         projectPopUp.target = self
         projectPopUp.action = #selector(projectSelectionChanged)
         projectPopUp.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        createInstanceButton.target = self
+        createInstanceButton.action = #selector(createInstance)
+        createInstanceButton.bezelStyle = .rounded
+        configureButton(createInstanceButton, symbolName: "plus.square.on.square")
 
         createProjectButton.target = self
         createProjectButton.action = #selector(createProject)
@@ -349,6 +353,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
         topBar.spacing = 8
+        topBar.addArrangedSubview(createInstanceButton)
+        topBar.addArrangedSubview(makeSeparator())
         topBar.addArrangedSubview(projectPopUp)
         topBar.addArrangedSubview(createProjectButton)
         topBar.addArrangedSubview(deleteProjectButton)
@@ -656,6 +662,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         field.alignment = .right
         field.widthAnchor.constraint(equalToConstant: 80).isActive = true
         return field
+    }
+
+    @objc private func createInstance() {
+        do {
+            try InstanceLauncher.spawnChild()
+        } catch {
+            setStatus("Launch failed", detail: error.localizedDescription)
+        }
     }
 
     private func prepareStorage(paths: VMPaths, config: VMConfig) throws {
