@@ -1,6 +1,6 @@
 # Okrun VM
 
-Small native macOS Virtualization.framework app for running Debian projects.
+Small native macOS Virtualization.framework app for running Linux projects.
 
 ## Build
 
@@ -19,7 +19,7 @@ Small native macOS Virtualization.framework app for running Debian projects.
 An Okrun project is a directory that owns one VM:
 
 - `okrun-vm.json` is the project config.
-- `vm/debian.raw` is the sparse virtual disk.
+- `vm/linux.raw` is the sparse virtual disk.
 - `vm/efi.variables` is the EFI variable store.
 - `vm/machine.identifier` is the stable Virtualization.framework machine ID.
 
@@ -41,7 +41,7 @@ project folder.
   "cpuCount": 4,
   "memoryGB": 4,
   "diskGB": 64,
-  "installerISOPath": "/path/to/debian.iso"
+  "installerISOPath": "/path/to/linux.iso"
 }
 ```
 
@@ -50,7 +50,7 @@ automatically.
 
 ## Disk Resizing
 
-After increasing `diskGB`, Debian still needs its partition/filesystem expanded.
+After increasing `diskGB`, Linux still needs its partition/filesystem expanded.
 Check devices with:
 
 ```sh
@@ -66,10 +66,10 @@ sudo resize2fs /dev/vda2
 ```
 
 Shrinking must be done manually: shrink the guest filesystem and partition first,
-then shut down the VM and shrink `vm/debian.raw` on macOS with `truncate`.
+then shut down the VM and shrink `vm/linux.raw` on macOS with `truncate`.
 
 ## Memory Allocation
 
-`memoryGB` is the guest RAM size at VM startup. Debian sees a fixed amount of RAM.
-The app exposes a virtio balloon device so macOS and Debian can cooperate on
+`memoryGB` is the guest RAM size at VM startup. Linux sees a fixed amount of RAM.
+The app exposes a virtio balloon device so macOS and Linux can cooperate on
 memory reclaim under pressure, but idle memory does not instantly shrink.

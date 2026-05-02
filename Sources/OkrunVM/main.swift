@@ -50,14 +50,27 @@ private struct VMPaths {
 
     static func project(at root: URL) -> VMPaths {
         let vmDirectory = root.appendingPathComponent("vm", isDirectory: true)
+        let disk = preferredDisk(in: vmDirectory)
         return VMPaths(
             root: root,
             config: root.appendingPathComponent("okrun-vm.json"),
             vmDirectory: vmDirectory,
-            disk: vmDirectory.appendingPathComponent("debian.raw"),
+            disk: disk,
             efiStore: vmDirectory.appendingPathComponent("efi.variables"),
             machineIdentifier: vmDirectory.appendingPathComponent("machine.identifier")
         )
+    }
+
+    private static func preferredDisk(in vmDirectory: URL) -> URL {
+        let linuxDisk = vmDirectory.appendingPathComponent("linux.raw")
+        let legacyDisk = vmDirectory.appendingPathComponent("debian.raw")
+
+        if FileManager.default.fileExists(atPath: legacyDisk.path),
+           !FileManager.default.fileExists(atPath: linuxDisk.path) {
+            return legacyDisk
+        }
+
+        return linuxDisk
     }
 }
 
@@ -554,7 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     private func chooseInstallerISO() -> URL? {
         let panel = NSOpenPanel()
         panel.title = "Choose Installer ISO"
-        panel.message = "Select the Debian .iso file for this project."
+        panel.message = "Select the Linux .iso file for this project."
         panel.prompt = "Use ISO"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -755,7 +768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         do {
             if virtualMachine.canRequestStop {
                 try virtualMachine.requestStop()
-                setStatus("Shutdown requested", detail: "Waiting for Debian to shut down cleanly.")
+                setStatus("Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
                 return
             }
         } catch {
