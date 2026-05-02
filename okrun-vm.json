@@ -1,0 +1,6 @@
+{
+  "cpuCount" : 4,
+  "diskGB" : 64,
+  "installerISOPath" : null,
+  "memoryGB" : 4
+}

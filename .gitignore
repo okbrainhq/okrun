@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+._*
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+DerivedData/
+*.xcworkspace/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+xcuserdata/
+
+# Built app bundle
+OkrunVM.app/
+*.app/
+*.dSYM/
+
+# Local VM state
+vm/
+*.raw
+*.qcow2
+*.img
+*.vmdk
+*.variables
+*.iso
+
+# Local project registry and config copies
+.okrun
+okrun-vm.local.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.bak
