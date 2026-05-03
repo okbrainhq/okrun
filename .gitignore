@@ -28,6 +28,9 @@ vm/
 *.variables
 *.iso
 
+# E2E fixtures
+.e2e/
+
 # Local project registry and config copies
 .okrun
 okrun-vm.local.json

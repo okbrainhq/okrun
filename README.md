@@ -14,6 +14,24 @@ Small native macOS Virtualization.framework app for running Linux projects.
 ./scripts/run.sh
 ```
 
+## Test
+
+Run fast unit and integration-style tests:
+
+```sh
+swift test
+```
+
+Run the real headless VM boot E2E:
+
+```sh
+./scripts/e2e-headless-boot.sh
+```
+
+The E2E script downloads Alpine Linux aarch64 netboot artifacts into `.e2e/`,
+builds a tiny initramfs that prints `OKRUN_E2E_BOOTED`, builds the signed app,
+and boots that Linux image with Virtualization.framework headlessly.
+
 ## Projects
 
 An Okrun project is a directory that owns one VM:
