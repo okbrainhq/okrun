@@ -233,14 +233,14 @@ private final class GlassPanelView: NSVisualEffectView {
 }
 
 private final class RoundedContainerView: NSView {
-    init(cornerRadius: CGFloat = 24) {
+    init(cornerRadius: CGFloat = 20) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
         layer?.cornerRadius = cornerRadius
         layer?.cornerCurve = .continuous
-        layer?.masksToBounds = false
+        layer?.masksToBounds = true
         layer?.borderWidth = 1
         layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
     }
