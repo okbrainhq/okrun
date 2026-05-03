@@ -51,6 +51,53 @@ struct OkrunVMTests {
     }
 
     @Test
+    func vmConfigLoadsLegacyConfigWithoutSharedDirectories() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let configURL = project.appendingPathComponent("okrun-vm.json")
+        try Data("""
+        {
+          "cpuCount": 2,
+          "memoryGB": 3,
+          "diskGB": 20,
+          "installerISOPath": null
+        }
+        """.utf8).write(to: configURL)
+
+        let config = try VMConfig.load(from: configURL)
+
+        #expect(config.cpuCount == 2)
+        #expect(config.memoryGB == 3)
+        #expect(config.diskGB == 20)
+        #expect(config.installerISOPath == nil)
+        #expect(config.sharedDirectories == [])
+    }
+
+    @Test
+    func vmConfigSavesAndLoadsSharedDirectories() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let sharedDirectory = project.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(at: sharedDirectory, withIntermediateDirectories: true)
+
+        let configURL = project.appendingPathComponent("okrun-vm.json")
+        let config = VMConfig(
+            cpuCount: 6,
+            memoryGB: 8,
+            diskGB: 64,
+            installerISOPath: "/tmp/debian.iso",
+            sharedDirectories: [
+                SharedDirectoryConfig(name: "project", hostPath: sharedDirectory.path, readOnly: false)
+            ]
+        )
+        try config.save(to: configURL)
+
+        #expect(try VMConfig.load(from: configURL) == config)
+    }
+
+    @Test
     func vmConfigRejectsInvalidValues() {
         #expect(throws: (any Error).self) {
             try VMConfig(cpuCount: 0, memoryGB: 4, diskGB: 64, installerISOPath: nil).validated()
@@ -61,6 +108,78 @@ struct OkrunVMTests {
         #expect(throws: (any Error).self) {
             try VMConfig(cpuCount: 4, memoryGB: 4, diskGB: 0, installerISOPath: nil).validated()
         }
+    }
+
+    @Test
+    func vmConfigRejectsInvalidSharedDirectories() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let sharedDirectory = project.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(at: sharedDirectory, withIntermediateDirectories: true)
+        let fileURL = project.appendingPathComponent("not-a-directory")
+        try Data().write(to: fileURL)
+
+        #expect(throws: (any Error).self) {
+            try VMConfig(
+                cpuCount: 4,
+                memoryGB: 4,
+                diskGB: 64,
+                installerISOPath: nil,
+                sharedDirectories: [SharedDirectoryConfig(name: "", hostPath: sharedDirectory.path, readOnly: false)]
+            ).validated()
+        }
+        #expect(throws: (any Error).self) {
+            try VMConfig(
+                cpuCount: 4,
+                memoryGB: 4,
+                diskGB: 64,
+                installerISOPath: nil,
+                sharedDirectories: [
+                    SharedDirectoryConfig(name: "shared", hostPath: sharedDirectory.path, readOnly: false),
+                    SharedDirectoryConfig(name: "shared", hostPath: sharedDirectory.path, readOnly: true)
+                ]
+            ).validated()
+        }
+        #expect(throws: (any Error).self) {
+            try VMConfig(
+                cpuCount: 4,
+                memoryGB: 4,
+                diskGB: 64,
+                installerISOPath: nil,
+                sharedDirectories: [SharedDirectoryConfig(name: "missing", hostPath: project.appendingPathComponent("missing").path, readOnly: false)]
+            ).validated()
+        }
+        #expect(throws: (any Error).self) {
+            try VMConfig(
+                cpuCount: 4,
+                memoryGB: 4,
+                diskGB: 64,
+                installerISOPath: nil,
+                sharedDirectories: [SharedDirectoryConfig(name: "file", hostPath: fileURL.path, readOnly: false)]
+            ).validated()
+        }
+    }
+
+    @Test
+    func directorySharingDeviceFactoryBuildsVirtioFSDevice() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let writableDirectory = project.appendingPathComponent("writable", isDirectory: true)
+        let readOnlyDirectory = project.appendingPathComponent("readonly", isDirectory: true)
+        try FileManager.default.createDirectory(at: writableDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: readOnlyDirectory, withIntermediateDirectories: true)
+
+        let devices = try DirectorySharingDeviceFactory.makeDevices(for: [
+            SharedDirectoryConfig(name: "writable", hostPath: writableDirectory.path, readOnly: false),
+            SharedDirectoryConfig(name: "readonly", hostPath: readOnlyDirectory.path, readOnly: true)
+        ])
+
+        #expect(devices.count == 1)
+        let device = try #require(devices.first as? VZVirtioFileSystemDeviceConfiguration)
+        #expect(device.tag == SharedDirectoryValidator.tag)
+        #expect(device.share is VZMultipleDirectoryShare)
     }
 
     @Test

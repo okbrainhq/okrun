@@ -59,12 +59,98 @@ project folder.
   "cpuCount": 4,
   "memoryGB": 4,
   "diskGB": 64,
-  "installerISOPath": "/path/to/linux.iso"
+  "installerISOPath": "/path/to/linux.iso",
+  "sharedDirectories": [
+    {
+      "name": "projects",
+      "hostPath": "/Users/me/Projects",
+      "readOnly": false
+    },
+    {
+      "name": "downloads",
+      "hostPath": "/Users/me/Downloads",
+      "readOnly": true
+    }
+  ]
 }
 ```
 
 Increasing `diskGB` expands the raw disk file. Existing disks are not shrunk
 automatically.
+
+## Shared Directories
+
+`sharedDirectories` exposes Mac directories to the Linux VM with VirtioFS. Each
+entry needs a unique `name`, a Mac `hostPath`, and a `readOnly` flag.
+
+Start the VM, then mount the Okrun share inside Linux:
+
+```sh
+sudo mkdir -p /mnt/okrun
+sudo mount -t virtiofs okrun /mnt/okrun
+```
+
+Each configured directory appears below the mount point by name:
+
+```text
+/mnt/okrun/projects
+/mnt/okrun/downloads
+```
+
+Linux must have VirtioFS support available. Shared directories are mounted
+manually by default.
+
+### Mount on Boot with systemd
+
+To mount the Okrun share automatically on boot, create a systemd mount unit
+inside the Linux VM.
+
+1. Create the mount point:
+
+```sh
+sudo mkdir -p /mnt/okrun
+```
+
+2. Create `/etc/systemd/system/mnt-okrun.mount`:
+
+```sh
+sudo tee /etc/systemd/system/mnt-okrun.mount >/dev/null <<'EOF'
+[Unit]
+Description=Okrun shared directories
+
+[Mount]
+What=okrun
+Where=/mnt/okrun
+Type=virtiofs
+Options=defaults
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+The unit filename must match the mount path: `/mnt/okrun` becomes
+`mnt-okrun.mount`.
+
+3. Reload systemd and start the mount:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now mnt-okrun.mount
+```
+
+4. Confirm the shared directories are visible:
+
+```sh
+findmnt /mnt/okrun
+ls /mnt/okrun
+```
+
+To stop mounting it automatically:
+
+```sh
+sudo systemctl disable --now mnt-okrun.mount
+```
 
 ## Disk Resizing
 
