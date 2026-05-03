@@ -46,6 +46,7 @@ private struct VMPaths {
     let vmDirectory: URL
     let disk: URL
     let efiStore: URL
+    let installerEfiStore: URL
     let machineIdentifier: URL
 
     static func project(at root: URL) -> VMPaths {
@@ -57,6 +58,7 @@ private struct VMPaths {
             vmDirectory: vmDirectory,
             disk: disk,
             efiStore: vmDirectory.appendingPathComponent("efi.variables"),
+            installerEfiStore: vmDirectory.appendingPathComponent("installer.efi.variables"),
             machineIdentifier: vmDirectory.appendingPathComponent("machine.identifier")
         )
     }
@@ -271,6 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     private var virtualMachine: VZVirtualMachine?
     private var paths: VMPaths?
     private var vmConfig: VMConfig?
+    private var projectLockFD: Int32?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -289,6 +292,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        releaseProjectLock()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -678,6 +685,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     }
 
     @objc private func createInstance() {
+        guard registry.projects.count > 1 else {
+            setStatus("Only one project", detail: "Create another project before opening a second VM instance.")
+            return
+        }
+
         do {
             try InstanceLauncher.spawnChild()
         } catch {
@@ -786,6 +798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
             if let error {
                 self?.setStatus("Shutdown failed", detail: error.localizedDescription)
             } else {
+                self?.releaseProjectLock()
                 self?.virtualMachine = nil
                 self?.vmView.virtualMachine = nil
                 self?.setControlsEnabled(canStart: true, canStop: false)
@@ -806,6 +819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         }
 
         do {
+            try acquireProjectLock(paths: paths)
             let configuration = try makeConfiguration(paths: paths, config: vmConfig, mode: mode)
             let vm = VZVirtualMachine(configuration: configuration)
             vm.delegate = self
@@ -828,6 +842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
                     case .success:
                         self?.setStatus("Running", detail: self?.runtimeDetail("Mode: \(modeText)") ?? "")
                     case .failure(let error):
+                        self?.releaseProjectLock()
                         self?.virtualMachine = nil
                         self?.vmView.virtualMachine = nil
                         self?.setControlsEnabled(canStart: true, canStop: false)
@@ -836,9 +851,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
                 }
             }
         } catch {
+            releaseProjectLock()
             setControlsEnabled(canStart: true, canStop: false)
             setStatus("Configuration failed", detail: error.localizedDescription)
         }
+    }
+
+    private func acquireProjectLock(paths: VMPaths) throws {
+        guard projectLockFD == nil else { return }
+
+        try FileManager.default.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
+        let lockURL = paths.vmDirectory.appendingPathComponent("okrun.lock")
+        let fd = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+        guard fd >= 0 else {
+            throw AppError("Unable to create VM lock at \(lockURL.path).")
+        }
+
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            close(fd)
+            throw AppError("This project is already running in another Okrun VM instance: \(paths.root.path)")
+        }
+
+        projectLockFD = fd
+    }
+
+    private func releaseProjectLock() {
+        guard let fd = projectLockFD else { return }
+        flock(fd, LOCK_UN)
+        close(fd)
+        projectLockFD = nil
     }
 
     private func makeConfiguration(paths: VMPaths, config: VMConfig, mode: VMMode) throws -> VZVirtualMachineConfiguration {
@@ -849,7 +890,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         configuration.platform = platform
 
         let bootLoader = VZEFIBootLoader()
-        bootLoader.variableStore = VZEFIVariableStore(url: paths.efiStore)
+        bootLoader.variableStore = try makeEFIVariableStore(paths: paths, mode: mode)
         configuration.bootLoader = bootLoader
 
         configuration.cpuCount = min(config.cpuCount, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
@@ -865,6 +906,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
 
         try configuration.validate()
         return configuration
+    }
+
+    private func makeEFIVariableStore(paths: VMPaths, mode: VMMode) throws -> VZEFIVariableStore {
+        switch mode {
+        case .installed:
+            return VZEFIVariableStore(url: paths.efiStore)
+        case .installer:
+            let fileManager = FileManager.default
+            if fileManager.fileExists(atPath: paths.installerEfiStore.path) {
+                try fileManager.removeItem(at: paths.installerEfiStore)
+            }
+            return try VZEFIVariableStore(creatingVariableStoreAt: paths.installerEfiStore)
+        }
     }
 
     private func loadMachineIdentifier(from url: URL) throws -> VZGenericMachineIdentifier {
@@ -905,6 +959,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
 
     private func setControlsEnabled(canStart: Bool, canStop: Bool) {
         let hasProject = registry.selectedProject != nil
+        createInstanceButton.isEnabled = canStart && registry.projects.count > 1
         startInstallerButton.isEnabled = canStart && hasProject
         startInstalledButton.isEnabled = canStart && hasProject
         shutdownButton.isEnabled = canStop
@@ -920,6 +975,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         DispatchQueue.main.async { [weak self] in
+            self?.releaseProjectLock()
             self?.virtualMachine = nil
             self?.vmView.virtualMachine = nil
             self?.setControlsEnabled(canStart: true, canStop: false)
@@ -929,6 +985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         DispatchQueue.main.async { [weak self] in
+            self?.releaseProjectLock()
             self?.virtualMachine = nil
             self?.vmView.virtualMachine = nil
             self?.setControlsEnabled(canStart: true, canStop: false)
