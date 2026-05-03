@@ -35,12 +35,12 @@ private enum InstanceLauncher {
     }
 }
 
-private enum VMMode {
+enum VMMode {
     case installer(URL)
     case installed
 }
 
-private struct VMPaths {
+struct VMPaths {
     let root: URL
     let config: URL
     let vmDirectory: URL
@@ -76,18 +76,18 @@ private struct VMPaths {
     }
 }
 
-private struct ProjectRegistry: Codable {
+struct ProjectRegistry: Codable, Equatable {
     var selectedProject: String?
     var projects: [String]
 
     static let empty = ProjectRegistry(selectedProject: nil, projects: [])
 }
 
-private final class ProjectStore {
+final class ProjectStore {
     private let url: URL
 
-    init() {
-        url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".okrun")
+    init(url: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".okrun")) {
+        self.url = url
     }
 
     func load(defaultProject: URL?) throws -> ProjectRegistry {
@@ -181,7 +181,7 @@ private final class ProjectStore {
     }
 }
 
-private struct AppError: LocalizedError {
+struct AppError: LocalizedError {
     let message: String
 
     init(_ message: String) {
@@ -212,7 +212,7 @@ private final class DialogActions: NSObject {
     }
 }
 
-private struct VMConfig: Codable {
+struct VMConfig: Codable, Equatable {
     static let defaults = VMConfig(cpuCount: 4, memoryGB: 4, diskGB: 64, installerISOPath: nil)
 
     let cpuCount: Int
@@ -253,6 +253,55 @@ private struct VMConfig: Codable {
             throw AppError("diskGB must be greater than 0.")
         }
         return self
+    }
+}
+
+enum VMStorage {
+    static func prepare(paths: VMPaths, config: VMConfig) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
+
+        let configuredDiskSize = UInt64(config.diskGB) * 1024 * 1024 * 1024
+        if !fileManager.fileExists(atPath: paths.disk.path) {
+            fileManager.createFile(atPath: paths.disk.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: paths.disk)
+            try handle.truncate(atOffset: configuredDiskSize)
+            try handle.close()
+        } else {
+            let attributes = try fileManager.attributesOfItem(atPath: paths.disk.path)
+            let currentSize = attributes[.size] as? UInt64 ?? 0
+            if currentSize < configuredDiskSize {
+                let handle = try FileHandle(forWritingTo: paths.disk)
+                try handle.truncate(atOffset: configuredDiskSize)
+                try handle.close()
+            } else if currentSize > configuredDiskSize {
+                throw AppError("Existing disk is larger than diskGB in the config. Increase diskGB or move \(paths.disk.path).")
+            }
+        }
+
+        if !fileManager.fileExists(atPath: paths.efiStore.path) {
+            _ = try VZEFIVariableStore(creatingVariableStoreAt: paths.efiStore)
+        }
+
+        if !fileManager.fileExists(atPath: paths.machineIdentifier.path) {
+            let machineIdentifier = VZGenericMachineIdentifier()
+            try machineIdentifier.dataRepresentation.write(to: paths.machineIdentifier, options: .atomic)
+        }
+    }
+}
+
+enum EFIVariableStoreFactory {
+    static func make(paths: VMPaths, mode: VMMode) throws -> VZEFIVariableStore {
+        switch mode {
+        case .installed:
+            return VZEFIVariableStore(url: paths.efiStore)
+        case .installer:
+            let fileManager = FileManager.default
+            if fileManager.fileExists(atPath: paths.installerEfiStore.path) {
+                try fileManager.removeItem(at: paths.installerEfiStore)
+            }
+            return try VZEFIVariableStore(creatingVariableStoreAt: paths.installerEfiStore)
+        }
     }
 }
 
@@ -698,35 +747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     }
 
     private func prepareStorage(paths: VMPaths, config: VMConfig) throws {
-        let fileManager = FileManager.default
-        try fileManager.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
-
-        let configuredDiskSize = UInt64(config.diskGB) * 1024 * 1024 * 1024
-        if !fileManager.fileExists(atPath: paths.disk.path) {
-            fileManager.createFile(atPath: paths.disk.path, contents: nil)
-            let handle = try FileHandle(forWritingTo: paths.disk)
-            try handle.truncate(atOffset: configuredDiskSize)
-            try handle.close()
-        } else {
-            let attributes = try fileManager.attributesOfItem(atPath: paths.disk.path)
-            let currentSize = attributes[.size] as? UInt64 ?? 0
-            if currentSize < configuredDiskSize {
-                let handle = try FileHandle(forWritingTo: paths.disk)
-                try handle.truncate(atOffset: configuredDiskSize)
-                try handle.close()
-            } else if currentSize > configuredDiskSize {
-                throw AppError("Existing disk is larger than diskGB in the config. Increase diskGB or move \(paths.disk.path).")
-            }
-        }
-
-        if !fileManager.fileExists(atPath: paths.efiStore.path) {
-            _ = try VZEFIVariableStore(creatingVariableStoreAt: paths.efiStore)
-        }
-
-        if !fileManager.fileExists(atPath: paths.machineIdentifier.path) {
-            let machineIdentifier = VZGenericMachineIdentifier()
-            try machineIdentifier.dataRepresentation.write(to: paths.machineIdentifier, options: .atomic)
-        }
+        try VMStorage.prepare(paths: paths, config: config)
     }
 
     private func statusDetail(paths: VMPaths, config: VMConfig) -> String {
@@ -909,16 +930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     }
 
     private func makeEFIVariableStore(paths: VMPaths, mode: VMMode) throws -> VZEFIVariableStore {
-        switch mode {
-        case .installed:
-            return VZEFIVariableStore(url: paths.efiStore)
-        case .installer:
-            let fileManager = FileManager.default
-            if fileManager.fileExists(atPath: paths.installerEfiStore.path) {
-                try fileManager.removeItem(at: paths.installerEfiStore)
-            }
-            return try VZEFIVariableStore(creatingVariableStoreAt: paths.installerEfiStore)
-        }
+        try EFIVariableStoreFactory.make(paths: paths, mode: mode)
     }
 
     private func loadMachineIdentifier(from url: URL) throws -> VZGenericMachineIdentifier {

@@ -17,6 +17,13 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("Virtualization")
             ]
+        ),
+        .testTarget(
+            name: "OkrunVMTests",
+            dependencies: ["OkrunVM"],
+            linkerSettings: [
+                .linkedFramework("Virtualization")
+            ]
         )
     ]
 )
