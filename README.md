@@ -98,8 +98,59 @@ Each configured directory appears below the mount point by name:
 ```
 
 Linux must have VirtioFS support available. Shared directories are mounted
-manually for now; add an `/etc/fstab` or systemd mount entry inside the guest if
-you want the guest to mount them automatically on boot.
+manually by default.
+
+### Mount on Boot with systemd
+
+To mount the Okrun share automatically on boot, create a systemd mount unit
+inside the Linux VM.
+
+1. Create the mount point:
+
+```sh
+sudo mkdir -p /mnt/okrun
+```
+
+2. Create `/etc/systemd/system/mnt-okrun.mount`:
+
+```sh
+sudo tee /etc/systemd/system/mnt-okrun.mount >/dev/null <<'EOF'
+[Unit]
+Description=Okrun shared directories
+
+[Mount]
+What=okrun
+Where=/mnt/okrun
+Type=virtiofs
+Options=defaults
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+The unit filename must match the mount path: `/mnt/okrun` becomes
+`mnt-okrun.mount`.
+
+3. Reload systemd and start the mount:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now mnt-okrun.mount
+```
+
+4. Confirm the shared directories are visible:
+
+```sh
+findmnt /mnt/okrun
+ls /mnt/okrun
+```
+
+To stop mounting it automatically:
+
+```sh
+sudo systemctl disable --now mnt-okrun.mount
+```
 
 ## Disk Resizing
 
