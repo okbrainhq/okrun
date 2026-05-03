@@ -212,6 +212,54 @@ private final class DialogActions: NSObject {
     }
 }
 
+private final class GlassPanelView: NSVisualEffectView {
+    init(material: NSVisualEffectView.Material = .hudWindow, cornerRadius: CGFloat = 18) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        blendingMode = .withinWindow
+        self.material = material
+        state = .active
+        wantsLayer = true
+        layer?.cornerRadius = cornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+private final class RoundedContainerView: NSView {
+    init(cornerRadius: CGFloat = 20) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.cornerRadius = cornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+private extension NSToolbarItem.Identifier {
+    static let newInstance = NSToolbarItem.Identifier("OkrunVM.newInstance")
+    static let projectPicker = NSToolbarItem.Identifier("OkrunVM.projectPicker")
+    static let newProject = NSToolbarItem.Identifier("OkrunVM.newProject")
+    static let deleteProject = NSToolbarItem.Identifier("OkrunVM.deleteProject")
+    static let installer = NSToolbarItem.Identifier("OkrunVM.installer")
+    static let start = NSToolbarItem.Identifier("OkrunVM.start")
+    static let shutdown = NSToolbarItem.Identifier("OkrunVM.shutdown")
+}
+
 struct VMConfig: Codable, Equatable {
     static let defaults = VMConfig(cpuCount: 4, memoryGB: 4, diskGB: 64, installerISOPath: nil)
 
@@ -598,24 +646,20 @@ private final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NSToolbarItemValidation, VZVirtualMachineDelegate {
     private var window: NSWindow!
     private var vmView = VZVirtualMachineView()
-    private var projectPopUp = NSPopUpButton()
-    private var createInstanceButton = NSButton(title: "New Instance", target: nil, action: nil)
-    private var createProjectButton = NSButton(title: "New", target: nil, action: nil)
-    private var deleteProjectButton = NSButton(title: "Delete", target: nil, action: nil)
     private var statusLabel = NSTextField(labelWithString: "Preparing")
     private var detailsLabel = NSTextField(labelWithString: "")
-    private var startInstallerButton = NSButton(title: "Boot Installer", target: nil, action: nil)
-    private var startInstalledButton = NSButton(title: "Start", target: nil, action: nil)
-    private var shutdownButton = NSButton(title: "Shutdown", target: nil, action: nil)
     private let projectStore = ProjectStore()
     private var registry = ProjectRegistry.empty
     private var virtualMachine: VZVirtualMachine?
     private var paths: VMPaths?
     private var vmConfig: VMConfig?
     private var projectLockFD: Int32?
+    private var canStartControls = true
+    private var canStopControls = false
+    private weak var projectMenuButton: NSPopUpButton?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -661,87 +705,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
         content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 1).cgColor
 
         let root = NSStackView()
         root.orientation = .vertical
         root.spacing = 8
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        projectPopUp.target = self
-        projectPopUp.action = #selector(projectSelectionChanged)
-        projectPopUp.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        createInstanceButton.target = self
-        createInstanceButton.action = #selector(createInstance)
-        createInstanceButton.bezelStyle = .rounded
-        configureButton(createInstanceButton, symbolName: "plus.square.on.square")
-
-        createProjectButton.target = self
-        createProjectButton.action = #selector(createProject)
-        createProjectButton.bezelStyle = .rounded
-        configureButton(createProjectButton, symbolName: "plus")
-
-        deleteProjectButton.target = self
-        deleteProjectButton.action = #selector(deleteProject)
-        deleteProjectButton.bezelStyle = .rounded
-        configureButton(deleteProjectButton, symbolName: "trash")
-
         statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        statusLabel.alignment = .right
         detailsLabel.font = .systemFont(ofSize: 12, weight: .regular)
         detailsLabel.textColor = .secondaryLabelColor
         detailsLabel.lineBreakMode = .byWordWrapping
         detailsLabel.maximumNumberOfLines = 1
-
-        startInstallerButton.target = self
-        startInstallerButton.action = #selector(startInstaller)
-        startInstallerButton.bezelStyle = .rounded
-        configureButton(startInstallerButton, symbolName: "opticaldiscdrive")
-
-        startInstalledButton.target = self
-        startInstalledButton.action = #selector(startInstalled)
-        startInstalledButton.bezelStyle = .rounded
-        configureButton(startInstalledButton, symbolName: "play.fill")
-
-        shutdownButton.target = self
-        shutdownButton.action = #selector(shutdownVM)
-        shutdownButton.bezelStyle = .rounded
-        configureButton(shutdownButton, symbolName: "stop.fill")
+        detailsLabel.alignment = .right
 
         vmView.translatesAutoresizingMaskIntoConstraints = false
         vmView.capturesSystemKeys = true
-
-        let topBar = NSStackView()
-        topBar.orientation = .horizontal
-        topBar.alignment = .centerY
-        topBar.spacing = 8
-        topBar.addArrangedSubview(createInstanceButton)
-        topBar.addArrangedSubview(makeSeparator())
-        topBar.addArrangedSubview(projectPopUp)
-        topBar.addArrangedSubview(createProjectButton)
-        topBar.addArrangedSubview(deleteProjectButton)
-        topBar.addArrangedSubview(makeSeparator())
-        topBar.addArrangedSubview(startInstallerButton)
-        topBar.addArrangedSubview(startInstalledButton)
-        topBar.addArrangedSubview(shutdownButton)
 
         let statusRow = NSStackView()
         statusRow.orientation = .horizontal
         statusRow.alignment = .firstBaseline
         statusRow.spacing = 8
+        statusRow.translatesAutoresizingMaskIntoConstraints = false
         statusRow.addArrangedSubview(statusLabel)
         statusRow.addArrangedSubview(detailsLabel)
 
-        root.addArrangedSubview(topBar)
-        root.addArrangedSubview(statusRow)
-        root.addArrangedSubview(vmView)
+        let statusContainer = NSView()
+        statusContainer.translatesAutoresizingMaskIntoConstraints = false
+        statusContainer.addSubview(statusRow)
+
+        let vmContainer = RoundedContainerView()
+        vmContainer.addSubview(vmView)
+
+        root.addArrangedSubview(statusContainer)
+        root.addArrangedSubview(vmContainer)
         content.addSubview(root)
 
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            root.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-            root.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
-            root.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)
+            root.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            root.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            root.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            root.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            statusContainer.heightAnchor.constraint(equalToConstant: 24),
+            statusRow.trailingAnchor.constraint(equalTo: statusContainer.trailingAnchor),
+            statusRow.centerYAnchor.constraint(equalTo: statusContainer.centerYAnchor),
+            statusRow.leadingAnchor.constraint(greaterThanOrEqualTo: statusContainer.leadingAnchor),
+            vmContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 720),
+            vmContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 420),
+            vmView.leadingAnchor.constraint(equalTo: vmContainer.leadingAnchor),
+            vmView.trailingAnchor.constraint(equalTo: vmContainer.trailingAnchor),
+            vmView.topAnchor.constraint(equalTo: vmContainer.topAnchor),
+            vmView.bottomAnchor.constraint(equalTo: vmContainer.bottomAnchor)
         ])
 
         window = NSWindow(
@@ -750,9 +765,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
             backing: .buffered,
             defer: false
         )
+        window.minSize = NSSize(width: 820, height: 560)
         window.center()
         window.title = "Okrun VM"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = false
+        window.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 1)
         window.contentView = content
+        installToolbar()
         window.makeKeyAndOrderFront(nil)
 
         setControlsEnabled(canStart: true, canStop: false)
@@ -765,10 +785,173 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         return separator
     }
 
+    private func installToolbar() {
+        let toolbar = NSToolbar(identifier: "OkrunVM.mainToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        toolbar.showsBaselineSeparator = false
+
+        if #available(macOS 11.0, *) {
+            window.toolbarStyle = .unified
+            window.titlebarSeparatorStyle = .none
+        }
+
+        window.toolbar = toolbar
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [
+            .newInstance,
+            .flexibleSpace,
+            .flexibleSpace,
+            .projectPicker,
+            .newProject,
+            .deleteProject,
+            .space,
+            .installer,
+            .start,
+            .shutdown
+        ]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar)
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        switch itemIdentifier {
+        case .newInstance:
+            return makeToolbarItem(
+                itemIdentifier,
+                label: "New Instance",
+                symbolName: "plus.square.on.square",
+                action: #selector(createInstance)
+            )
+        case .projectPicker:
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "Project"
+            item.paletteLabel = "Project"
+            item.toolTip = "Select project"
+            let button = makeProjectMenuButton()
+            item.view = button
+            projectMenuButton = button
+            return item
+        case .newProject:
+            return makeToolbarItem(itemIdentifier, label: "New Project", symbolName: "plus", action: #selector(createProject))
+        case .deleteProject:
+            return makeToolbarItem(itemIdentifier, label: "Delete Project", symbolName: "trash", action: #selector(deleteProject))
+        case .installer:
+            return makeToolbarItem(itemIdentifier, label: "Boot Installer", symbolName: "opticaldiscdrive", action: #selector(startInstaller))
+        case .start:
+            return makeToolbarItem(itemIdentifier, label: "Start", symbolName: "play.fill", action: #selector(startInstalled))
+        case .shutdown:
+            return makeToolbarItem(itemIdentifier, label: "Shutdown", symbolName: "stop.fill", action: #selector(shutdownVM))
+        default:
+            return nil
+        }
+    }
+
+    private func makeToolbarItem(
+        _ identifier: NSToolbarItem.Identifier,
+        label: String,
+        symbolName: String,
+        action: Selector
+    ) -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.label = label
+        item.paletteLabel = label
+        item.toolTip = label
+        item.target = self
+        item.action = action
+        item.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
+        item.isBordered = true
+        return item
+    }
+
+    private func makeProjectMenuButton() -> NSPopUpButton {
+        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.target = self
+        button.action = #selector(projectMenuButtonChanged(_:))
+        button.controlSize = .regular
+        button.bezelStyle = .texturedRounded
+        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 136).isActive = true
+        button.widthAnchor.constraint(lessThanOrEqualToConstant: 190).isActive = true
+        populateProjectMenuButton(button)
+        return button
+    }
+
+    private func populateProjectMenuButton(_ button: NSPopUpButton) {
+        button.removeAllItems()
+
+        if registry.projects.isEmpty {
+            button.addItem(withTitle: "No Project")
+            button.isEnabled = false
+            return
+        }
+
+        for project in registry.projects {
+            let url = URL(fileURLWithPath: project, isDirectory: true)
+            let label = url.lastPathComponent.isEmpty ? project : url.lastPathComponent
+            button.addItem(withTitle: label)
+            button.lastItem?.representedObject = project
+        }
+
+        if let selected = registry.selectedProject,
+           let index = registry.projects.firstIndex(of: selected) {
+            button.selectItem(at: index)
+        }
+    }
+
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        let hasProject = registry.selectedProject != nil
+
+        switch item.itemIdentifier {
+        case .newInstance, .installer, .start:
+            return canStartControls && hasProject
+        case .projectPicker:
+            return canStartControls && !registry.projects.isEmpty
+        case .deleteProject:
+            return canStartControls && hasProject
+        case .newProject:
+            return !canStopControls
+        case .shutdown:
+            return canStopControls
+        default:
+            return true
+        }
+    }
+
+    private func makeGlassPanel(
+        containing child: NSView,
+        material: NSVisualEffectView.Material = .hudWindow,
+        horizontalInset: CGFloat,
+        verticalInset: CGFloat
+    ) -> NSView {
+        let panel = GlassPanelView(material: material)
+        panel.addSubview(child)
+
+        NSLayoutConstraint.activate([
+            child.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: horizontalInset),
+            child.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -horizontalInset),
+            child.topAnchor.constraint(equalTo: panel.topAnchor, constant: verticalInset),
+            child.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -verticalInset)
+        ])
+
+        return panel
+    }
+
     private func configureButton(_ button: NSButton, symbolName: String) {
         button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: button.title)
         button.imagePosition = .imageLeading
         button.imageHugsTitle = true
+        button.controlSize = .large
     }
 
     private func loadSelectedProject() throws {
@@ -792,34 +975,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     }
 
     private func refreshProjectMenu() {
-        projectPopUp.removeAllItems()
-
-        if registry.projects.isEmpty {
-            projectPopUp.addItem(withTitle: "No projects")
-            projectPopUp.isEnabled = false
-            return
+        if let projectMenuButton {
+            populateProjectMenuButton(projectMenuButton)
         }
-
-        for project in registry.projects {
-            let url = URL(fileURLWithPath: project, isDirectory: true)
-            let label = url.lastPathComponent.isEmpty ? project : url.lastPathComponent
-            projectPopUp.addItem(withTitle: label)
-            projectPopUp.lastItem?.representedObject = project
-        }
-
-        if let selected = registry.selectedProject,
-           let index = registry.projects.firstIndex(of: selected) {
-            projectPopUp.selectItem(at: index)
-        }
+        window?.toolbar?.validateVisibleItems()
     }
 
-    @objc private func projectSelectionChanged() {
+    @objc private func projectMenuButtonChanged(_ sender: NSPopUpButton) {
         guard virtualMachine == nil else {
             refreshProjectMenu()
             return
         }
 
-        guard let selected = projectPopUp.selectedItem?.representedObject as? String else {
+        guard let selected = sender.selectedItem?.representedObject as? String else {
             return
         }
 
@@ -930,15 +1098,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         var isoURL: URL?
         var result: NewProjectRequest?
 
-        let projectPath = NSTextField(labelWithString: "Not selected")
-        let isoPath = NSTextField(labelWithString: "Not selected")
+        let projectPath = makePathLabel("Not selected")
+        let isoPath = makePathLabel("Not selected")
         projectPath.lineBreakMode = .byTruncatingMiddle
         isoPath.lineBreakMode = .byTruncatingMiddle
-        projectPath.textColor = .secondaryLabelColor
-        isoPath.textColor = .secondaryLabelColor
 
         let projectButton = NSButton(title: "Choose...", target: nil, action: nil)
         let isoButton = NSButton(title: "Choose...", target: nil, action: nil)
+        projectButton.bezelStyle = .rounded
+        isoButton.bezelStyle = .rounded
+        projectButton.controlSize = .regular
+        isoButton.controlSize = .regular
+        configureButton(projectButton, symbolName: "folder")
+        configureButton(isoButton, symbolName: "opticaldisc")
         let cpuField = makeNumberField("4")
         let memoryField = makeNumberField("4")
         let diskField = makeNumberField("64")
@@ -948,50 +1120,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
             guard let url = self?.chooseProjectDirectory() else { return }
             projectURL = url
             projectPath?.stringValue = url.path
+            projectPath?.textColor = .labelColor
         }
         actions.onChooseISO = { [weak self, weak isoPath] in
             guard let url = self?.chooseInstallerISO() else { return }
             isoURL = url
             isoPath?.stringValue = url.path
+            isoPath?.textColor = .labelColor
         }
         projectButton.target = actions
         projectButton.action = #selector(DialogActions.chooseProject)
         isoButton.target = actions
         isoButton.action = #selector(DialogActions.chooseISO)
 
-        let subtitle = NSTextField(labelWithString: "Select where the project lives, the installer ISO, and the VM resources.")
+        let subtitle = NSTextField(labelWithString: "Select the project folder, installer ISO, and starter resources.")
         subtitle.font = .systemFont(ofSize: 12, weight: .regular)
         subtitle.textColor = .secondaryLabelColor
         subtitle.lineBreakMode = .byWordWrapping
         subtitle.maximumNumberOfLines = 2
+        subtitle.alignment = .center
 
         let grid = NSGridView(views: [
-            [NSTextField(labelWithString: "Project"), projectPath, projectButton],
-            [NSTextField(labelWithString: "ISO"), isoPath, isoButton],
-            [NSTextField(labelWithString: "CPU"), cpuField, NSView()],
-            [NSTextField(labelWithString: "Memory GB"), memoryField, NSView()],
-            [NSTextField(labelWithString: "Disk GB"), diskField, NSView()]
+            [makeFieldLabel("Project"), projectPath, projectButton],
+            [makeFieldLabel("ISO"), isoPath, isoButton],
+            [makeFieldLabel("CPU"), cpuField, NSView()],
+            [makeFieldLabel("Memory GB"), memoryField, NSView()],
+            [makeFieldLabel("Disk GB"), diskField, NSView()]
         ])
         grid.column(at: 0).xPlacement = .trailing
-        grid.column(at: 0).width = 90
-        grid.column(at: 1).width = 440
-        grid.column(at: 2).width = 90
-        grid.rowSpacing = 10
-        grid.columnSpacing = 12
+        grid.column(at: 0).width = 100
+        grid.column(at: 1).width = 420
+        grid.column(at: 2).width = 112
+        grid.rowSpacing = 12
+        grid.columnSpacing = 14
 
         let content = NSStackView(views: [subtitle, grid])
         content.orientation = .vertical
-        content.spacing = 14
+        content.spacing = 18
         content.translatesAutoresizingMaskIntoConstraints = false
 
-        let wrapper = NSView(frame: NSRect(x: 0, y: 0, width: 680, height: 170))
+        let wrapper = NSView(frame: NSRect(x: 0, y: 0, width: 680, height: 190))
         wrapper.addSubview(content)
 
         NSLayoutConstraint.activate([
             content.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor),
             content.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor),
-            content.topAnchor.constraint(equalTo: wrapper.topAnchor),
-            content.bottomAnchor.constraint(lessThanOrEqualTo: wrapper.bottomAnchor)
+            content.topAnchor.constraint(equalTo: wrapper.topAnchor, constant: 4),
+            content.bottomAnchor.constraint(lessThanOrEqualTo: wrapper.bottomAnchor, constant: -4)
         ])
 
         let alert = NSAlert()
@@ -1022,13 +1197,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     private func makeNumberField(_ value: String) -> NSTextField {
         let field = NSTextField(string: value)
         field.alignment = .right
+        field.controlSize = .large
+        field.font = .systemFont(ofSize: 13)
         field.widthAnchor.constraint(equalToConstant: 80).isActive = true
         return field
     }
 
+    private func makeFieldLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.textColor = .labelColor
+        label.alignment = .right
+        return label
+    }
+
+    private func makePathLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 13, weight: .regular)
+        label.textColor = .secondaryLabelColor
+        label.maximumNumberOfLines = 1
+        return label
+    }
+
     @objc private func createInstance() {
-        guard registry.projects.count > 1 else {
-            setStatus("Only one project", detail: "Create another project before opening a second VM instance.")
+        guard registry.selectedProject != nil else {
+            setStatus("No project selected", detail: "Create or select a project before opening a second VM instance.")
             return
         }
 
@@ -1265,14 +1458,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
     }
 
     private func setControlsEnabled(canStart: Bool, canStop: Bool) {
-        let hasProject = registry.selectedProject != nil
-        createInstanceButton.isEnabled = canStart && registry.projects.count > 1
-        startInstallerButton.isEnabled = canStart && hasProject
-        startInstalledButton.isEnabled = canStart && hasProject
-        shutdownButton.isEnabled = canStop
-        createProjectButton.isEnabled = !canStop
-        deleteProjectButton.isEnabled = canStart && hasProject
-        projectPopUp.isEnabled = canStart && !registry.projects.isEmpty
+        canStartControls = canStart
+        canStopControls = canStop
+        projectMenuButton?.isEnabled = canStart && !registry.projects.isEmpty
+        window?.toolbar?.validateVisibleItems()
     }
 
     private func setStatus(_ status: String, detail: String) {
