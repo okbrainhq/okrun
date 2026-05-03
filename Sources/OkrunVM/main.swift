@@ -1098,17 +1098,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         var isoURL: URL?
         var result: NewProjectRequest?
 
-        let projectPath = NSTextField(labelWithString: "Not selected")
-        let isoPath = NSTextField(labelWithString: "Not selected")
+        let projectPath = makePathLabel("Not selected")
+        let isoPath = makePathLabel("Not selected")
         projectPath.lineBreakMode = .byTruncatingMiddle
         isoPath.lineBreakMode = .byTruncatingMiddle
-        projectPath.textColor = .secondaryLabelColor
-        isoPath.textColor = .secondaryLabelColor
 
         let projectButton = NSButton(title: "Choose...", target: nil, action: nil)
         let isoButton = NSButton(title: "Choose...", target: nil, action: nil)
         projectButton.bezelStyle = .rounded
         isoButton.bezelStyle = .rounded
+        projectButton.controlSize = .regular
+        isoButton.controlSize = .regular
         configureButton(projectButton, symbolName: "folder")
         configureButton(isoButton, symbolName: "opticaldisc")
         let cpuField = makeNumberField("4")
@@ -1120,51 +1120,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             guard let url = self?.chooseProjectDirectory() else { return }
             projectURL = url
             projectPath?.stringValue = url.path
+            projectPath?.textColor = .labelColor
         }
         actions.onChooseISO = { [weak self, weak isoPath] in
             guard let url = self?.chooseInstallerISO() else { return }
             isoURL = url
             isoPath?.stringValue = url.path
+            isoPath?.textColor = .labelColor
         }
         projectButton.target = actions
         projectButton.action = #selector(DialogActions.chooseProject)
         isoButton.target = actions
         isoButton.action = #selector(DialogActions.chooseISO)
 
-        let subtitle = NSTextField(labelWithString: "Select where the project lives, the installer ISO, and the VM resources.")
+        let subtitle = NSTextField(labelWithString: "Select the project folder, installer ISO, and starter resources.")
         subtitle.font = .systemFont(ofSize: 12, weight: .regular)
         subtitle.textColor = .secondaryLabelColor
         subtitle.lineBreakMode = .byWordWrapping
         subtitle.maximumNumberOfLines = 2
+        subtitle.alignment = .center
 
         let grid = NSGridView(views: [
-            [NSTextField(labelWithString: "Project"), projectPath, projectButton],
-            [NSTextField(labelWithString: "ISO"), isoPath, isoButton],
-            [NSTextField(labelWithString: "CPU"), cpuField, NSView()],
-            [NSTextField(labelWithString: "Memory GB"), memoryField, NSView()],
-            [NSTextField(labelWithString: "Disk GB"), diskField, NSView()]
+            [makeFieldLabel("Project"), projectPath, projectButton],
+            [makeFieldLabel("ISO"), isoPath, isoButton],
+            [makeFieldLabel("CPU"), cpuField, NSView()],
+            [makeFieldLabel("Memory GB"), memoryField, NSView()],
+            [makeFieldLabel("Disk GB"), diskField, NSView()]
         ])
         grid.column(at: 0).xPlacement = .trailing
-        grid.column(at: 0).width = 90
-        grid.column(at: 1).width = 440
-        grid.column(at: 2).width = 90
-        grid.rowSpacing = 10
-        grid.columnSpacing = 12
+        grid.column(at: 0).width = 100
+        grid.column(at: 1).width = 420
+        grid.column(at: 2).width = 112
+        grid.rowSpacing = 12
+        grid.columnSpacing = 14
 
         let content = NSStackView(views: [subtitle, grid])
         content.orientation = .vertical
-        content.spacing = 14
+        content.spacing = 18
         content.translatesAutoresizingMaskIntoConstraints = false
 
-        let wrapper = GlassPanelView(material: .contentBackground, cornerRadius: 16)
-        wrapper.frame = NSRect(x: 0, y: 0, width: 680, height: 190)
+        let wrapper = NSView(frame: NSRect(x: 0, y: 0, width: 680, height: 190))
         wrapper.addSubview(content)
 
         NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor, constant: 16),
-            content.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -16),
-            content.topAnchor.constraint(equalTo: wrapper.topAnchor, constant: 16),
-            content.bottomAnchor.constraint(lessThanOrEqualTo: wrapper.bottomAnchor, constant: -16)
+            content.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor),
+            content.topAnchor.constraint(equalTo: wrapper.topAnchor, constant: 4),
+            content.bottomAnchor.constraint(lessThanOrEqualTo: wrapper.bottomAnchor, constant: -4)
         ])
 
         let alert = NSAlert()
@@ -1199,6 +1201,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         field.font = .systemFont(ofSize: 13)
         field.widthAnchor.constraint(equalToConstant: 80).isActive = true
         return field
+    }
+
+    private func makeFieldLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.textColor = .labelColor
+        label.alignment = .right
+        return label
+    }
+
+    private func makePathLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 13, weight: .regular)
+        label.textColor = .secondaryLabelColor
+        label.maximumNumberOfLines = 1
+        return label
     }
 
     @objc private func createInstance() {
