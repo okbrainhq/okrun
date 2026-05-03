@@ -219,6 +219,38 @@ struct VMConfig: Codable, Equatable {
     let memoryGB: Int
     let diskGB: Int
     let installerISOPath: String?
+    let sharedDirectories: [SharedDirectoryConfig]
+
+    enum CodingKeys: String, CodingKey {
+        case cpuCount
+        case memoryGB
+        case diskGB
+        case installerISOPath
+        case sharedDirectories
+    }
+
+    init(
+        cpuCount: Int,
+        memoryGB: Int,
+        diskGB: Int,
+        installerISOPath: String?,
+        sharedDirectories: [SharedDirectoryConfig] = []
+    ) {
+        self.cpuCount = cpuCount
+        self.memoryGB = memoryGB
+        self.diskGB = diskGB
+        self.installerISOPath = installerISOPath
+        self.sharedDirectories = sharedDirectories
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        cpuCount = try container.decode(Int.self, forKey: .cpuCount)
+        memoryGB = try container.decode(Int.self, forKey: .memoryGB)
+        diskGB = try container.decode(Int.self, forKey: .diskGB)
+        installerISOPath = try container.decodeIfPresent(String.self, forKey: .installerISOPath)
+        sharedDirectories = try container.decodeIfPresent([SharedDirectoryConfig].self, forKey: .sharedDirectories) ?? []
+    }
 
     static func load(from url: URL) throws -> VMConfig {
         let fileManager = FileManager.default
@@ -252,7 +284,65 @@ struct VMConfig: Codable, Equatable {
         guard diskGB > 0 else {
             throw AppError("diskGB must be greater than 0.")
         }
+        try SharedDirectoryValidator.validate(sharedDirectories)
         return self
+    }
+}
+
+struct SharedDirectoryConfig: Codable, Equatable {
+    let name: String
+    let hostPath: String
+    let readOnly: Bool
+}
+
+enum SharedDirectoryValidator {
+    static let tag = "okrun"
+
+    static func validate(_ sharedDirectories: [SharedDirectoryConfig]) throws {
+        var names = Set<String>()
+
+        for directory in sharedDirectories {
+            let name = directory.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else {
+                throw AppError("sharedDirectories name must not be empty.")
+            }
+            guard name.rangeOfCharacter(from: CharacterSet(charactersIn: "/:")) == nil else {
+                throw AppError("sharedDirectories name must not contain '/' or ':'.")
+            }
+            guard names.insert(name).inserted else {
+                throw AppError("sharedDirectories contains duplicate name '\(name)'.")
+            }
+
+            let url = URL(fileURLWithPath: directory.hostPath, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                throw AppError("Shared directory does not exist: \(url.path)")
+            }
+            guard isDirectory.boolValue else {
+                throw AppError("Shared directory path is not a directory: \(url.path)")
+            }
+        }
+
+        try VZVirtioFileSystemDeviceConfiguration.validateTag(tag)
+    }
+}
+
+enum DirectorySharingDeviceFactory {
+    static func makeDevices(for sharedDirectories: [SharedDirectoryConfig]) throws -> [VZDirectorySharingDeviceConfiguration] {
+        guard !sharedDirectories.isEmpty else { return [] }
+        try SharedDirectoryValidator.validate(sharedDirectories)
+
+        var directories: [String: VZSharedDirectory] = [:]
+        for directory in sharedDirectories {
+            let name = directory.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let url = URL(fileURLWithPath: directory.hostPath, isDirectory: true)
+            directories[name] = VZSharedDirectory(url: url, readOnly: directory.readOnly)
+        }
+
+        let share = VZMultipleDirectoryShare(directories: directories)
+        let device = VZVirtioFileSystemDeviceConfiguration(tag: SharedDirectoryValidator.tag)
+        device.share = share
+        return [device]
     }
 }
 
@@ -309,16 +399,20 @@ private final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     private let kernelURL: URL
     private let initialRamdiskURL: URL
     private let timeout: TimeInterval
-    private let expectedOutput = "OKRUN_E2E_BOOTED"
+    private let sharedDirectory: SharedDirectoryConfig?
+    private var expectedOutput: String {
+        sharedDirectory == nil ? "OKRUN_E2E_BOOTED" : "OKRUN_E2E_SHARED_DIRS_PASSED"
+    }
     private let completion = DispatchSemaphore(value: 0)
     private var virtualMachine: VZVirtualMachine?
     private var serialOutput = Data()
     private var result: Result<Void, Error>?
 
-    init(kernelURL: URL, initialRamdiskURL: URL, timeout: TimeInterval) {
+    init(kernelURL: URL, initialRamdiskURL: URL, timeout: TimeInterval, sharedDirectory: SharedDirectoryConfig?) {
         self.kernelURL = kernelURL
         self.initialRamdiskURL = initialRamdiskURL
         self.timeout = timeout
+        self.sharedDirectory = sharedDirectory
     }
 
     static func runIfRequested(arguments: [String] = CommandLine.arguments) -> Int32? {
@@ -329,7 +423,8 @@ private final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             let test = HeadlessBootTest(
                 kernelURL: options.kernel,
                 initialRamdiskURL: options.initialRamdisk,
-                timeout: options.timeout
+                timeout: options.timeout,
+                sharedDirectory: options.sharedDirectory
             )
             try test.run()
             print("Headless boot E2E passed: \(test.expectedOutput)")
@@ -350,10 +445,11 @@ private final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         return message
     }
 
-    private static func parseOptions(arguments: [String]) throws -> (kernel: URL, initialRamdisk: URL, timeout: TimeInterval) {
+    private static func parseOptions(arguments: [String]) throws -> (kernel: URL, initialRamdisk: URL, timeout: TimeInterval, sharedDirectory: SharedDirectoryConfig?) {
         var kernelPath: String?
         var initialRamdiskPath: String?
         var timeout: TimeInterval = 30
+        var sharedDirectoryPath: String?
         var iterator = arguments.dropFirst().makeIterator()
 
         while let argument = iterator.next() {
@@ -367,6 +463,8 @@ private final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                     throw AppError("--timeout must be a positive number of seconds.")
                 }
                 timeout = parsed
+            case "--shared-directory":
+                sharedDirectoryPath = iterator.next()
             default:
                 continue
             }
@@ -388,7 +486,11 @@ private final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             throw AppError("Initramfs does not exist: \(initialRamdisk.path)")
         }
 
-        return (kernel, initialRamdisk, timeout)
+        let sharedDirectory = sharedDirectoryPath.map {
+            SharedDirectoryConfig(name: "e2e", hostPath: $0, readOnly: false)
+        }
+
+        return (kernel, initialRamdisk, timeout, sharedDirectory)
     }
 
     private func run() throws {
@@ -450,6 +552,9 @@ private final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             fileHandleForWriting: serialOutput
         )
         configuration.serialPorts = [serialPort]
+        configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
+            for: sharedDirectory.map { [$0] } ?? []
+        )
 
         try configuration.validate()
         return configuration
@@ -970,7 +1075,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
                 cpuCount: vmConfig.cpuCount,
                 memoryGB: vmConfig.memoryGB,
                 diskGB: vmConfig.diskGB,
-                installerISOPath: iso.path
+                installerISOPath: iso.path,
+                sharedDirectories: vmConfig.sharedDirectories
             )
             try updatedConfig.save(to: paths.config)
             self.vmConfig = updatedConfig
@@ -1112,6 +1218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
         configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode)
+        configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(for: config.sharedDirectories)
 
         try configuration.validate()
         return configuration

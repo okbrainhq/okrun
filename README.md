@@ -59,12 +59,47 @@ project folder.
   "cpuCount": 4,
   "memoryGB": 4,
   "diskGB": 64,
-  "installerISOPath": "/path/to/linux.iso"
+  "installerISOPath": "/path/to/linux.iso",
+  "sharedDirectories": [
+    {
+      "name": "projects",
+      "hostPath": "/Users/me/Projects",
+      "readOnly": false
+    },
+    {
+      "name": "downloads",
+      "hostPath": "/Users/me/Downloads",
+      "readOnly": true
+    }
+  ]
 }
 ```
 
 Increasing `diskGB` expands the raw disk file. Existing disks are not shrunk
 automatically.
+
+## Shared Directories
+
+`sharedDirectories` exposes Mac directories to the Linux VM with VirtioFS. Each
+entry needs a unique `name`, a Mac `hostPath`, and a `readOnly` flag.
+
+Start the VM, then mount the Okrun share inside Linux:
+
+```sh
+sudo mkdir -p /mnt/okrun
+sudo mount -t virtiofs okrun /mnt/okrun
+```
+
+Each configured directory appears below the mount point by name:
+
+```text
+/mnt/okrun/projects
+/mnt/okrun/downloads
+```
+
+Linux must have VirtioFS support available. Shared directories are mounted
+manually for now; add an `/etc/fstab` or systemd mount entry inside the guest if
+you want the guest to mount them automatically on boot.
 
 ## Disk Resizing
 
