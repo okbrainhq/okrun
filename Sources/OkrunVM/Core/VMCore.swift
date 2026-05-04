@@ -11,9 +11,12 @@ struct VMPaths {
     let config: URL
     let vmDirectory: URL
     let disk: URL
+    let savedStateDisk: URL
     let efiStore: URL
+    let savedStateEfiStore: URL
     let installerEfiStore: URL
     let machineIdentifier: URL
+    let machineState: URL
 
     static func project(at root: URL) -> VMPaths {
         let vmDirectory = root.appendingPathComponent("vm", isDirectory: true)
@@ -23,9 +26,12 @@ struct VMPaths {
             config: root.appendingPathComponent("okrun-vm.json"),
             vmDirectory: vmDirectory,
             disk: disk,
+            savedStateDisk: vmDirectory.appendingPathComponent("machine-state.raw"),
             efiStore: vmDirectory.appendingPathComponent("efi.variables"),
+            savedStateEfiStore: vmDirectory.appendingPathComponent("efi.variables.machine-state"),
             installerEfiStore: vmDirectory.appendingPathComponent("installer.efi.variables"),
-            machineIdentifier: vmDirectory.appendingPathComponent("machine.identifier")
+            machineIdentifier: vmDirectory.appendingPathComponent("machine.identifier"),
+            machineState: vmDirectory.appendingPathComponent("machine.state")
         )
     }
 

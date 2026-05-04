@@ -50,8 +50,28 @@ private extension NSToolbarItem.Identifier {
     static let shutdown = NSToolbarItem.Identifier("OkrunVM.shutdown")
 }
 
+private enum RunningVMCloseAction {
+    case stop
+    case closeAnyway
+    case cancel
+}
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NSToolbarItemValidation, VZVirtualMachineDelegate {
+private final class CloseAlertButtonHandler: NSObject {
+    @objc func shutdown() {
+        NSApp.stopModal(withCode: .alertFirstButtonReturn)
+    }
+
+    @objc func closeAnyway() {
+        NSApp.stopModal(withCode: .alertSecondButtonReturn)
+    }
+
+    @objc func cancel() {
+        NSApp.stopModal(withCode: .alertThirdButtonReturn)
+    }
+}
+
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, NSToolbarItemValidation, VZVirtualMachineDelegate {
     private var window: NSWindow!
     private var vmView = VZVirtualMachineView()
     private var statusLabel = NSTextField(labelWithString: "Preparing")
@@ -64,6 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     private var projectLockFD: Int32?
     private var canStartControls = true
     private var canStopControls = false
+    private var isClosingAnyway = false
+    private var closeAlertHandler: CloseAlertButtonHandler?
     private weak var projectMenuButton: NSPopUpButton?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -85,6 +107,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         true
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard virtualMachine != nil, !isClosingAnyway else {
+            return .terminateNow
+        }
+
+        switch askBeforeClosingRunningVM() {
+        case .stop:
+            shutdownVM()
+            return .terminateCancel
+        case .closeAnyway:
+            isClosingAnyway = true
+            return .terminateNow
+        case .cancel:
+            return .terminateCancel
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         releaseProjectLock()
     }
@@ -95,6 +134,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         }
 
         return true
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard virtualMachine != nil, !isClosingAnyway else {
+            return true
+        }
+
+        switch askBeforeClosingRunningVM() {
+        case .stop:
+            shutdownVM()
+            return false
+        case .closeAnyway:
+            isClosingAnyway = true
+            return true
+        case .cancel:
+            return false
+        }
     }
 
     private func installAppIcon() {
@@ -177,6 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         window.titlebarAppearsTransparent = false
         window.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 1)
         window.contentView = content
+        window.delegate = self
         installToolbar()
         window.makeKeyAndOrderFront(nil)
 
@@ -500,6 +557,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         """
     }
 
+    private func askBeforeClosingRunningVM() -> RunningVMCloseAction {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 210),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "VM Running"
+        panel.isReleasedWhenClosed = false
+        panel.level = .modalPanel
+
+        let content = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView(image: NSImage(
+            systemSymbolName: "exclamationmark.triangle",
+            accessibilityDescription: "Warning"
+        ) ?? NSImage())
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .regular)
+        icon.contentTintColor = .systemYellow
+
+        let titleLabel = NSTextField(labelWithString: "The VM is still running")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+
+        let detailLabel = NSTextField(wrappingLabelWithString: """
+        Closing Okrun while the VM is running can stop guest services abruptly and may risk disk consistency.
+
+        Shutdown the VM first, keep Okrun running, or close anyway.
+        """)
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.font = .systemFont(ofSize: 13)
+        detailLabel.textColor = .secondaryLabelColor
+
+        let textStack = NSStackView(views: [titleLabel, detailLabel])
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 8
+
+        let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        let shutdownButton = NSButton(title: "Shutdown VM", target: nil, action: nil)
+        let closeAnywayButton = NSButton(title: "Close Anyway", target: nil, action: nil)
+
+        cancelButton.bezelStyle = .rounded
+        shutdownButton.bezelStyle = .rounded
+        closeAnywayButton.bezelStyle = .rounded
+        shutdownButton.keyEquivalent = "\r"
+        cancelButton.keyEquivalent = "\u{1b}"
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+
+        let buttonRow = NSStackView(views: [cancelButton, spacer, shutdownButton, closeAnywayButton])
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.spacing = 8
+
+        content.addSubview(icon)
+        content.addSubview(textStack)
+        content.addSubview(buttonRow)
+        panel.contentView = content
+
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            icon.topAnchor.constraint(equalTo: content.topAnchor, constant: 26),
+            icon.widthAnchor.constraint(equalToConstant: 32),
+            icon.heightAnchor.constraint(equalToConstant: 32),
+
+            textStack.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 16),
+            textStack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            textStack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
+
+            buttonRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            buttonRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            buttonRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            spacer.widthAnchor.constraint(greaterThanOrEqualToConstant: 20)
+        ])
+
+        cancelButton.action = #selector(CloseAlertButtonHandler.cancel)
+        shutdownButton.action = #selector(CloseAlertButtonHandler.shutdown)
+        closeAnywayButton.action = #selector(CloseAlertButtonHandler.closeAnyway)
+
+        let handler = CloseAlertButtonHandler()
+        cancelButton.target = handler
+        shutdownButton.target = handler
+        closeAnywayButton.target = handler
+        closeAlertHandler = handler
+
+        panel.center()
+        if let window {
+            panel.setFrameOrigin(NSPoint(
+                x: window.frame.midX - panel.frame.width / 2,
+                y: window.frame.midY - panel.frame.height / 2
+            ))
+        }
+
+        let response = NSApp.runModal(for: panel)
+        panel.close()
+        closeAlertHandler = nil
+
+        switch response {
+        case .alertFirstButtonReturn:
+            return .stop
+        case .alertSecondButtonReturn:
+            return .closeAnyway
+        default:
+            return .cancel
+        }
+    }
+
     @objc private func startInstaller() {
         guard let paths, let vmConfig else {
             setStatus("Not ready", detail: "No project is selected.")
@@ -592,12 +762,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             case .installed:
                 modeText = "installed system"
             }
+
             setStatus("Starting \(modeText)", detail: statusDetail(paths: paths, config: vmConfig))
 
             vm.start { [weak self] result in
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
+                        self?.setControlsEnabled(canStart: false, canStop: true)
                         self?.setStatus("Running", detail: self?.runtimeDetail("Mode: \(modeText)") ?? "")
                     case .failure(let error):
                         self?.releaseProjectLock()

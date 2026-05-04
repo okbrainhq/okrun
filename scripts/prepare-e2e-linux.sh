@@ -9,6 +9,7 @@ INITRAMFS="$FIXTURE_DIR/v3.18-initramfs-virt"
 BOOT_IMAGE="$FIXTURE_DIR/v3.18-Image"
 E2E_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e"
 E2E_SHARED_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-shared"
+E2E_SAVE_RESTORE_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-save-restore"
 
 mkdir -p "$FIXTURE_DIR"
 
@@ -73,6 +74,24 @@ chmod 0755 "$WORK_DIR/init"
 
 (cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_SHARED_INITRAMFS")
 
+cat > "$WORK_DIR/init" <<'EOF'
+#!/bin/sh
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+/bin/busybox mount -t proc proc /proc 2>/dev/null || true
+/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
+echo OKRUN_E2E_SAVE_RESTORE_BOOTED >/dev/console
+echo OKRUN_E2E_SAVE_RESTORE_BOOTED >/dev/hvc0 2>/dev/null || true
+/bin/busybox sleep 3
+echo OKRUN_E2E_SAVE_RESTORE_RESUMED >/dev/console
+echo OKRUN_E2E_SAVE_RESTORE_RESUMED >/dev/hvc0 2>/dev/null || true
+/bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+while true; do :; done
+EOF
+chmod 0755 "$WORK_DIR/init"
+
+(cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_SAVE_RESTORE_INITRAMFS")
+
 echo "$BOOT_IMAGE"
 echo "$E2E_INITRAMFS"
 echo "$E2E_SHARED_INITRAMFS"
+echo "$E2E_SAVE_RESTORE_INITRAMFS"

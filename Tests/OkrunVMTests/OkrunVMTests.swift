@@ -18,8 +18,11 @@ struct OkrunVMTests {
 
         #expect(paths.disk.lastPathComponent == "debian.raw")
         #expect(paths.config == project.appendingPathComponent("okrun-vm.json"))
+        #expect(paths.savedStateDisk == vmDirectory.appendingPathComponent("machine-state.raw"))
         #expect(paths.efiStore == vmDirectory.appendingPathComponent("efi.variables"))
+        #expect(paths.savedStateEfiStore == vmDirectory.appendingPathComponent("efi.variables.machine-state"))
         #expect(paths.installerEfiStore == vmDirectory.appendingPathComponent("installer.efi.variables"))
+        #expect(paths.machineState == vmDirectory.appendingPathComponent("machine.state"))
     }
 
     @Test
