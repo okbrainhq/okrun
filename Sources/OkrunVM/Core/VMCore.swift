@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Virtualization
 
 enum VMMode {
@@ -172,6 +173,7 @@ struct VMConfig: Codable, Equatable {
     let memoryGB: Int
     let diskGB: Int
     let installerISOPath: String?
+    let privateNetwork: PrivateNetworkConfig
     let sharedDirectories: [SharedDirectoryConfig]
 
     enum CodingKeys: String, CodingKey {
@@ -179,6 +181,7 @@ struct VMConfig: Codable, Equatable {
         case memoryGB
         case diskGB
         case installerISOPath
+        case privateNetwork
         case sharedDirectories
     }
 
@@ -187,12 +190,14 @@ struct VMConfig: Codable, Equatable {
         memoryGB: Int,
         diskGB: Int,
         installerISOPath: String?,
+        privateNetwork: PrivateNetworkConfig = .disabled,
         sharedDirectories: [SharedDirectoryConfig] = []
     ) {
         self.cpuCount = cpuCount
         self.memoryGB = memoryGB
         self.diskGB = diskGB
         self.installerISOPath = installerISOPath
+        self.privateNetwork = privateNetwork
         self.sharedDirectories = sharedDirectories
     }
 
@@ -202,6 +207,7 @@ struct VMConfig: Codable, Equatable {
         memoryGB = try container.decode(Int.self, forKey: .memoryGB)
         diskGB = try container.decode(Int.self, forKey: .diskGB)
         installerISOPath = try container.decodeIfPresent(String.self, forKey: .installerISOPath)
+        privateNetwork = try container.decodeIfPresent(PrivateNetworkConfig.self, forKey: .privateNetwork) ?? .disabled
         sharedDirectories = try container.decodeIfPresent([SharedDirectoryConfig].self, forKey: .sharedDirectories) ?? []
     }
 
@@ -237,8 +243,52 @@ struct VMConfig: Codable, Equatable {
         guard diskGB > 0 else {
             throw AppError("diskGB must be greater than 0.")
         }
+        try PrivateNetworkValidator.validate(privateNetwork)
         try SharedDirectoryValidator.validate(sharedDirectories)
         return self
+    }
+}
+
+struct PrivateNetworkConfig: Codable, Equatable {
+    static let disabled = PrivateNetworkConfig(enabled: false)
+    static let defaultIdentifier = "okrun"
+
+    let enabled: Bool
+    let identifier: String
+
+    init(enabled: Bool, identifier: String = Self.defaultIdentifier) {
+        self.enabled = enabled
+        self.identifier = identifier
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case identifier
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        identifier = try container.decodeIfPresent(String.self, forKey: .identifier) ?? Self.defaultIdentifier
+    }
+
+    func validated() throws -> PrivateNetworkConfig {
+        try PrivateNetworkValidator.validate(self)
+        return self
+    }
+}
+
+enum PrivateNetworkValidator {
+    static func validate(_ config: PrivateNetworkConfig) throws {
+        guard !config.enabled || !config.identifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw AppError("privateNetwork identifier must not be empty when enabled.")
+        }
+        guard config.identifier.rangeOfCharacter(from: CharacterSet(charactersIn: "/:\0")) == nil else {
+            throw AppError("privateNetwork identifier must not contain '/', ':', or NUL.")
+        }
+        guard config.identifier.utf8.count <= 48 else {
+            throw AppError("privateNetwork identifier must be 48 bytes or fewer.")
+        }
     }
 }
 
@@ -246,6 +296,231 @@ struct SharedDirectoryConfig: Codable, Equatable {
     let name: String
     let hostPath: String
     let readOnly: Bool
+}
+
+enum NetworkDeviceFactory {
+    static func makeDevices(privateNetwork: PrivateNetworkConfig) throws -> [VZNetworkDeviceConfiguration] {
+        var devices: [VZNetworkDeviceConfiguration] = [makeNATDevice()]
+
+        if privateNetwork.enabled {
+            devices.append(try makePrivateNetworkDevice(identifier: privateNetwork.identifier))
+        }
+
+        return devices
+    }
+
+    static func makeNATDevice() -> VZNetworkDeviceConfiguration {
+        let networkDevice = VZVirtioNetworkDeviceConfiguration()
+        networkDevice.attachment = VZNATNetworkDeviceAttachment()
+        return networkDevice
+    }
+
+    private static func makePrivateNetworkDevice(identifier: String) throws -> VZNetworkDeviceConfiguration {
+        let networkDevice = VZVirtioNetworkDeviceConfiguration()
+        let runtime = try PrivateNetworkRuntime(identifier: identifier)
+        networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
+        PrivateNetworkRuntimeRegistry.shared.retain(runtime)
+        return networkDevice
+    }
+}
+
+final class PrivateNetworkRuntimeRegistry {
+    static let shared = PrivateNetworkRuntimeRegistry()
+
+    private var runtimes: [PrivateNetworkRuntime] = []
+
+    private init() {}
+
+    func retain(_ runtime: PrivateNetworkRuntime) {
+        runtimes.append(runtime)
+    }
+
+    func releaseAll() {
+        runtimes.removeAll()
+    }
+}
+
+final class PrivateNetworkRuntime {
+    let fileHandle: FileHandle
+
+    private let bridgeDescriptor: Int32
+    private let peerDescriptor: Int32
+    private let peerURL: URL
+    private let networkDirectory: URL
+    private let bridgeSource: DispatchSourceRead
+    private let peerSource: DispatchSourceRead
+    private let queue: DispatchQueue
+
+    init(identifier: String) throws {
+        var descriptors: [Int32] = [0, 0]
+        guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &descriptors) == 0 else {
+            throw AppError("Failed to create private network socket pair: \(String(cString: strerror(errno))).")
+        }
+
+        bridgeDescriptor = descriptors[1]
+        let guestDescriptor = descriptors[0]
+
+        let sendBufferSize = 1_048_576
+        let receiveBufferSize = 4_194_304
+        try Self.setSocketOption(guestDescriptor, SO_SNDBUF, sendBufferSize)
+        try Self.setSocketOption(guestDescriptor, SO_RCVBUF, receiveBufferSize)
+        try Self.setSocketOption(bridgeDescriptor, SO_SNDBUF, sendBufferSize)
+        try Self.setSocketOption(bridgeDescriptor, SO_RCVBUF, receiveBufferSize)
+
+        let root = URL(fileURLWithPath: "/tmp/okrun-vnet", isDirectory: true)
+        networkDirectory = root.appendingPathComponent(identifier, isDirectory: true)
+        try FileManager.default.createDirectory(at: networkDirectory, withIntermediateDirectories: true)
+
+        peerDescriptor = socket(AF_UNIX, SOCK_DGRAM, 0)
+        guard peerDescriptor >= 0 else {
+            close(guestDescriptor)
+            close(bridgeDescriptor)
+            throw AppError("Failed to create private network peer socket: \(String(cString: strerror(errno))).")
+        }
+        try Self.setSocketOption(peerDescriptor, SO_SNDBUF, sendBufferSize)
+        try Self.setSocketOption(peerDescriptor, SO_RCVBUF, receiveBufferSize)
+
+        peerURL = networkDirectory.appendingPathComponent("\(Self.shortPeerIdentifier()).sock")
+        try Self.bindUnixDatagramSocket(peerDescriptor, to: peerURL.path)
+
+        fileHandle = FileHandle(fileDescriptor: guestDescriptor, closeOnDealloc: true)
+        queue = DispatchQueue(label: "okrun.private-network.\(identifier).\(UUID().uuidString)")
+
+        bridgeSource = DispatchSource.makeReadSource(fileDescriptor: bridgeDescriptor, queue: queue)
+        peerSource = DispatchSource.makeReadSource(fileDescriptor: peerDescriptor, queue: queue)
+
+        bridgeSource.setEventHandler { [weak self] in
+            self?.readGuestFrames()
+        }
+        peerSource.setEventHandler { [weak self] in
+            self?.readPeerFrames()
+        }
+        bridgeSource.resume()
+        peerSource.resume()
+    }
+
+    deinit {
+        bridgeSource.cancel()
+        peerSource.cancel()
+        close(bridgeDescriptor)
+        close(peerDescriptor)
+        try? FileManager.default.removeItem(at: peerURL)
+    }
+
+    private func readGuestFrames() {
+        var buffer = [UInt8](repeating: 0, count: 65_535)
+
+        while true {
+            let count = recv(bridgeDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
+            if count > 0 {
+                broadcastFrame(buffer, count: count)
+                continue
+            }
+            if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return
+            }
+            return
+        }
+    }
+
+    private func readPeerFrames() {
+        var buffer = [UInt8](repeating: 0, count: 65_535)
+
+        while true {
+            let count = recv(peerDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
+            if count > 0 {
+                _ = buffer.withUnsafeBufferPointer { pointer in
+                    write(bridgeDescriptor, pointer.baseAddress, count)
+                }
+                continue
+            }
+            if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return
+            }
+            return
+        }
+    }
+
+    private func broadcastFrame(_ frame: [UInt8], count: Int) {
+        guard let peers = try? FileManager.default.contentsOfDirectory(at: networkDirectory, includingPropertiesForKeys: nil) else {
+            return
+        }
+
+        for peer in peers where peer.pathExtension == "sock" && peer != peerURL {
+            _ = frame.withUnsafeBufferPointer { pointer in
+                Self.sendUnixDatagram(
+                    descriptor: peerDescriptor,
+                    buffer: pointer.baseAddress,
+                    count: count,
+                    to: peer.path
+                )
+            }
+        }
+    }
+
+    private static func setSocketOption(_ descriptor: Int32, _ option: Int32, _ value: Int) throws {
+        var socketValue = Int32(value)
+        guard setsockopt(descriptor, SOL_SOCKET, option, &socketValue, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            throw AppError("Failed to configure private network socket: \(String(cString: strerror(errno))).")
+        }
+    }
+
+    private static func shortPeerIdentifier() -> String {
+        UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12).lowercased()
+    }
+
+    private static func bindUnixDatagramSocket(_ descriptor: Int32, to path: String) throws {
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
+        guard path.utf8.count < pathCapacity else {
+            throw AppError("Private network socket path is too long: \(path)")
+        }
+
+        try? FileManager.default.removeItem(atPath: path)
+        _ = withUnsafeMutablePointer(to: &address.sun_path.0) { pointer in
+            path.withCString { source in
+                strncpy(pointer, source, pathCapacity - 1)
+            }
+        }
+
+        let length = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(descriptor, $0, length)
+            }
+        }
+        guard result == 0 else {
+            throw AppError("Failed to bind private network socket: \(String(cString: strerror(errno))).")
+        }
+    }
+
+    private static func sendUnixDatagram(
+        descriptor: Int32,
+        buffer: UnsafePointer<UInt8>?,
+        count: Int,
+        to path: String
+    ) -> Int {
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
+        guard path.utf8.count < pathCapacity else {
+            return -1
+        }
+
+        _ = withUnsafeMutablePointer(to: &address.sun_path.0) { pointer in
+            path.withCString { source in
+                strncpy(pointer, source, pathCapacity - 1)
+            }
+        }
+
+        let length = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
+        return withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                sendto(descriptor, buffer, count, MSG_DONTWAIT, $0, length)
+            }
+        }
+    }
 }
 
 enum SharedDirectoryValidator {

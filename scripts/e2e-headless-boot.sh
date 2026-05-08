@@ -8,6 +8,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KERNEL="$(sed -n '1p' /tmp/okrun-e2e-linux-paths.txt)"
 INITRAMFS="$(sed -n '2p' /tmp/okrun-e2e-linux-paths.txt)"
 SHARED_INITRAMFS="$(sed -n '3p' /tmp/okrun-e2e-linux-paths.txt)"
+PRIVATE_NETWORK_SERVER_INITRAMFS="$(sed -n '5p' /tmp/okrun-e2e-linux-paths.txt)"
+PRIVATE_NETWORK_CLIENT_INITRAMFS="$(sed -n '6p' /tmp/okrun-e2e-linux-paths.txt)"
 
 "$ROOT/scripts/build.sh"
 
@@ -15,6 +17,22 @@ SHARED_INITRAMFS="$(sed -n '3p' /tmp/okrun-e2e-linux-paths.txt)"
   --headless-boot-test \
   --kernel "$KERNEL" \
   --initramfs "$INITRAMFS" \
+  --timeout 45
+
+"$ROOT/OkrunVM.app/Contents/MacOS/OkrunVM" \
+  --headless-boot-test \
+  --kernel "$KERNEL" \
+  --initramfs "$INITRAMFS" \
+  --private-network \
+  --private-network-id "okrun-e2e-$$" \
+  --timeout 45
+
+"$ROOT/OkrunVM.app/Contents/MacOS/OkrunVM" \
+  --headless-private-network-test \
+  --kernel "$KERNEL" \
+  --server-initramfs "$PRIVATE_NETWORK_SERVER_INITRAMFS" \
+  --client-initramfs "$PRIVATE_NETWORK_CLIENT_INITRAMFS" \
+  --private-network-id "okrun-e2e-ping-$$" \
   --timeout 45
 
 SHARED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/okrun-e2e-shared.XXXXXX")"

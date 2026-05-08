@@ -691,6 +691,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 memoryGB: vmConfig.memoryGB,
                 diskGB: vmConfig.diskGB,
                 installerISOPath: iso.path,
+                privateNetwork: vmConfig.privateNetwork,
                 sharedDirectories: vmConfig.sharedDirectories
             )
             try updatedConfig.save(to: paths.config)
@@ -729,6 +730,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 self?.setStatus("Shutdown failed", detail: error.localizedDescription)
             } else {
                 self?.releaseProjectLock()
+                PrivateNetworkRuntimeRegistry.shared.releaseAll()
                 self?.virtualMachine = nil
                 self?.vmView.virtualMachine = nil
                 self?.setControlsEnabled(canStart: true, canStop: false)
@@ -775,6 +777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                         self?.setStatus("Running", detail: self?.runtimeDetail("Mode: \(modeText)") ?? "")
                     case .failure(let error):
                         self?.releaseProjectLock()
+                        PrivateNetworkRuntimeRegistry.shared.releaseAll()
                         self?.virtualMachine = nil
                         self?.vmView.virtualMachine = nil
                         self?.setControlsEnabled(canStart: true, canStop: false)
@@ -784,6 +787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             }
         } catch {
             releaseProjectLock()
+            PrivateNetworkRuntimeRegistry.shared.releaseAll()
             setControlsEnabled(canStart: true, canStop: false)
             setStatus("Configuration failed", detail: error.localizedDescription)
         }
@@ -831,7 +835,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         configuration.graphicsDevices = [makeGraphicsDevice()]
         configuration.keyboards = [VZUSBKeyboardConfiguration()]
         configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        configuration.networkDevices = [makeNetworkDevice()]
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork)
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
         configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode)
@@ -859,12 +863,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)
         ]
         return graphicsDevice
-    }
-
-    private func makeNetworkDevice() -> VZNetworkDeviceConfiguration {
-        let networkDevice = VZVirtioNetworkDeviceConfiguration()
-        networkDevice.attachment = VZNATNetworkDeviceAttachment()
-        return networkDevice
     }
 
     private func makeStorageDevices(paths: VMPaths, mode: VMMode) throws -> [VZStorageDeviceConfiguration] {
@@ -896,6 +894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         DispatchQueue.main.async { [weak self] in
             self?.releaseProjectLock()
+            PrivateNetworkRuntimeRegistry.shared.releaseAll()
             self?.virtualMachine = nil
             self?.vmView.virtualMachine = nil
             self?.setControlsEnabled(canStart: true, canStop: false)
@@ -906,6 +905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         DispatchQueue.main.async { [weak self] in
             self?.releaseProjectLock()
+            PrivateNetworkRuntimeRegistry.shared.releaseAll()
             self?.virtualMachine = nil
             self?.vmView.virtualMachine = nil
             self?.setControlsEnabled(canStart: true, canStop: false)

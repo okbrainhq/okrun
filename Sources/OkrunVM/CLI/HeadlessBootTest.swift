@@ -7,6 +7,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     private let initialRamdiskURL: URL
     private let timeout: TimeInterval
     private let sharedDirectory: SharedDirectoryConfig?
+    private let privateNetwork: PrivateNetworkConfig
     private var expectedOutput: String {
         sharedDirectory == nil ? "OKRUN_E2E_BOOTED" : "OKRUN_E2E_SHARED_DIRS_PASSED"
     }
@@ -15,16 +16,24 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     private var serialOutput = Data()
     private var result: Result<Void, Error>?
 
-    init(kernelURL: URL, initialRamdiskURL: URL, timeout: TimeInterval, sharedDirectory: SharedDirectoryConfig?) {
+    init(
+        kernelURL: URL,
+        initialRamdiskURL: URL,
+        timeout: TimeInterval,
+        sharedDirectory: SharedDirectoryConfig?,
+        privateNetwork: PrivateNetworkConfig
+    ) {
         self.kernelURL = kernelURL
         self.initialRamdiskURL = initialRamdiskURL
         self.timeout = timeout
         self.sharedDirectory = sharedDirectory
+        self.privateNetwork = privateNetwork
     }
 
     static func runIfRequested(arguments: [String] = CommandLine.arguments) -> Int32? {
         guard arguments.contains("--headless-boot-test")
             || arguments.contains("--headless-save-restore-test")
+            || arguments.contains("--headless-private-network-test")
             || arguments.contains("--headless-project-save-restore-test") else {
             return nil
         }
@@ -46,10 +55,33 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                     kernelURL: options.kernel,
                     initialRamdiskURL: options.initialRamdisk,
                     timeout: options.timeout,
-                    sharedDirectory: options.sharedDirectory
+                    sharedDirectory: options.sharedDirectory,
+                    privateNetwork: options.privateNetwork
                 )
                 try test.run()
                 print("Headless save/restore E2E passed: OKRUN_E2E_SAVE_RESTORE_RESUMED")
+                return 0
+            }
+
+            if arguments.contains("--headless-private-network-test") {
+                guard let serverInitialRamdisk = options.privateNetworkServerInitialRamdisk else {
+                    throw AppError("Missing --server-initramfs path.")
+                }
+                guard let clientInitialRamdisk = options.privateNetworkClientInitialRamdisk else {
+                    throw AppError("Missing --client-initramfs path.")
+                }
+
+                let test = HeadlessPrivateNetworkTest(
+                    kernelURL: options.kernel,
+                    serverInitialRamdiskURL: serverInitialRamdisk,
+                    clientInitialRamdiskURL: clientInitialRamdisk,
+                    timeout: options.timeout,
+                    privateNetwork: options.privateNetwork.enabled
+                        ? options.privateNetwork
+                        : PrivateNetworkConfig(enabled: true)
+                )
+                try test.run()
+                print("Headless private network E2E passed: OKRUN_E2E_PRIVATE_NETWORK_PASSED")
                 return 0
             }
 
@@ -57,7 +89,8 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                 kernelURL: options.kernel,
                 initialRamdiskURL: options.initialRamdisk,
                 timeout: options.timeout,
-                sharedDirectory: options.sharedDirectory
+                sharedDirectory: options.sharedDirectory,
+                privateNetwork: options.privateNetwork
             )
             try test.run()
             print("Headless boot E2E passed: \(test.expectedOutput)")
@@ -85,12 +118,18 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         initialRamdisk: URL,
         timeout: TimeInterval,
         sharedDirectory: SharedDirectoryConfig?,
+        privateNetwork: PrivateNetworkConfig,
+        privateNetworkServerInitialRamdisk: URL?,
+        privateNetworkClientInitialRamdisk: URL?,
         projectRoot: URL?
     ) {
         var kernelPath: String?
         var initialRamdiskPath: String?
+        var privateNetworkServerInitialRamdiskPath: String?
+        var privateNetworkClientInitialRamdiskPath: String?
         var timeout: TimeInterval = 30
         var sharedDirectoryPath: String?
+        var privateNetwork = PrivateNetworkConfig.disabled
         var projectRootPath: String?
         var iterator = arguments.dropFirst().makeIterator()
 
@@ -100,6 +139,10 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                 kernelPath = iterator.next()
             case "--initramfs":
                 initialRamdiskPath = iterator.next()
+            case "--server-initramfs":
+                privateNetworkServerInitialRamdiskPath = iterator.next()
+            case "--client-initramfs":
+                privateNetworkClientInitialRamdiskPath = iterator.next()
             case "--timeout":
                 guard let value = iterator.next(), let parsed = TimeInterval(value), parsed > 0 else {
                     throw AppError("--timeout must be a positive number of seconds.")
@@ -107,6 +150,13 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                 timeout = parsed
             case "--shared-directory":
                 sharedDirectoryPath = iterator.next()
+            case "--private-network":
+                privateNetwork = PrivateNetworkConfig(enabled: true)
+            case "--private-network-id":
+                guard let value = iterator.next() else {
+                    throw AppError("Missing --private-network-id value.")
+                }
+                privateNetwork = PrivateNetworkConfig(enabled: true, identifier: value)
             case "--project-root":
                 projectRootPath = iterator.next()
             default:
@@ -114,30 +164,56 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             }
         }
 
+        let isPrivateNetworkTest = arguments.contains("--headless-private-network-test")
         let projectRoot = projectRootPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
         if projectRoot == nil {
             guard kernelPath != nil else {
                 throw AppError("Missing --kernel path.")
             }
-            guard initialRamdiskPath != nil else {
+            guard isPrivateNetworkTest || initialRamdiskPath != nil else {
                 throw AppError("Missing --initramfs path.")
+            }
+            guard !isPrivateNetworkTest || privateNetworkServerInitialRamdiskPath != nil else {
+                throw AppError("Missing --server-initramfs path.")
+            }
+            guard !isPrivateNetworkTest || privateNetworkClientInitialRamdiskPath != nil else {
+                throw AppError("Missing --client-initramfs path.")
             }
         }
 
         let kernel = URL(fileURLWithPath: kernelPath ?? "/")
         let initialRamdisk = URL(fileURLWithPath: initialRamdiskPath ?? "/")
+        let privateNetworkServerInitialRamdisk = privateNetworkServerInitialRamdiskPath.map { URL(fileURLWithPath: $0) }
+        let privateNetworkClientInitialRamdisk = privateNetworkClientInitialRamdiskPath.map { URL(fileURLWithPath: $0) }
         if projectRoot == nil && !FileManager.default.fileExists(atPath: kernel.path) {
             throw AppError("Kernel does not exist: \(kernel.path)")
         }
-        if projectRoot == nil && !FileManager.default.fileExists(atPath: initialRamdisk.path) {
+        if projectRoot == nil && !isPrivateNetworkTest && !FileManager.default.fileExists(atPath: initialRamdisk.path) {
             throw AppError("Initramfs does not exist: \(initialRamdisk.path)")
+        }
+        if let privateNetworkServerInitialRamdisk,
+           !FileManager.default.fileExists(atPath: privateNetworkServerInitialRamdisk.path) {
+            throw AppError("Server initramfs does not exist: \(privateNetworkServerInitialRamdisk.path)")
+        }
+        if let privateNetworkClientInitialRamdisk,
+           !FileManager.default.fileExists(atPath: privateNetworkClientInitialRamdisk.path) {
+            throw AppError("Client initramfs does not exist: \(privateNetworkClientInitialRamdisk.path)")
         }
 
         let sharedDirectory = sharedDirectoryPath.map {
             SharedDirectoryConfig(name: "e2e", hostPath: $0, readOnly: false)
         }
 
-        return (kernel, initialRamdisk, timeout, sharedDirectory, projectRoot)
+        return (
+            kernel,
+            initialRamdisk,
+            timeout,
+            sharedDirectory,
+            try privateNetwork.validated(),
+            privateNetworkServerInitialRamdisk,
+            privateNetworkClientInitialRamdisk,
+            projectRoot
+        )
     }
 
     private func run() throws {
@@ -168,6 +244,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
 
         outputPipe.fileHandleForReading.readabilityHandler = nil
         try stopVM()
+        PrivateNetworkRuntimeRegistry.shared.releaseAll()
 
         guard let result else {
             let output = String(decoding: serialOutput, as: UTF8.self)
@@ -191,6 +268,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
 
         configuration.cpuCount = 1
         configuration.memorySize = 1024 * 1024 * 1024
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: privateNetwork)
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
         let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -245,11 +323,216 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     }
 }
 
+final class HeadlessPrivateNetworkTest: NSObject, VZVirtualMachineDelegate {
+    private let kernelURL: URL
+    private let serverInitialRamdiskURL: URL
+    private let clientInitialRamdiskURL: URL
+    private let timeout: TimeInterval
+    private let privateNetwork: PrivateNetworkConfig
+    private var serverVM: VZVirtualMachine?
+    private var clientVM: VZVirtualMachine?
+    private var serverOutput = Data()
+    private var clientOutput = Data()
+    private var stopError: Error?
+
+    init(
+        kernelURL: URL,
+        serverInitialRamdiskURL: URL,
+        clientInitialRamdiskURL: URL,
+        timeout: TimeInterval,
+        privateNetwork: PrivateNetworkConfig
+    ) {
+        self.kernelURL = kernelURL
+        self.serverInitialRamdiskURL = serverInitialRamdiskURL
+        self.clientInitialRamdiskURL = clientInitialRamdiskURL
+        self.timeout = timeout
+        self.privateNetwork = privateNetwork
+    }
+
+    func run() throws {
+        let serverPipe = Pipe()
+        serverPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.serverOutput.append(data)
+        }
+        defer { serverPipe.fileHandleForReading.readabilityHandler = nil }
+
+        let clientPipe = Pipe()
+        clientPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.clientOutput.append(data)
+        }
+        defer { clientPipe.fileHandleForReading.readabilityHandler = nil }
+
+        let serverConfiguration = try makeConfiguration(
+            initialRamdiskURL: serverInitialRamdiskURL,
+            serialOutput: serverPipe.fileHandleForWriting
+        )
+        let serverVM = VZVirtualMachine(configuration: serverConfiguration)
+        serverVM.delegate = self
+        self.serverVM = serverVM
+
+        try start(serverVM, label: "private network server")
+        try waitForMarker(
+            "OKRUN_E2E_PRIVATE_NETWORK_SERVER_READY",
+            in: { self.serverOutput },
+            label: "private network server"
+        )
+
+        let clientConfiguration = try makeConfiguration(
+            initialRamdiskURL: clientInitialRamdiskURL,
+            serialOutput: clientPipe.fileHandleForWriting
+        )
+        let clientVM = VZVirtualMachine(configuration: clientConfiguration)
+        clientVM.delegate = self
+        self.clientVM = clientVM
+
+        try start(clientVM, label: "private network client")
+        try waitForMarker(
+            "OKRUN_E2E_PRIVATE_NETWORK_PASSED",
+            in: { self.clientOutput },
+            label: "private network client"
+        )
+
+        try stop(clientVM)
+        try stop(serverVM)
+        PrivateNetworkRuntimeRegistry.shared.releaseAll()
+        self.clientVM = nil
+        self.serverVM = nil
+    }
+
+    private func makeConfiguration(initialRamdiskURL: URL, serialOutput: FileHandle) throws -> VZVirtualMachineConfiguration {
+        let configuration = VZVirtualMachineConfiguration()
+
+        let platform = VZGenericPlatformConfiguration()
+        platform.machineIdentifier = VZGenericMachineIdentifier()
+        configuration.platform = platform
+
+        let bootLoader = VZLinuxBootLoader(kernelURL: kernelURL)
+        bootLoader.initialRamdiskURL = initialRamdiskURL
+        bootLoader.commandLine = "console=hvc0 panic=-1"
+        configuration.bootLoader = bootLoader
+
+        configuration.cpuCount = 1
+        configuration.memorySize = 1024 * 1024 * 1024
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: privateNetwork)
+        configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+        let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+        serialPort.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: nil,
+            fileHandleForWriting: serialOutput
+        )
+        configuration.serialPorts = [serialPort]
+
+        try configuration.validate()
+        return configuration
+    }
+
+    private func start(_ vm: VZVirtualMachine, label: String) throws {
+        var completed = false
+        var startError: Error?
+        vm.start { result in
+            if case .failure(let error) = result {
+                startError = error
+            }
+            completed = true
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while !completed && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+
+        guard completed else {
+            throw AppError("Timed out starting \(label).")
+        }
+        if let startError {
+            throw AppError("\(label) start failed: \(HeadlessBootTest.describeError(startError))")
+        }
+    }
+
+    private func waitForMarker(_ marker: String, in output: () -> Data, label: String) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let stopError {
+                throw stopError
+            }
+
+            let text = String(decoding: output(), as: UTF8.self)
+            if text.contains(marker) {
+                return
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+
+        let serverText = String(decoding: serverOutput, as: UTF8.self)
+        let clientText = String(decoding: clientOutput, as: UTF8.self)
+        throw AppError(
+            """
+            Timed out waiting for \(marker) from \(label).
+            Server serial output:
+            \(serverText)
+            Client serial output:
+            \(clientText)
+            """
+        )
+    }
+
+    private func stop(_ vm: VZVirtualMachine) throws {
+        guard vm.canStop else { return }
+
+        var completed = false
+        var stopError: Error?
+        vm.stop { error in
+            stopError = error
+            completed = true
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        while !completed && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+
+        if let stopError {
+            throw stopError
+        }
+    }
+
+    func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        if virtualMachine === serverVM {
+            let output = String(decoding: serverOutput, as: UTF8.self)
+            stopError = AppError("Private network server stopped before the client completed. Server serial output:\n\(output)")
+        } else if virtualMachine === clientVM {
+            let output = String(decoding: clientOutput, as: UTF8.self)
+            if !output.contains("OKRUN_E2E_PRIVATE_NETWORK_PASSED") {
+                let serverText = String(decoding: serverOutput, as: UTF8.self)
+                stopError = AppError(
+                    """
+                    Private network client stopped before reporting success.
+                    Server serial output:
+                    \(serverText)
+                    Client serial output:
+                    \(output)
+                    """
+                )
+            }
+        }
+    }
+
+    func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
+        stopError = error
+    }
+}
+
 final class HeadlessSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
     private let kernelURL: URL
     private let initialRamdiskURL: URL
     private let timeout: TimeInterval
     private let sharedDirectory: SharedDirectoryConfig?
+    private let privateNetwork: PrivateNetworkConfig
     private let machineIdentifier = VZGenericMachineIdentifier()
     private let stateURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("okrun-save-restore-\(UUID().uuidString).state")
@@ -261,12 +544,14 @@ final class HeadlessSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
         kernelURL: URL,
         initialRamdiskURL: URL,
         timeout: TimeInterval,
-        sharedDirectory: SharedDirectoryConfig?
+        sharedDirectory: SharedDirectoryConfig?,
+        privateNetwork: PrivateNetworkConfig
     ) {
         self.kernelURL = kernelURL
         self.initialRamdiskURL = initialRamdiskURL
         self.timeout = timeout
         self.sharedDirectory = sharedDirectory
+        self.privateNetwork = privateNetwork
     }
 
     func run() throws {
@@ -295,6 +580,7 @@ final class HeadlessSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
         try validateSaveRestoreSupport(firstConfiguration, phase: "initial synthetic")
         try save(firstVM, to: stateURL)
         try stop(firstVM)
+        PrivateNetworkRuntimeRegistry.shared.releaseAll()
         virtualMachine = nil
 
         let restoredConfiguration = try makeConfiguration(serialOutput: outputPipe.fileHandleForWriting)
@@ -307,6 +593,7 @@ final class HeadlessSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
         try resume(restoredVM)
         try waitForSerialMarker("OKRUN_E2E_SAVE_RESTORE_RESUMED")
         try stop(restoredVM)
+        PrivateNetworkRuntimeRegistry.shared.releaseAll()
         virtualMachine = nil
     }
 
@@ -324,6 +611,7 @@ final class HeadlessSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
 
         configuration.cpuCount = 1
         configuration.memorySize = 1024 * 1024 * 1024
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: privateNetwork)
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
         let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -516,6 +804,7 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
         try copyFile(from: paths.disk, to: paths.savedStateDisk)
         try save(firstVM, to: paths.machineState)
         try stop(firstVM)
+        PrivateNetworkRuntimeRegistry.shared.releaseAll()
         virtualMachine = nil
 
         try copyFile(from: paths.savedStateEfiStore, to: paths.efiStore)
@@ -530,6 +819,7 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
         try resume(restoredVM)
         try waitForGuestSettle()
         try stop(restoredVM)
+        PrivateNetworkRuntimeRegistry.shared.releaseAll()
         virtualMachine = nil
     }
 
@@ -585,7 +875,7 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
         configuration.graphicsDevices = [makeGraphicsDevice()]
         configuration.keyboards = [VZUSBKeyboardConfiguration()]
         configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        configuration.networkDevices = [makeNetworkDevice()]
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork)
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.storageDevices = [try makeStorageDevice()]
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(for: config.sharedDirectories)
@@ -613,12 +903,6 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
             VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)
         ]
         return graphicsDevice
-    }
-
-    private func makeNetworkDevice() -> VZNetworkDeviceConfiguration {
-        let networkDevice = VZVirtioNetworkDeviceConfiguration()
-        networkDevice.attachment = VZNATNetworkDeviceAttachment()
-        return networkDevice
     }
 
     private func makeStorageDevice() throws -> VZStorageDeviceConfiguration {

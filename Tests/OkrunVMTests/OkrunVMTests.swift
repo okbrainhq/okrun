@@ -74,11 +74,12 @@ struct OkrunVMTests {
         #expect(config.memoryGB == 3)
         #expect(config.diskGB == 20)
         #expect(config.installerISOPath == nil)
+        #expect(config.privateNetwork == .disabled)
         #expect(config.sharedDirectories == [])
     }
 
     @Test
-    func vmConfigSavesAndLoadsSharedDirectories() throws {
+    func vmConfigSavesAndLoadsPrivateNetworkAndSharedDirectories() throws {
         let project = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(project) }
 
@@ -91,6 +92,7 @@ struct OkrunVMTests {
             memoryGB: 8,
             diskGB: 64,
             installerISOPath: "/tmp/debian.iso",
+            privateNetwork: PrivateNetworkConfig(enabled: true, identifier: "team"),
             sharedDirectories: [
                 SharedDirectoryConfig(name: "project", hostPath: sharedDirectory.path, readOnly: false)
             ]
@@ -110,6 +112,24 @@ struct OkrunVMTests {
         }
         #expect(throws: (any Error).self) {
             try VMConfig(cpuCount: 4, memoryGB: 4, diskGB: 0, installerISOPath: nil).validated()
+        }
+        #expect(throws: (any Error).self) {
+            try VMConfig(
+                cpuCount: 4,
+                memoryGB: 4,
+                diskGB: 64,
+                installerISOPath: nil,
+                privateNetwork: PrivateNetworkConfig(enabled: true, identifier: "")
+            ).validated()
+        }
+        #expect(throws: (any Error).self) {
+            try VMConfig(
+                cpuCount: 4,
+                memoryGB: 4,
+                diskGB: 64,
+                installerISOPath: nil,
+                privateNetwork: PrivateNetworkConfig(enabled: true, identifier: "bad/network")
+            ).validated()
         }
     }
 
@@ -183,6 +203,20 @@ struct OkrunVMTests {
         let device = try #require(devices.first as? VZVirtioFileSystemDeviceConfiguration)
         #expect(device.tag == SharedDirectoryValidator.tag)
         #expect(device.share is VZMultipleDirectoryShare)
+    }
+
+    @Test
+    func networkDeviceFactoryAddsPrivateNetworkAdapterWhenEnabled() throws {
+        let natOnlyDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: .disabled)
+        #expect(natOnlyDevices.count == 1)
+        #expect((natOnlyDevices.first as? VZVirtioNetworkDeviceConfiguration)?.attachment is VZNATNetworkDeviceAttachment)
+
+        let privateDevices = try NetworkDeviceFactory.makeDevices(
+            privateNetwork: PrivateNetworkConfig(enabled: true, identifier: "test")
+        )
+        #expect(privateDevices.count == 2)
+        #expect((privateDevices.first as? VZVirtioNetworkDeviceConfiguration)?.attachment is VZNATNetworkDeviceAttachment)
+        #expect((privateDevices.last as? VZVirtioNetworkDeviceConfiguration)?.attachment is VZFileHandleNetworkDeviceAttachment)
     }
 
     @Test

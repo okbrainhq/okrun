@@ -10,6 +10,8 @@ BOOT_IMAGE="$FIXTURE_DIR/v3.18-Image"
 E2E_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e"
 E2E_SHARED_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-shared"
 E2E_SAVE_RESTORE_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-save-restore"
+E2E_PRIVATE_NETWORK_SERVER_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-server"
+E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-client"
 
 mkdir -p "$FIXTURE_DIR"
 
@@ -91,7 +93,99 @@ chmod 0755 "$WORK_DIR/init"
 
 (cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_SAVE_RESTORE_INITRAMFS")
 
+cat > "$WORK_DIR/init" <<'EOF'
+#!/bin/sh
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+/bin/busybox mount -t proc proc /proc 2>/dev/null || true
+/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
+/sbin/modprobe virtio_net 2>/dev/null || true
+
+PRIVATE_IFACE=""
+for attempt in 1 2 3 4 5; do
+  for path in /sys/class/net/*; do
+    iface="${path##*/}"
+    [ "$iface" = "lo" ] && continue
+    PRIVATE_IFACE="$iface"
+  done
+  [ -n "$PRIVATE_IFACE" ] && break
+  /bin/busybox sleep 1
+done
+
+echo "OKRUN_E2E_PRIVATE_NETWORK_SERVER_IFACE=${PRIVATE_IFACE}" >/dev/console
+echo "OKRUN_E2E_PRIVATE_NETWORK_SERVER_IFACE=${PRIVATE_IFACE}" >/dev/hvc0 2>/dev/null || true
+
+if [ -z "$PRIVATE_IFACE" ]; then
+  echo OKRUN_E2E_PRIVATE_NETWORK_SERVER_FAILED_NO_IFACE >/dev/console
+  echo OKRUN_E2E_PRIVATE_NETWORK_SERVER_FAILED_NO_IFACE >/dev/hvc0 2>/dev/null || true
+  /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+  while true; do :; done
+fi
+
+/bin/busybox ip link set "$PRIVATE_IFACE" up
+/bin/busybox ip addr add 10.77.0.2/24 dev "$PRIVATE_IFACE"
+echo OKRUN_E2E_PRIVATE_NETWORK_SERVER_READY >/dev/console
+echo OKRUN_E2E_PRIVATE_NETWORK_SERVER_READY >/dev/hvc0 2>/dev/null || true
+/bin/busybox sleep 30
+/bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+while true; do :; done
+EOF
+chmod 0755 "$WORK_DIR/init"
+
+(cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_PRIVATE_NETWORK_SERVER_INITRAMFS")
+
+cat > "$WORK_DIR/init" <<'EOF'
+#!/bin/sh
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+/bin/busybox mount -t proc proc /proc 2>/dev/null || true
+/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
+/sbin/modprobe virtio_net 2>/dev/null || true
+
+PRIVATE_IFACE=""
+for attempt in 1 2 3 4 5; do
+  for path in /sys/class/net/*; do
+    iface="${path##*/}"
+    [ "$iface" = "lo" ] && continue
+    PRIVATE_IFACE="$iface"
+  done
+  [ -n "$PRIVATE_IFACE" ] && break
+  /bin/busybox sleep 1
+done
+
+echo "OKRUN_E2E_PRIVATE_NETWORK_CLIENT_IFACE=${PRIVATE_IFACE}" >/dev/console
+echo "OKRUN_E2E_PRIVATE_NETWORK_CLIENT_IFACE=${PRIVATE_IFACE}" >/dev/hvc0 2>/dev/null || true
+
+if [ -z "$PRIVATE_IFACE" ]; then
+  echo OKRUN_E2E_PRIVATE_NETWORK_CLIENT_FAILED_NO_IFACE >/dev/console
+  echo OKRUN_E2E_PRIVATE_NETWORK_CLIENT_FAILED_NO_IFACE >/dev/hvc0 2>/dev/null || true
+  /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+  while true; do :; done
+fi
+
+/bin/busybox ip link set "$PRIVATE_IFACE" up
+/bin/busybox ip addr add 10.77.0.3/24 dev "$PRIVATE_IFACE"
+
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if /bin/busybox ping -c 1 -W 1 10.77.0.2 >/dev/console 2>&1; then
+    echo OKRUN_E2E_PRIVATE_NETWORK_PASSED >/dev/console
+    echo OKRUN_E2E_PRIVATE_NETWORK_PASSED >/dev/hvc0 2>/dev/null || true
+    /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+    while true; do :; done
+  fi
+  /bin/busybox sleep 1
+done
+
+echo OKRUN_E2E_PRIVATE_NETWORK_FAILED >/dev/console
+echo OKRUN_E2E_PRIVATE_NETWORK_FAILED >/dev/hvc0 2>/dev/null || true
+/bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+while true; do :; done
+EOF
+chmod 0755 "$WORK_DIR/init"
+
+(cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS")
+
 echo "$BOOT_IMAGE"
 echo "$E2E_INITRAMFS"
 echo "$E2E_SHARED_INITRAMFS"
 echo "$E2E_SAVE_RESTORE_INITRAMFS"
+echo "$E2E_PRIVATE_NETWORK_SERVER_INITRAMFS"
+echo "$E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS"

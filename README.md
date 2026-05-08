@@ -60,6 +60,10 @@ project folder.
   "memoryGB": 4,
   "diskGB": 64,
   "installerISOPath": "/path/to/linux.iso",
+  "privateNetwork": {
+    "enabled": false,
+    "identifier": "okrun"
+  },
   "sharedDirectories": [
     {
       "name": "projects",
@@ -77,6 +81,133 @@ project folder.
 
 Increasing `diskGB` expands the raw disk file. Existing disks are not shrunk
 automatically.
+
+## Private VM Network
+
+`privateNetwork` adds a second virtual NIC backed by an OkRUn-local Ethernet
+bus. Keep the regular NAT NIC for internet access, and use this private NIC for
+VM-to-VM traffic with static IPs configured inside Linux. This network is local
+to OkRUn on the Mac; it does not depend on your Wi-Fi, router, or bridged
+networking support.
+
+### Enable the Network
+
+Enable it in each VM's `okrun-vm.json`. VMs with the same `identifier` share one
+private network:
+
+```json
+{
+  "privateNetwork": {
+    "enabled": true,
+    "identifier": "okrun"
+  }
+}
+```
+
+Fully stop and restart the VMs after changing the config.
+
+### Find the Private Interface
+
+Inside each Linux VM, list the network interfaces:
+
+```sh
+ip -br link
+ip -br addr
+```
+
+You should see the NAT interface with a `192.168.64.x` address and another
+interface with no IP address. The interface with no IP address is usually the
+OkRUn private network. For example:
+
+```text
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>
+enp0s1           UP             5a:94:ef:12:34:56 <BROADCAST,MULTICAST,UP,LOWER_UP>
+enp0s2           DOWN           5a:94:ef:65:43:21 <BROADCAST,MULTICAST>
+```
+
+And:
+
+```text
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+enp0s1           UP             192.168.64.16/24
+enp0s2           DOWN
+```
+
+In this example, `<private-iface>` is `enp0s2`.
+
+### Test with Temporary Static IPs
+
+On `devbox`:
+
+```sh
+sudo ip link set <private-iface> up
+sudo ip addr add 10.77.0.2/24 dev <private-iface>
+```
+
+On `devbox-sandbox`:
+
+```sh
+sudo ip link set <private-iface> up
+sudo ip addr add 10.77.0.3/24 dev <private-iface>
+```
+
+Then test both directions:
+
+```sh
+ping -c 3 10.77.0.2
+ping -c 3 10.77.0.3
+```
+
+Then add hostnames in `/etc/hosts` if desired:
+
+```text
+10.77.0.2 devbox.okrun devbox
+10.77.0.3 devbox-sandbox.okrun devbox-sandbox
+```
+
+### Persist with systemd-networkd
+
+The `ip addr add` commands are temporary. To keep the private IP after reboot,
+configure the interface inside Linux. On a system using `systemd-networkd`,
+create one `.network` file per VM.
+
+On `devbox`, create `/etc/systemd/network/20-okrun-private.network`:
+
+```ini
+[Match]
+Name=<private-iface>
+
+[Network]
+Address=10.77.0.2/24
+```
+
+On `devbox-sandbox`, use:
+
+```ini
+[Match]
+Name=<private-iface>
+
+[Network]
+Address=10.77.0.3/24
+```
+
+Then enable and restart `systemd-networkd`:
+
+```sh
+sudo systemctl enable systemd-networkd
+sudo systemctl restart systemd-networkd
+```
+
+Verify:
+
+```sh
+ip -br addr
+ping -c 3 10.77.0.2
+ping -c 3 10.77.0.3
+```
+
+Do not add a gateway for this private interface. Keep the default route on the
+NAT interface so internet access continues to use OkRUn's regular NAT network.
 
 ## Shared Directories
 
