@@ -375,7 +375,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let hasProject = registry.selectedProject != nil
 
         switch item.itemIdentifier {
-        case .newInstance, .installer, .start:
+        case .newInstance:
+            return hasProject
+        case .installer, .start:
             return canStartControls && hasProject
         case .projectPicker:
             return canStartControls && !registry.projects.isEmpty
