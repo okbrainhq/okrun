@@ -246,6 +246,10 @@ okrun_virtiofs_device_available() {
     return 0
   fi
 
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe virtiofs >/dev/null 2>&1 || true
+  fi
+
   if find /sys/bus/virtio/drivers/virtio_fs -type f -name tag -exec grep -qx okrun {} \; -print -quit 2>/dev/null | grep -q .; then
     return 0
   fi
@@ -448,6 +452,8 @@ elif command -v systemctl >/dev/null 2>&1; then
       if ! systemctl start mnt-okrun.mount; then
         echo "Warning: could not start /mnt/okrun mount. Run 'journalctl -xeu mnt-okrun.mount' inside the guest for details." >&2
       fi
+    elif systemctl start mnt-okrun.mount; then
+      :
     elif [[ "$managed_virtiofs_mount_config" == "1" ]]; then
       systemctl disable mnt-okrun.mount >/dev/null 2>&1 || true
       echo "Okrun VirtioFS device is not present; installed mnt-okrun.mount but left it disabled. Start this VM with an updated Okrun build, then rerun this installer."
