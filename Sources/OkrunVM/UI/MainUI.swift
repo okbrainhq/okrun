@@ -426,7 +426,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         paths = discoveredPaths
         vmConfig = config
-        try prepareStorage(paths: discoveredPaths, config: config)
         setStatus("Ready", detail: statusDetail(paths: discoveredPaths, config: config))
         setControlsEnabled(canStart: true, canStop: false)
     }
@@ -466,7 +465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             try FileManager.default.createDirectory(at: request.projectURL, withIntermediateDirectories: true)
             let paths = VMPaths.project(at: request.projectURL)
             try request.config.save(to: paths.config)
-            try prepareStorage(paths: paths, config: request.config)
+            _ = try prepareStorage(paths: paths, config: request.config)
 
             let path = projectStore.standardPath(request.projectURL)
             if !registry.projects.contains(path) {
@@ -541,12 +540,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
     }
 
-    private func prepareStorage(paths: VMPaths, config: VMConfig) throws {
+    private func loadAndPrepareConfiguration(paths: VMPaths) throws -> (
+        config: VMConfig,
+        preparation: VMStorage.PreparationResult
+    ) {
+        let config = try VMConfig.load(from: paths.config)
+        let preparation = try prepareStorage(paths: paths, config: config)
+        return (config, preparation)
+    }
+
+    private func reloadSelectedProjectConfiguration() throws -> (
+        config: VMConfig,
+        preparation: VMStorage.PreparationResult
+    ) {
+        guard let paths else {
+            throw AppError("VM paths were not prepared.")
+        }
+
+        let loaded = try loadAndPrepareConfiguration(paths: paths)
+        vmConfig = loaded.config
+        return loaded
+    }
+
+    private func prepareStorage(paths: VMPaths, config: VMConfig) throws -> VMStorage.PreparationResult {
         try VMStorage.prepare(paths: paths, config: config)
     }
 
-    private func statusDetail(paths: VMPaths, config: VMConfig) -> String {
-        "\(paths.root.path)  |  CPU \(config.cpuCount)  Memory \(config.memoryGB) GB  Disk \(config.diskGB) GB"
+    private func statusDetail(
+        paths: VMPaths,
+        config: VMConfig,
+        preparation: VMStorage.PreparationResult? = nil
+    ) -> String {
+        var detail = "\(paths.root.path)  |  CPU \(config.cpuCount)  Memory \(config.memoryGB) GB  Disk \(config.diskGB) GB"
+
+        if preparation?.expandedDisk == true {
+            detail += "  |  Disk image expanded; grow the Linux partition/filesystem inside the guest."
+        }
+
+        return detail
     }
 
     private func runtimeDetail(_ status: String) -> String {
@@ -673,12 +704,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     @objc private func startInstaller() {
-        guard let paths, let vmConfig else {
+        guard let paths else {
             setStatus("Not ready", detail: "No project is selected.")
             return
         }
 
-        if let isoPath = vmConfig.installerISOPath, FileManager.default.fileExists(atPath: isoPath) {
+        let currentConfig: VMConfig
+        do {
+            currentConfig = try VMConfig.load(from: paths.config)
+            vmConfig = currentConfig
+        } catch {
+            setStatus("Config reload failed", detail: error.localizedDescription)
+            return
+        }
+
+        if let isoPath = currentConfig.installerISOPath, FileManager.default.fileExists(atPath: isoPath) {
             start(mode: .installer(URL(fileURLWithPath: isoPath)))
             return
         }
@@ -687,12 +727,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         do {
             let updatedConfig = VMConfig(
-                cpuCount: vmConfig.cpuCount,
-                memoryGB: vmConfig.memoryGB,
-                diskGB: vmConfig.diskGB,
+                cpuCount: currentConfig.cpuCount,
+                memoryGB: currentConfig.memoryGB,
+                diskGB: currentConfig.diskGB,
                 installerISOPath: iso.path,
-                privateNetwork: vmConfig.privateNetwork,
-                sharedDirectories: vmConfig.sharedDirectories
+                privateNetwork: currentConfig.privateNetwork,
+                sharedDirectories: currentConfig.sharedDirectories
             )
             try updatedConfig.save(to: paths.config)
             self.vmConfig = updatedConfig
@@ -745,14 +785,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             setStatus("Not ready", detail: "VM paths were not prepared.")
             return
         }
-        guard let vmConfig else {
+        guard vmConfig != nil else {
             setStatus("Not ready", detail: "VM config was not loaded.")
             return
         }
 
         do {
             try acquireProjectLock(paths: paths)
-            let configuration = try makeConfiguration(paths: paths, config: vmConfig, mode: mode)
+            let loaded = try reloadSelectedProjectConfiguration()
+            let configuration = try makeConfiguration(paths: paths, config: loaded.config, mode: mode)
             let vm = VZVirtualMachine(configuration: configuration)
             vm.delegate = self
             virtualMachine = vm
@@ -767,7 +808,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 modeText = "installed system"
             }
 
-            setStatus("Starting \(modeText)", detail: statusDetail(paths: paths, config: vmConfig))
+            setStatus(
+                "Starting \(modeText)",
+                detail: statusDetail(paths: paths, config: loaded.config, preparation: loaded.preparation)
+            )
 
             vm.start { [weak self] result in
                 DispatchQueue.main.async {
@@ -866,14 +910,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func makeStorageDevices(paths: VMPaths, mode: VMMode) throws -> [VZStorageDeviceConfiguration] {
-        let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: paths.disk, readOnly: false)
+        let diskAttachment = try DiskImageAttachmentFactory.make(url: paths.disk, readOnly: false)
         let diskDevice = VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
 
         switch mode {
         case .installed:
             return [diskDevice]
         case .installer(let iso):
-            let isoAttachment = try VZDiskImageStorageDeviceAttachment(url: iso, readOnly: true)
+            let isoAttachment = try DiskImageAttachmentFactory.make(url: iso, readOnly: true)
             let isoDevice = VZVirtioBlockDeviceConfiguration(attachment: isoAttachment)
             return [isoDevice, diskDevice]
         }

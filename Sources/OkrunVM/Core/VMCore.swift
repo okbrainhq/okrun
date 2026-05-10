@@ -575,16 +575,36 @@ enum DirectorySharingDeviceFactory {
 }
 
 enum VMStorage {
-    static func prepare(paths: VMPaths, config: VMConfig) throws {
+    struct PreparationResult: Equatable {
+        enum DiskChange: Equatable {
+            case created(size: UInt64)
+            case expanded(from: UInt64, to: UInt64)
+            case unchanged(size: UInt64)
+        }
+
+        let diskChange: DiskChange
+
+        var expandedDisk: Bool {
+            if case .expanded = diskChange {
+                return true
+            }
+            return false
+        }
+    }
+
+    @discardableResult
+    static func prepare(paths: VMPaths, config: VMConfig) throws -> PreparationResult {
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
 
         let configuredDiskSize = UInt64(config.diskGB) * 1024 * 1024 * 1024
+        let diskChange: PreparationResult.DiskChange
         if !fileManager.fileExists(atPath: paths.disk.path) {
             fileManager.createFile(atPath: paths.disk.path, contents: nil)
             let handle = try FileHandle(forWritingTo: paths.disk)
             try handle.truncate(atOffset: configuredDiskSize)
             try handle.close()
+            diskChange = .created(size: configuredDiskSize)
         } else {
             let attributes = try fileManager.attributesOfItem(atPath: paths.disk.path)
             let currentSize = attributes[.size] as? UInt64 ?? 0
@@ -592,8 +612,11 @@ enum VMStorage {
                 let handle = try FileHandle(forWritingTo: paths.disk)
                 try handle.truncate(atOffset: configuredDiskSize)
                 try handle.close()
+                diskChange = .expanded(from: currentSize, to: configuredDiskSize)
             } else if currentSize > configuredDiskSize {
                 throw AppError("Existing disk is larger than diskGB in the config. Increase diskGB or move \(paths.disk.path).")
+            } else {
+                diskChange = .unchanged(size: currentSize)
             }
         }
 
@@ -605,6 +628,19 @@ enum VMStorage {
             let machineIdentifier = VZGenericMachineIdentifier()
             try machineIdentifier.dataRepresentation.write(to: paths.machineIdentifier, options: .atomic)
         }
+
+        return PreparationResult(diskChange: diskChange)
+    }
+}
+
+enum DiskImageAttachmentFactory {
+    static func make(url: URL, readOnly: Bool) throws -> VZDiskImageStorageDeviceAttachment {
+        try VZDiskImageStorageDeviceAttachment(
+            url: url,
+            readOnly: readOnly,
+            cachingMode: .automatic,
+            synchronizationMode: readOnly ? .fsync : .full
+        )
     }
 }
 

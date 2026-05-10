@@ -906,7 +906,7 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
     }
 
     private func makeStorageDevice() throws -> VZStorageDeviceConfiguration {
-        let attachment = try VZDiskImageStorageDeviceAttachment(url: diskOverride ?? paths.disk, readOnly: false)
+        let attachment = try DiskImageAttachmentFactory.make(url: diskOverride ?? paths.disk, readOnly: false)
         return VZVirtioBlockDeviceConfiguration(attachment: attachment)
     }
 

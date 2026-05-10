@@ -254,11 +254,12 @@ struct OkrunVMTests {
         let paths = VMPaths.project(at: project)
         let config = VMConfig(cpuCount: 2, memoryGB: 2, diskGB: 1, installerISOPath: nil)
 
-        try VMStorage.prepare(paths: paths, config: config)
+        let result = try VMStorage.prepare(paths: paths, config: config)
 
         #expect(FileManager.default.fileExists(atPath: paths.disk.path))
         #expect(FileManager.default.fileExists(atPath: paths.efiStore.path))
         #expect(FileManager.default.fileExists(atPath: paths.machineIdentifier.path))
+        #expect(result.diskChange == .created(size: 1_073_741_824))
 
         let attributes = try FileManager.default.attributesOfItem(atPath: paths.disk.path)
         #expect(attributes[.size] as? UInt64 == 1_073_741_824)
@@ -277,9 +278,13 @@ struct OkrunVMTests {
         try handle.truncate(atOffset: 1_073_741_824)
         try handle.close()
 
-        try VMStorage.prepare(paths: paths, config: VMConfig(cpuCount: 2, memoryGB: 2, diskGB: 2, installerISOPath: nil))
+        let result = try VMStorage.prepare(
+            paths: paths,
+            config: VMConfig(cpuCount: 2, memoryGB: 2, diskGB: 2, installerISOPath: nil)
+        )
         var attributes = try FileManager.default.attributesOfItem(atPath: paths.disk.path)
         #expect(attributes[.size] as? UInt64 == 2_147_483_648)
+        #expect(result.diskChange == .expanded(from: 1_073_741_824, to: 2_147_483_648))
 
         #expect(throws: (any Error).self) {
             try VMStorage.prepare(paths: paths, config: VMConfig(cpuCount: 2, memoryGB: 2, diskGB: 1, installerISOPath: nil))
