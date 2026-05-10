@@ -86,6 +86,7 @@ assert_file_contains "$GUEST_ROOT/etc/systemd/system/okrun-guest-health.service"
 assert_file_contains "$GUEST_ROOT/etc/systemd/system/okrun-guest-health.service" "EnvironmentFile=/etc/okrun/guest-tools.env"
 assert_file_contains "$GUEST_ROOT/etc/systemd/system/okrun-guest-health.service" "ExecStart=/usr/local/lib/okrun/okrun-guest-health.sh"
 assert_file_contains "$GUEST_ROOT/etc/okrun/guest-tools.env" "OKRUN_LOG_DIR=/mnt/okrun/okrun-guest-logs"
+assert_file_contains "$GUEST_ROOT/etc/okrun/guest-tools.env" "OKRUN_LOG_PROBE_TIMEOUT=8"
 assert_file_contains "$GUEST_ROOT/etc/systemd/system/mnt-okrun.mount" "What=okrun"
 assert_file_contains "$GUEST_ROOT/etc/systemd/system/mnt-okrun.mount" "Where=/mnt/okrun"
 assert_file_contains "$GUEST_ROOT/etc/systemd/system/mnt-okrun.mount" "Type=virtiofs"
@@ -173,9 +174,9 @@ chmod +x "$BIN_DIR/cut" "$BIN_DIR/date"
 
 ROTATE_LOG_DIR="$WORK_DIR/rotate-logs"
 mkdir -p "$ROTATE_LOG_DIR"
-printf '%01200d\n' 1 >"$ROTATE_LOG_DIR/guest-health.log"
+printf '%060000d\n' 1 >"$ROTATE_LOG_DIR/guest-health.log"
 OKRUN_LOG_DIR="$ROTATE_LOG_DIR" \
-  OKRUN_LOG_MAX_BYTES=1000 \
+  OKRUN_LOG_MAX_BYTES=50000 \
   OKRUN_LOG_KEEP=2 \
   OKRUN_HEALTH_ONCE=1 \
   PATH="$BIN_DIR:$PATH" \

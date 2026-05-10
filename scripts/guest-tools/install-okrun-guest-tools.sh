@@ -100,6 +100,7 @@ install -d -m 0755 "$(guest_path /usr/local/lib/okrun)" "$(guest_path /usr/local
 install -m 0755 "$(dirname "$0")/okrun-guest-health.sh" "$(guest_path /usr/local/lib/okrun/okrun-guest-health.sh)"
 cat >"$(guest_path /etc/okrun/guest-tools.env)" <<EOF
 OKRUN_LOG_DIR=$LOG_DIR
+OKRUN_LOG_PROBE_TIMEOUT=8
 EOF
 
 install -d -m 0755 "$(guest_path /etc/systemd/system)"
@@ -129,36 +130,98 @@ if [[ -r /etc/okrun/guest-tools.env ]]; then
   source /etc/okrun/guest-tools.env
 fi
 OKRUN_LOG_DIR="${OKRUN_LOG_DIR:-/mnt/okrun/okrun-guest-logs}"
+OKRUN_LOG_PROBE_TIMEOUT="${OKRUN_LOG_PROBE_TIMEOUT:-8}"
+KERNEL_ALERT_PATTERN='bug:|oops:|kernel panic|i/o error|blk_update_request|buffer i/o|ext4-fs error|ext4.*error|oom|out of memory|hung task|blocked for more than|soft lockup|hard lockup|rcu:.*stall|rcu_sched.*stall|rcu_preempt.*stall|segfault|unable to handle|internal error|call trace|tainted'
+KERNEL_FAULT_CONTEXT_PATTERN='bug:|oops|kernel panic|unable to handle|internal error|undefined instruction|fixing recursive fault|segfault|tainted'
 
 section() {
   printf '\n== %s ==\n' "$1"
 }
 
+run_probe() {
+  local name="$1"
+  shift
+
+  printf '\n-- %s --\n' "$name"
+  if [[ "$OKRUN_LOG_PROBE_TIMEOUT" =~ ^[0-9]+$ ]] && command -v timeout >/dev/null 2>&1; then
+    timeout --kill-after=2s "$OKRUN_LOG_PROBE_TIMEOUT" "$@" 2>&1 || true
+  else
+    "$@" 2>&1 || true
+  fi
+}
+
 section "Identity"
-hostnamectl 2>/dev/null || hostname
-uname -a
+run_probe hostname hostname
+run_probe hostnamectl hostnamectl
+run_probe uname uname -a
+[[ -r /proc/cmdline ]] && run_probe proc-cmdline cat /proc/cmdline
+[[ -r /proc/sys/kernel/tainted ]] && run_probe kernel-tainted cat /proc/sys/kernel/tainted
 
 section "Memory"
-free -h 2>/dev/null || cat /proc/meminfo
+run_probe free free -h
+[[ -r /proc/meminfo ]] && run_probe meminfo cat /proc/meminfo
+[[ -r /proc/sys/vm/swappiness ]] && run_probe vm-swappiness cat /proc/sys/vm/swappiness
+[[ -r /proc/sys/vm/overcommit_memory ]] && run_probe vm-overcommit-memory cat /proc/sys/vm/overcommit_memory
+[[ -r /proc/sys/vm/overcommit_ratio ]] && run_probe vm-overcommit-ratio cat /proc/sys/vm/overcommit_ratio
+[[ -r /proc/sys/vm/panic_on_oom ]] && run_probe vm-panic-on-oom cat /proc/sys/vm/panic_on_oom
+[[ -r /proc/pressure/cpu ]] && run_probe pressure-cpu cat /proc/pressure/cpu
+[[ -r /proc/pressure/io ]] && run_probe pressure-io cat /proc/pressure/io
+[[ -r /proc/pressure/memory ]] && run_probe pressure-memory cat /proc/pressure/memory
 
 section "Disk"
-lsblk -f 2>/dev/null || true
-df -hT / /boot /boot/efi /mnt/okrun 2>/dev/null || true
-findmnt -R / /mnt/okrun 2>/dev/null || true
+run_probe lsblk lsblk -f
+run_probe df df -hT / /boot /boot/efi /mnt/okrun
+run_probe findmnt-root findmnt -R /
+run_probe findmnt-okrun findmnt -R /mnt/okrun
+[[ -r /proc/mounts ]] && run_probe proc-mounts cat /proc/mounts
+[[ -r /proc/partitions ]] && run_probe proc-partitions cat /proc/partitions
 
 section "Network"
-ip -br addr 2>/dev/null || true
-ip route 2>/dev/null || true
+run_probe ip-addr ip -br addr
+run_probe ip-route ip route
+
+section "Sandbox Setup"
+run_probe sandbox-user bash -c "id brain-sandbox; getent passwd brain-sandbox; stat -c '%A %U:%G %n' /home/brain-sandbox /home/brain-sandbox/apps /home/brain-sandbox/upload_images /home/brain-sandbox/skills /home/brain-sandbox/.local /var/www/brain-data 2>/dev/null || true"
+run_probe setup-processes bash -c "ps -eo pid,ppid,stat,wchan:24,comm,args,%cpu,%mem 2>/dev/null | grep -Ei 'apt|dpkg|pip|npm|node|systemd-run|curl|setup-sandbox|brain-sandbox' | grep -v grep | head -100 || true"
+run_probe package-versions bash -c "for command in node npm python3 pip3 curl git ffmpeg jq; do if command -v \"\$command\" >/dev/null 2>&1; then printf '%s: ' \"\$command\"; \"\$command\" --version 2>&1 | head -1; else printf '%s: missing\n' \"\$command\"; fi; done"
+run_probe resolv-conf bash -c "ls -l /etc/resolv.conf /etc/resolv.conf.head /home/brain-sandbox/resolv.conf 2>/dev/null || true; sed -n '1,40p' /etc/resolv.conf 2>/dev/null || true; sed -n '1,40p' /home/brain-sandbox/resolv.conf 2>/dev/null || true"
+[[ -r /etc/sudoers.d/brain-shell-sandbox ]] && run_probe sandbox-sudoers bash -c "stat -c '%A %U:%G %n' /etc/sudoers.d/brain-shell-sandbox; sed -n '1,30p' /etc/sudoers.d/brain-shell-sandbox"
+if command -v systemctl >/dev/null 2>&1; then
+  run_probe systemd-jobs systemctl list-jobs --no-pager
+  run_probe systemd-run-units bash -c "systemctl list-units 'run-*.service' 'run-*.scope' --all --no-pager --plain 2>/dev/null | head -120 || true"
+fi
+if command -v iptables >/dev/null 2>&1; then
+  run_probe iptables-sandbox bash -c "iptables -S OUTPUT 2>/dev/null | grep SANDBOX_OUT || true; iptables -S SANDBOX_OUT 2>/dev/null || true"
+fi
+if command -v ip6tables >/dev/null 2>&1; then
+  run_probe ip6tables-output bash -c "ip6tables -S OUTPUT 2>/dev/null | head -120 || true"
+fi
+[[ -r /etc/cron.hourly/brain-sandbox-cleanup ]] && run_probe sandbox-cron-cleanup bash -c "stat -c '%A %U:%G %n' /etc/cron.hourly/brain-sandbox-cleanup; sed -n '1,120p' /etc/cron.hourly/brain-sandbox-cleanup"
+[[ -r /var/log/apt/history.log ]] && run_probe apt-history-tail tail -120 /var/log/apt/history.log
+[[ -r /var/log/dpkg.log ]] && run_probe dpkg-tail tail -120 /var/log/dpkg.log
 
 section "Swap"
-swapon --show 2>/dev/null || true
+[[ -r /proc/swaps ]] && run_probe proc-swaps cat /proc/swaps
+[[ -r /etc/fstab ]] && run_probe fstab-swap bash -c "grep -E '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab || true"
+run_probe swapon swapon --show
+run_probe vmstat vmstat 1 2
+
+section "Processes"
+run_probe ps-top bash -c 'ps -eo pid,ppid,stat,wchan:24,comm,%cpu,%mem --sort=-%cpu 2>/dev/null | head -40'
+run_probe ps-blocked bash -c "ps -eo pid,ppid,stat,wchan:24,comm,args 2>/dev/null | awk '\$3 ~ /D/ { print }' | head -80"
+
+section "Systemd"
+run_probe systemd-failed systemctl --failed --no-pager
 
 section "Recent Okrun Health"
-tail -200 "$OKRUN_LOG_DIR/guest-health.log" 2>/dev/null || true
+run_probe guest-health tail -300 "$OKRUN_LOG_DIR/guest-health.log"
 
 section "Kernel Alerts"
-journalctl -k --since '30 minutes ago' --no-pager 2>/dev/null |
-  grep -Ei 'bug:|i/o error|blk_update_request|buffer i/o|ext4-fs error|oom|out of memory|hung task|soft lockup|hard lockup' || true
+run_probe kernel-alert bash -c "journalctl -k --since '60 minutes ago' --no-pager 2>/dev/null | grep -Ei '$KERNEL_ALERT_PATTERN' | tail -200 || true"
+run_probe kernel-fault-context bash -c "if journalctl -k --since '60 minutes ago' --no-pager 2>/dev/null | grep -Eiq '$KERNEL_FAULT_CONTEXT_PATTERN'; then journalctl -k --since '60 minutes ago' --no-pager 2>/dev/null | tail -300; fi"
+
+section "System Alerts"
+run_probe system-alert bash -c "journalctl --since '60 minutes ago' --priority=warning..alert --no-pager 2>/dev/null | tail -200 || true"
 EOF
 chmod 0755 "$(guest_path /usr/local/sbin/okrun-guest-diagnose)"
 
@@ -394,7 +457,8 @@ elif command -v systemctl >/dev/null 2>&1; then
   fi
 
   require_log_share
-  systemctl enable --now okrun-guest-health.service
+  systemctl enable okrun-guest-health.service
+  systemctl restart okrun-guest-health.service
 
   if [[ "$installed_private_network_config" == "1" ]]; then
     systemctl enable systemd-networkd
