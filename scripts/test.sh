@@ -8,4 +8,5 @@ export SWIFTPM_HOME="$ROOT/.build/swiftpm-home"
 mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFTPM_HOME"
 
 (cd "$ROOT" && swift test --disable-sandbox)
+"$ROOT/scripts/e2e-guest-tools-installer.sh"
 "$ROOT/scripts/e2e-headless-boot.sh"

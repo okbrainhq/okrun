@@ -92,6 +92,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         NSApp.setActivationPolicy(.regular)
         installAppIcon()
         buildWindow()
+        AppLog.lifecycle.info(
+            "Launching OkrunVM pid=\(getpid()) bundle=\(Bundle.main.bundleURL.path, privacy: .public) executable=\(Bundle.main.executableURL?.path ?? "unknown", privacy: .public)"
+        )
 
         do {
             registry = try projectStore.load(defaultProject: ProjectStore.defaultProjectRoot())
@@ -426,6 +429,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         paths = discoveredPaths
         vmConfig = config
+        AppLog.lifecycle.info(
+            "Loaded project path=\(discoveredPaths.root.path, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count)"
+        )
         setStatus("Ready", detail: statusDetail(paths: discoveredPaths, config: config))
         setControlsEnabled(canStart: true, canStop: false)
     }
@@ -466,6 +472,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             let paths = VMPaths.project(at: request.projectURL)
             try request.config.save(to: paths.config)
             _ = try prepareStorage(paths: paths, config: request.config)
+            AppLog.lifecycle.info(
+                "Created project path=\(paths.root.path, privacy: .public) cpu=\(request.config.cpuCount) memoryGB=\(request.config.memoryGB) diskGB=\(request.config.diskGB)"
+            )
 
             let path = projectStore.standardPath(request.projectURL)
             if !registry.projects.contains(path) {
@@ -502,6 +511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         do {
+            AppLog.lifecycle.warning("Deleting project path=\(selectedProject, privacy: .public)")
             let fileManager = FileManager.default
             if fileManager.fileExists(atPath: selectedProject) {
                 try fileManager.removeItem(atPath: selectedProject)
@@ -713,7 +723,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         do {
             currentConfig = try VMConfig.load(from: paths.config)
             vmConfig = currentConfig
+            AppLog.lifecycle.info(
+                "Reloaded installer config project=\(paths.root.path, privacy: .public) cpu=\(currentConfig.cpuCount) memoryGB=\(currentConfig.memoryGB) diskGB=\(currentConfig.diskGB)"
+            )
         } catch {
+            AppLog.lifecycle.error("Installer config reload failed project=\(paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             setStatus("Config reload failed", detail: error.localizedDescription)
             return
         }
@@ -736,8 +750,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             )
             try updatedConfig.save(to: paths.config)
             self.vmConfig = updatedConfig
+            AppLog.lifecycle.info("Updated installer ISO project=\(paths.root.path, privacy: .public) iso=\(iso.path, privacy: .public)")
             start(mode: .installer(iso))
         } catch {
+            AppLog.lifecycle.error("ISO update failed project=\(paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             setStatus("ISO update failed", detail: error.localizedDescription)
         }
     }
@@ -751,10 +767,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         do {
             if virtualMachine.canRequestStop {
                 try virtualMachine.requestStop()
+                AppLog.virtualMachine.info("Requested graceful shutdown project=\(self.paths?.root.path ?? "unknown", privacy: .public)")
                 setStatus("Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
                 return
             }
         } catch {
+            AppLog.virtualMachine.error("Graceful shutdown failed project=\(self.paths?.root.path ?? "unknown", privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             setStatus("Graceful shutdown failed", detail: error.localizedDescription)
             return
         }
@@ -765,10 +783,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
 
         setStatus("Force shutdown", detail: "Force-stopping the VM.")
+        AppLog.virtualMachine.warning("Force-stopping VM project=\(self.paths?.root.path ?? "unknown", privacy: .public)")
         virtualMachine.stop { [weak self] error in
             if let error {
+                AppLog.virtualMachine.error("Force stop failed error=\(error.localizedDescription, privacy: .public)")
                 self?.setStatus("Shutdown failed", detail: error.localizedDescription)
             } else {
+                AppLog.virtualMachine.info("Force stop completed")
                 self?.releaseProjectLock()
                 PrivateNetworkRuntimeRegistry.shared.releaseAll()
                 self?.virtualMachine = nil
@@ -793,6 +814,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         do {
             try acquireProjectLock(paths: paths)
             let loaded = try reloadSelectedProjectConfiguration()
+            AppLog.virtualMachine.info(
+                "Starting VM project=\(paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) cpu=\(loaded.config.cpuCount) memoryGB=\(loaded.config.memoryGB) diskGB=\(loaded.config.diskGB) privateNetwork=\(loaded.config.privateNetwork.enabled) sharedDirectories=\(loaded.config.sharedDirectories.count) diskChange=\(String(describing: loaded.preparation.diskChange), privacy: .public)"
+            )
             let configuration = try makeConfiguration(paths: paths, config: loaded.config, mode: mode)
             let vm = VZVirtualMachine(configuration: configuration)
             vm.delegate = self
@@ -817,9 +841,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
+                        AppLog.virtualMachine.info("VM started project=\(self?.paths?.root.path ?? "unknown", privacy: .public)")
                         self?.setControlsEnabled(canStart: false, canStop: true)
                         self?.setStatus("Running", detail: self?.runtimeDetail("Mode: \(modeText)") ?? "")
                     case .failure(let error):
+                        AppLog.virtualMachine.error("VM start failed project=\(self?.paths?.root.path ?? "unknown", privacy: .public) error=\(error.localizedDescription, privacy: .public)")
                         self?.releaseProjectLock()
                         PrivateNetworkRuntimeRegistry.shared.releaseAll()
                         self?.virtualMachine = nil
@@ -830,6 +856,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 }
             }
         } catch {
+            AppLog.virtualMachine.error("VM configuration failed project=\(paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             releaseProjectLock()
             PrivateNetworkRuntimeRegistry.shared.releaseAll()
             setControlsEnabled(canStart: true, canStop: false)
@@ -936,6 +963,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         DispatchQueue.main.async { [weak self] in
+            AppLog.virtualMachine.info("Guest stopped project=\(self?.paths?.root.path ?? "unknown", privacy: .public)")
             self?.releaseProjectLock()
             PrivateNetworkRuntimeRegistry.shared.releaseAll()
             self?.virtualMachine = nil
@@ -947,6 +975,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         DispatchQueue.main.async { [weak self] in
+            AppLog.virtualMachine.error("VM stopped with error project=\(self?.paths?.root.path ?? "unknown", privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             self?.releaseProjectLock()
             PrivateNetworkRuntimeRegistry.shared.releaseAll()
             self?.virtualMachine = nil

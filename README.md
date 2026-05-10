@@ -309,3 +309,80 @@ then shut down the VM and shrink `vm/linux.raw` on macOS with `truncate`.
 Run fewer or smaller VMs when macOS shows sustained memory pressure or swap use;
 guest performance can degrade sharply once the host starts compressing and
 swapping VM memory.
+
+## Diagnostics
+
+Okrun writes host-side lifecycle, storage, and VM start/stop events to macOS
+Unified Logging under the `local.okrun.vm` subsystem. Stream logs while
+reproducing an issue:
+
+```sh
+log stream --style compact --predicate 'subsystem == "local.okrun.vm"'
+```
+
+Show recent Okrun logs after a VM hangs or stops:
+
+```sh
+log show --last 2h --style compact --predicate 'subsystem == "local.okrun.vm"'
+```
+
+These logs include the app bundle path, selected project, CPU/RAM/disk config,
+disk image apparent and allocated sizes, disk expansion warnings, and VM
+start/stop errors.
+
+For a broader host-side snapshot, run:
+
+```sh
+./scripts/diagnose.sh
+```
+
+This prints Okrun processes, VM service CPU/memory, disk image ownership, host
+memory pressure, GPT layouts, and recent Okrun logs.
+
+## Guest Tools
+
+After installing Linux and enabling SSH inside any Okrun VM, install the generic
+guest tools from the Mac:
+
+```sh
+./scripts/install-guest-tools.sh <hostname-or-ip>
+```
+
+Use `--user`, `--port`, or `--identity` for SSH options:
+
+```sh
+./scripts/install-guest-tools.sh --user arunoda --port 22 192.168.64.16
+```
+
+The installer copies scripts into the guest with `scp`, then uses `sudo` over
+SSH to install:
+
+- `okrun-guest-health.service`, which logs memory, disk, network, swap, mount,
+  and recent kernel alert snapshots to `/var/log/okrun/guest-health.log`.
+- `okrun-guest-diagnose`, a one-shot guest diagnostic command.
+- `/mnt/okrun` VirtioFS mount support via `mnt-okrun.mount`.
+
+To also persist a private-network IP on the guest, pass a CIDR address. The
+installer auto-detects an interface without IPv4, or you can pass
+`--private-iface`:
+
+```sh
+./scripts/install-guest-tools.sh --private-ip 10.77.0.3/24 <hostname-or-ip>
+./scripts/install-guest-tools.sh --private-ip 10.77.0.3/24 --private-iface enp0s2 <hostname-or-ip>
+```
+
+To try growing the guest root filesystem after increasing `diskGB`, pass
+`--resize-root`. This uses `growpart` when available and only works when free
+space is adjacent to the root partition:
+
+```sh
+./scripts/install-guest-tools.sh --resize-root <hostname-or-ip>
+```
+
+Inside the guest, inspect logs and state with:
+
+```sh
+sudo tail -f /var/log/okrun/guest-health.log
+sudo okrun-guest-diagnose
+systemctl status okrun-guest-health.service
+```

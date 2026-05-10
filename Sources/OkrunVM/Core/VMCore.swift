@@ -5,6 +5,15 @@ import Virtualization
 enum VMMode {
     case installer(URL)
     case installed
+
+    var logDescription: String {
+        switch self {
+        case .installer(let url):
+            return "installer:\(url.lastPathComponent)"
+        case .installed:
+            return "installed"
+        }
+    }
 }
 
 struct VMPaths {
@@ -163,6 +172,19 @@ struct AppError: LocalizedError {
 
     var errorDescription: String? {
         message
+    }
+}
+
+struct DiskImageInfo: Equatable {
+    let apparentSize: UInt64
+    let allocatedSize: UInt64?
+
+    static func load(from url: URL) throws -> DiskImageInfo {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let apparentSize = attributes[.size] as? UInt64 ?? 0
+        let values = try url.resourceValues(forKeys: [.fileAllocatedSizeKey, .totalFileAllocatedSizeKey])
+        let allocatedSize = values.totalFileAllocatedSize ?? values.fileAllocatedSize
+        return DiskImageInfo(apparentSize: apparentSize, allocatedSize: allocatedSize.map(UInt64.init))
     }
 }
 
@@ -629,7 +651,21 @@ enum VMStorage {
             try machineIdentifier.dataRepresentation.write(to: paths.machineIdentifier, options: .atomic)
         }
 
-        return PreparationResult(diskChange: diskChange)
+        let result = PreparationResult(diskChange: diskChange)
+        let diskInfo = try? DiskImageInfo.load(from: paths.disk)
+        AppLog.storage.info(
+            """
+            Prepared storage project=\(paths.root.path, privacy: .public) disk=\(paths.disk.path, privacy: .public) configuredGB=\(config.diskGB) change=\(String(describing: diskChange), privacy: .public) apparentBytes=\(diskInfo?.apparentSize ?? 0) allocatedBytes=\(diskInfo?.allocatedSize ?? 0)
+            """
+        )
+
+        if result.expandedDisk {
+            AppLog.storage.warning(
+                "Disk image expanded for project=\(paths.root.path, privacy: .public). Guest partition/filesystem still needs to be grown inside Linux."
+            )
+        }
+
+        return result
     }
 }
 
