@@ -553,6 +553,10 @@ enum SharedDirectoryValidator {
 
         for directory in sharedDirectories {
             let name = directory.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if name == ManagedGuestTools.logShareName {
+                continue
+            }
+
             guard !name.isEmpty else {
                 throw AppError("sharedDirectories name must not be empty.")
             }
@@ -577,17 +581,38 @@ enum SharedDirectoryValidator {
     }
 }
 
+enum ManagedGuestTools {
+    static let logShareName = "okrun-guest-logs"
+
+    static func guestLogsDirectory(in paths: VMPaths) -> URL {
+        paths.vmDirectory.appendingPathComponent("guest-logs", isDirectory: true)
+    }
+}
+
 enum DirectorySharingDeviceFactory {
-    static func makeDevices(for sharedDirectories: [SharedDirectoryConfig]) throws -> [VZDirectorySharingDeviceConfiguration] {
-        guard !sharedDirectories.isEmpty else { return [] }
+    static func makeDevices(
+        for sharedDirectories: [SharedDirectoryConfig],
+        managedGuestLogsDirectory: URL? = nil
+    ) throws -> [VZDirectorySharingDeviceConfiguration] {
         try SharedDirectoryValidator.validate(sharedDirectories)
 
         var directories: [String: VZSharedDirectory] = [:]
         for directory in sharedDirectories {
             let name = directory.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if name == ManagedGuestTools.logShareName {
+                continue
+            }
+
             let url = URL(fileURLWithPath: directory.hostPath, isDirectory: true)
             directories[name] = VZSharedDirectory(url: url, readOnly: directory.readOnly)
         }
+
+        if let managedGuestLogsDirectory {
+            try FileManager.default.createDirectory(at: managedGuestLogsDirectory, withIntermediateDirectories: true)
+            directories[ManagedGuestTools.logShareName] = VZSharedDirectory(url: managedGuestLogsDirectory, readOnly: false)
+        }
+
+        guard !directories.isEmpty else { return [] }
 
         let share = VZMultipleDirectoryShare(directories: directories)
         let device = VZVirtioFileSystemDeviceConfiguration(tag: SharedDirectoryValidator.tag)

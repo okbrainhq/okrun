@@ -182,6 +182,20 @@ struct OkrunVMTests {
                 sharedDirectories: [SharedDirectoryConfig(name: "file", hostPath: fileURL.path, readOnly: false)]
             ).validated()
         }
+
+        #expect(try VMConfig(
+            cpuCount: 4,
+            memoryGB: 4,
+            diskGB: 64,
+            installerISOPath: nil,
+            sharedDirectories: [
+                SharedDirectoryConfig(
+                    name: ManagedGuestTools.logShareName,
+                    hostPath: project.appendingPathComponent("ignored-missing").path,
+                    readOnly: true
+                )
+            ]
+        ).validated().sharedDirectories.count == 1)
     }
 
     @Test
@@ -199,6 +213,33 @@ struct OkrunVMTests {
             SharedDirectoryConfig(name: "readonly", hostPath: readOnlyDirectory.path, readOnly: true)
         ])
 
+        #expect(devices.count == 1)
+        let device = try #require(devices.first as? VZVirtioFileSystemDeviceConfiguration)
+        #expect(device.tag == SharedDirectoryValidator.tag)
+        #expect(device.share is VZMultipleDirectoryShare)
+    }
+
+    @Test
+    func directorySharingDeviceFactoryAddsManagedGuestLogsShare() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let managedLogsDirectory = project.appendingPathComponent("vm/guest-logs", isDirectory: true)
+        let ignoredDirectory = project.appendingPathComponent("ignored", isDirectory: true)
+        try FileManager.default.createDirectory(at: ignoredDirectory, withIntermediateDirectories: true)
+
+        let devices = try DirectorySharingDeviceFactory.makeDevices(
+            for: [
+                SharedDirectoryConfig(
+                    name: ManagedGuestTools.logShareName,
+                    hostPath: ignoredDirectory.path,
+                    readOnly: true
+                )
+            ],
+            managedGuestLogsDirectory: managedLogsDirectory
+        )
+
+        #expect(FileManager.default.fileExists(atPath: managedLogsDirectory.path))
         #expect(devices.count == 1)
         let device = try #require(devices.first as? VZVirtioFileSystemDeviceConfiguration)
         #expect(device.tag == SharedDirectoryValidator.tag)

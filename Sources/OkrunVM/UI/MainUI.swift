@@ -909,7 +909,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork)
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode)
-        configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(for: config.sharedDirectories)
+        configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
+            for: config.sharedDirectories,
+            managedGuestLogsDirectory: ManagedGuestTools.guestLogsDirectory(in: paths)
+        )
 
         try configuration.validate()
         return configuration

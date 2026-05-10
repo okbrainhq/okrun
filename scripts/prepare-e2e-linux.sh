@@ -56,6 +56,11 @@ cat > "$WORK_DIR/init" <<'EOF'
 /sbin/modprobe virtiofs 2>/dev/null || true
 
 if /bin/busybox mount -t virtiofs okrun /mnt/okrun 2>/dev/console; then
+  if [ -d /mnt/okrun/okrun-guest-logs ]; then
+    echo OKRUN_E2E_GUEST_LOGS_SHARE_PASSED >/dev/console
+    echo OKRUN_E2E_GUEST_LOGS_SHARE_PASSED >/dev/hvc0 2>/dev/null || true
+  fi
+
   if [ "$(/bin/busybox cat /mnt/okrun/e2e/host-to-guest.txt 2>/dev/null)" = "hello-from-host" ]; then
     echo hello-from-guest >/mnt/okrun/e2e/guest-to-host.txt
     echo OKRUN_E2E_SHARED_DIRS_PASSED >/dev/console

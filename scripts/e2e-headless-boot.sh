@@ -36,8 +36,10 @@ PRIVATE_NETWORK_CLIENT_INITRAMFS="$(sed -n '6p' /tmp/okrun-e2e-linux-paths.txt)"
   --timeout 45
 
 SHARED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/okrun-e2e-shared.XXXXXX")"
+GUEST_LOGS_DIR="${SHARED_DIR%/*}/okrun-e2e-guest-logs.$$"
 cleanup() {
   rm -rf "$SHARED_DIR"
+  rm -rf "$GUEST_LOGS_DIR"
 }
 trap cleanup EXIT
 
@@ -47,7 +49,20 @@ echo hello-from-host > "$SHARED_DIR/host-to-guest.txt"
   --headless-boot-test \
   --kernel "$KERNEL" \
   --initramfs "$SHARED_INITRAMFS" \
+  --guest-logs-directory "$GUEST_LOGS_DIR" \
+  --timeout 45
+
+if [[ ! -d "$GUEST_LOGS_DIR" ]]; then
+  echo "Guest logs share E2E failed: host log directory was not created." >&2
+  exit 1
+fi
+
+"$ROOT/OkrunVM.app/Contents/MacOS/OkrunVM" \
+  --headless-boot-test \
+  --kernel "$KERNEL" \
+  --initramfs "$SHARED_INITRAMFS" \
   --shared-directory "$SHARED_DIR" \
+  --guest-logs-directory "$GUEST_LOGS_DIR" \
   --timeout 45
 
 if [[ "$(cat "$SHARED_DIR/guest-to-host.txt" 2>/dev/null)" != "hello-from-guest" ]]; then

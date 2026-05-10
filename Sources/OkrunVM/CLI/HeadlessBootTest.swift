@@ -7,9 +7,16 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     private let initialRamdiskURL: URL
     private let timeout: TimeInterval
     private let sharedDirectory: SharedDirectoryConfig?
+    private let managedGuestLogsDirectory: URL?
     private let privateNetwork: PrivateNetworkConfig
     private var expectedOutput: String {
-        sharedDirectory == nil ? "OKRUN_E2E_BOOTED" : "OKRUN_E2E_SHARED_DIRS_PASSED"
+        if sharedDirectory != nil {
+            return "OKRUN_E2E_SHARED_DIRS_PASSED"
+        }
+        if managedGuestLogsDirectory != nil {
+            return "OKRUN_E2E_GUEST_LOGS_SHARE_PASSED"
+        }
+        return "OKRUN_E2E_BOOTED"
     }
     private let completion = DispatchSemaphore(value: 0)
     private var virtualMachine: VZVirtualMachine?
@@ -21,12 +28,14 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         initialRamdiskURL: URL,
         timeout: TimeInterval,
         sharedDirectory: SharedDirectoryConfig?,
+        managedGuestLogsDirectory: URL?,
         privateNetwork: PrivateNetworkConfig
     ) {
         self.kernelURL = kernelURL
         self.initialRamdiskURL = initialRamdiskURL
         self.timeout = timeout
         self.sharedDirectory = sharedDirectory
+        self.managedGuestLogsDirectory = managedGuestLogsDirectory
         self.privateNetwork = privateNetwork
     }
 
@@ -90,6 +99,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                 initialRamdiskURL: options.initialRamdisk,
                 timeout: options.timeout,
                 sharedDirectory: options.sharedDirectory,
+                managedGuestLogsDirectory: options.managedGuestLogsDirectory,
                 privateNetwork: options.privateNetwork
             )
             try test.run()
@@ -121,6 +131,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         privateNetwork: PrivateNetworkConfig,
         privateNetworkServerInitialRamdisk: URL?,
         privateNetworkClientInitialRamdisk: URL?,
+        managedGuestLogsDirectory: URL?,
         projectRoot: URL?
     ) {
         var kernelPath: String?
@@ -129,6 +140,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         var privateNetworkClientInitialRamdiskPath: String?
         var timeout: TimeInterval = 30
         var sharedDirectoryPath: String?
+        var managedGuestLogsDirectoryPath: String?
         var privateNetwork = PrivateNetworkConfig.disabled
         var projectRootPath: String?
         var iterator = arguments.dropFirst().makeIterator()
@@ -150,6 +162,8 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                 timeout = parsed
             case "--shared-directory":
                 sharedDirectoryPath = iterator.next()
+            case "--guest-logs-directory":
+                managedGuestLogsDirectoryPath = iterator.next()
             case "--private-network":
                 privateNetwork = PrivateNetworkConfig(enabled: true)
             case "--private-network-id":
@@ -203,6 +217,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         let sharedDirectory = sharedDirectoryPath.map {
             SharedDirectoryConfig(name: "e2e", hostPath: $0, readOnly: false)
         }
+        let managedGuestLogsDirectory = managedGuestLogsDirectoryPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
 
         return (
             kernel,
@@ -212,6 +227,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             try privateNetwork.validated(),
             privateNetworkServerInitialRamdisk,
             privateNetworkClientInitialRamdisk,
+            managedGuestLogsDirectory,
             projectRoot
         )
     }
@@ -278,7 +294,8 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         )
         configuration.serialPorts = [serialPort]
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
-            for: sharedDirectory.map { [$0] } ?? []
+            for: sharedDirectory.map { [$0] } ?? [],
+            managedGuestLogsDirectory: managedGuestLogsDirectory
         )
 
         try configuration.validate()
@@ -878,7 +895,10 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
         configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork)
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.storageDevices = [try makeStorageDevice()]
-        configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(for: config.sharedDirectories)
+        configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
+            for: config.sharedDirectories,
+            managedGuestLogsDirectory: ManagedGuestTools.guestLogsDirectory(in: paths)
+        )
 
         do {
             try configuration.validate()

@@ -7,6 +7,8 @@ ENABLE_VIRTIOFS_MOUNT="1"
 RESIZE_ROOT="0"
 HEALTH_INTERVAL="60"
 GUEST_ROOT="${OKRUN_GUEST_ROOT:-}"
+managed_virtiofs_mount_config="0"
+LOG_SHARE_NAME="okrun-guest-logs"
 
 guest_path() {
   printf '%s%s' "$GUEST_ROOT" "$1"
@@ -31,11 +33,12 @@ Options:
   --private-ip CIDR        Persist a private-network address, for example 10.77.0.3/24.
   --private-iface IFACE    Interface for --private-ip. Defaults to auto-detect.
   --no-virtiofs-mount      Do not install the /mnt/okrun VirtioFS mount unit.
+  --log-share NAME         Required writable share below /mnt/okrun. Default: okrun-guest-logs.
   --resize-root            Try to grow the root partition/filesystem if free disk space is adjacent.
   --health-interval SEC    Seconds between health log snapshots. Default: 60.
   -h, --help               Show this help.
 
-Logs are written to /var/log/okrun/guest-health.log and journald.
+Logs are written to /mnt/okrun/<log-share>/guest-health.log and journald.
 EOF
 }
 
@@ -54,6 +57,11 @@ while [[ $# -gt 0 ]]; do
     --no-virtiofs-mount)
       ENABLE_VIRTIOFS_MOUNT="0"
       shift
+      ;;
+    --log-share)
+      LOG_SHARE_NAME="${2:-}"
+      [[ -n "$LOG_SHARE_NAME" ]] || { echo "Missing --log-share value" >&2; exit 64; }
+      shift 2
       ;;
     --resize-root)
       RESIZE_ROOT="1"
@@ -81,8 +89,18 @@ if [[ "${EUID:-$(id -u)}" -ne 0 && -z "$GUEST_ROOT" ]]; then
   exit 77
 fi
 
-install -d -m 0755 "$(guest_path /usr/local/lib/okrun)" "$(guest_path /usr/local/sbin)" "$(guest_path /var/log/okrun)"
+if [[ "$LOG_SHARE_NAME" == */* || "$LOG_SHARE_NAME" == *:* ]]; then
+  echo "--log-share must be a VirtioFS share name, not a path." >&2
+  exit 64
+fi
+
+LOG_DIR="/mnt/okrun/$LOG_SHARE_NAME"
+
+install -d -m 0755 "$(guest_path /usr/local/lib/okrun)" "$(guest_path /usr/local/sbin)" "$(guest_path /var/log/okrun)" "$(guest_path /etc/okrun)"
 install -m 0755 "$(dirname "$0")/okrun-guest-health.sh" "$(guest_path /usr/local/lib/okrun/okrun-guest-health.sh)"
+cat >"$(guest_path /etc/okrun/guest-tools.env)" <<EOF
+OKRUN_LOG_DIR=$LOG_DIR
+EOF
 
 install -d -m 0755 "$(guest_path /etc/systemd/system)"
 cat >"$(guest_path /etc/systemd/system/okrun-guest-health.service)" <<EOF
@@ -93,6 +111,7 @@ After=local-fs.target network-online.target
 [Service]
 Type=simple
 Environment=OKRUN_HEALTH_INTERVAL=$HEALTH_INTERVAL
+EnvironmentFile=/etc/okrun/guest-tools.env
 ExecStart=/usr/local/lib/okrun/okrun-guest-health.sh
 Restart=always
 RestartSec=5
@@ -104,6 +123,12 @@ EOF
 cat >"$(guest_path /usr/local/sbin/okrun-guest-diagnose)" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ -r /etc/okrun/guest-tools.env ]]; then
+  # shellcheck disable=SC1091
+  source /etc/okrun/guest-tools.env
+fi
+OKRUN_LOG_DIR="${OKRUN_LOG_DIR:-/mnt/okrun/okrun-guest-logs}"
 
 section() {
   printf '\n== %s ==\n' "$1"
@@ -129,7 +154,7 @@ section "Swap"
 swapon --show 2>/dev/null || true
 
 section "Recent Okrun Health"
-tail -200 /var/log/okrun/guest-health.log 2>/dev/null || true
+tail -200 "$OKRUN_LOG_DIR/guest-health.log" 2>/dev/null || true
 
 section "Kernel Alerts"
 journalctl -k --since '30 minutes ago' --no-pager 2>/dev/null |
@@ -153,6 +178,63 @@ virtiofs_mount_exists() {
   return 1
 }
 
+okrun_virtiofs_device_available() {
+  if [[ -n "$GUEST_ROOT" ]]; then
+    return 0
+  fi
+
+  if find /sys/bus/virtio/drivers/virtio_fs -type f -name tag -exec grep -qx okrun {} \; -print -quit 2>/dev/null | grep -q .; then
+    return 0
+  fi
+
+  if grep -Rqs '^okrun$' /sys/bus/virtio/drivers/virtio_fs 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
+print_missing_log_share_instructions() {
+  cat >&2 <<EOF
+Missing writable Okrun guest log share: $LOG_DIR
+
+Okrun now creates and mounts this share automatically when the VM starts. On the
+Mac, use an updated Okrun build, fully stop the VM, and start it again. The host
+will create this project directory if needed:
+
+  <project>/vm/guest-logs
+
+After the VM restarts, rerun:
+
+  ./scripts/install-guest-tools.sh <hostname-or-ip>
+
+EOF
+}
+
+require_log_share() {
+  local guest_log_dir
+  guest_log_dir="$(guest_path "$LOG_DIR")"
+
+  if [[ -z "$GUEST_ROOT" ]]; then
+    if command -v findmnt >/dev/null 2>&1; then
+      if [[ "$(findmnt -no FSTYPE /mnt/okrun 2>/dev/null || true)" != "virtiofs" ]]; then
+        print_missing_log_share_instructions
+        exit 78
+      fi
+    elif ! awk '$2 == "/mnt/okrun" && $3 == "virtiofs" { found = 1 } END { exit found ? 0 : 1 }' /proc/mounts 2>/dev/null; then
+      print_missing_log_share_instructions
+      exit 78
+    fi
+  fi
+
+  if [[ -d "$guest_log_dir" && -w "$guest_log_dir" ]]; then
+    return 0
+  fi
+
+  print_missing_log_share_instructions
+  exit 78
+}
+
 if [[ "$ENABLE_VIRTIOFS_MOUNT" == "1" ]]; then
   if virtiofs_mount_exists; then
     echo "Okrun VirtioFS mount config already exists; leaving it unchanged."
@@ -171,12 +253,15 @@ Options=defaults
 [Install]
 WantedBy=multi-user.target
 EOF
+    managed_virtiofs_mount_config="1"
   fi
 fi
 
 detect_private_iface() {
   if [[ "$PRIVATE_IFACE" != "auto" ]]; then
-    printf '%s\n' "$PRIVATE_IFACE"
+    if [[ -n "$GUEST_ROOT" ]] || ip link show dev "$PRIVATE_IFACE" >/dev/null 2>&1; then
+      printf '%s\n' "$PRIVATE_IFACE"
+    fi
     return
   fi
 
@@ -191,13 +276,6 @@ detect_private_iface() {
         fi
       done
   )"
-
-  if [[ -z "$candidate" ]]; then
-    candidate="$(
-      ip -o link show 2>/dev/null |
-        awk -F': ' '$2 != "lo" { print $2; exit }'
-    )"
-  fi
 
   printf '%s\n' "$candidate"
 }
@@ -230,11 +308,8 @@ installed_private_network_config="0"
 if [[ -n "$PRIVATE_IP_CIDR" ]]; then
   private_iface="$(detect_private_iface)"
   if [[ -z "$private_iface" ]]; then
-    echo "Could not detect a private network interface for $PRIVATE_IP_CIDR." >&2
-    exit 70
-  fi
-
-  if private_network_config_exists "$private_iface" "$PRIVATE_IP_CIDR"; then
+    echo "No Okrun private network interface detected; leaving network config unchanged. Enable privateNetwork for this VM, reboot it, then rerun with --private-ip."
+  elif private_network_config_exists "$private_iface" "$PRIVATE_IP_CIDR"; then
     echo "Okrun private network config already exists; leaving it unchanged."
   else
     install -d -m 0755 "$(guest_path /etc/systemd/network)"
@@ -299,21 +374,34 @@ resize_root_if_requested() {
 resize_root_if_requested
 
 if [[ -n "$GUEST_ROOT" ]]; then
+  require_log_share
   echo "Installed files into test root: $GUEST_ROOT"
 elif command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload
-  systemctl enable --now okrun-guest-health.service
 
   if [[ "$ENABLE_VIRTIOFS_MOUNT" == "1" && -f /etc/systemd/system/mnt-okrun.mount ]]; then
     systemctl enable mnt-okrun.mount
-    systemctl start mnt-okrun.mount || true
+    if okrun_virtiofs_device_available; then
+      if ! systemctl start mnt-okrun.mount; then
+        echo "Warning: could not start /mnt/okrun mount. Run 'journalctl -xeu mnt-okrun.mount' inside the guest for details." >&2
+      fi
+    elif [[ "$managed_virtiofs_mount_config" == "1" ]]; then
+      systemctl disable mnt-okrun.mount >/dev/null 2>&1 || true
+      echo "Okrun VirtioFS device is not present; installed mnt-okrun.mount but left it disabled. Start this VM with an updated Okrun build, then rerun this installer."
+    else
+      echo "Okrun VirtioFS device is not present; leaving existing mount config unchanged."
+    fi
   fi
+
+  require_log_share
+  systemctl enable --now okrun-guest-health.service
 
   if [[ "$installed_private_network_config" == "1" ]]; then
     systemctl enable systemd-networkd
     systemctl restart systemd-networkd
   fi
 else
+  require_log_share
   echo "systemctl not found; installed files but did not enable services." >&2
 fi
 

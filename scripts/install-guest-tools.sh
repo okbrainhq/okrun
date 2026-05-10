@@ -12,6 +12,7 @@ PRIVATE_IFACE="auto"
 ENABLE_VIRTIOFS_MOUNT="1"
 RESIZE_ROOT="0"
 HEALTH_INTERVAL="60"
+LOG_SHARE_NAME="okrun-guest-logs"
 
 usage() {
   cat <<'EOF'
@@ -26,6 +27,7 @@ Options:
   --private-ip CIDR        Persist a private-network address, for example 10.77.0.3/24.
   --private-iface IFACE    Interface for --private-ip. Defaults to auto-detect in the guest.
   --no-virtiofs-mount      Do not install the /mnt/okrun VirtioFS mount unit.
+  --log-share NAME         Required writable share below /mnt/okrun. Default: okrun-guest-logs.
   --resize-root            Try to grow the guest root partition/filesystem.
   --health-interval SEC    Seconds between health log snapshots. Default: 60.
   -h, --help               Show this help.
@@ -66,6 +68,15 @@ while [[ $# -gt 0 ]]; do
     --no-virtiofs-mount)
       ENABLE_VIRTIOFS_MOUNT="0"
       shift
+      ;;
+    --log-share)
+      LOG_SHARE_NAME="${2:-}"
+      [[ -n "$LOG_SHARE_NAME" ]] || { echo "Missing --log-share value" >&2; exit 64; }
+      if [[ "$LOG_SHARE_NAME" == */* || "$LOG_SHARE_NAME" == *:* ]]; then
+        echo "--log-share must be a VirtioFS share name, not a path." >&2
+        exit 64
+      fi
+      shift 2
       ;;
     --resize-root)
       RESIZE_ROOT="1"
@@ -113,7 +124,7 @@ if [[ -n "$SSH_IDENTITY" ]]; then
   SCP_ARGS+=(-i "$SSH_IDENTITY")
 fi
 
-INSTALL_ARGS=(--health-interval "$HEALTH_INTERVAL")
+INSTALL_ARGS=(--health-interval "$HEALTH_INTERVAL" --log-share "$LOG_SHARE_NAME")
 if [[ "$ENABLE_VIRTIOFS_MOUNT" == "0" ]]; then
   INSTALL_ARGS+=(--no-virtiofs-mount)
 fi
@@ -134,7 +145,7 @@ for arg in "${INSTALL_ARGS[@]}"; do
   remote_install_cmd+="$quoted_arg"
 done
 
-ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "$remote_install_cmd"
+ssh -t "${SSH_ARGS[@]}" "$SSH_TARGET" "$remote_install_cmd"
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "rm -rf '$REMOTE_DIR'"
 
 echo "Installed Okrun guest tools on $SSH_TARGET."
