@@ -306,5 +306,6 @@ then shut down the VM and shrink `vm/linux.raw` on macOS with `truncate`.
 ## Memory Allocation
 
 `memoryGB` is the guest RAM size at VM startup. Linux sees a fixed amount of RAM.
-The app exposes a virtio balloon device so macOS and Linux can cooperate on
-memory reclaim under pressure, but idle memory does not instantly shrink.
+Run fewer or smaller VMs when macOS shows sustained memory pressure or swap use;
+guest performance can degrade sharply once the host starts compressing and
+swapping VM memory.

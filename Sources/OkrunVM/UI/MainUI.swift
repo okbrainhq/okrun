@@ -881,7 +881,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
         configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork)
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-        configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
         configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode)
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(for: config.sharedDirectories)
 
