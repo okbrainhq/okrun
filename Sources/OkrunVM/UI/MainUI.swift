@@ -102,8 +102,8 @@ private class HoverIconButton: NSButton {
 }
 
 private enum RunningVMCloseAction {
-    case stop
-    case closeAnyway
+    case shutdown
+    case forceQuit
     case cancel
 }
 
@@ -112,7 +112,7 @@ private final class CloseAlertButtonHandler: NSObject {
         NSApp.stopModal(withCode: .alertFirstButtonReturn)
     }
 
-    @objc func closeAnyway() {
+    @objc func forceQuit() {
         NSApp.stopModal(withCode: .alertSecondButtonReturn)
     }
 
@@ -352,6 +352,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var sessions: [VMTabSession] = []
     private var selectedSessionID: UUID?
     private var isClosingAnyway = false
+    private var terminateAfterVMsStop = false
+    private var closeWindowAfterVMsStop = false
     private var closeAlertHandler: CloseAlertButtonHandler?
     private var skipAutomaticStartAfterCreate: Bool {
         ProcessInfo.processInfo.environment["OKRUN_UI_E2E_SKIP_AUTOSTART"] == "1"
@@ -391,12 +393,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
 
         switch askBeforeClosingRunningVM() {
-        case .stop:
-            shutdownRunningVMs()
-            return .terminateCancel
-        case .closeAnyway:
-            isClosingAnyway = true
-            return .terminateNow
+        case .shutdown:
+            return beginShutdownBeforeTermination()
+        case .forceQuit:
+            return beginForceStopBeforeTermination()
         case .cancel:
             return .terminateCancel
         }
@@ -423,12 +423,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
 
         switch askBeforeClosingRunningVM() {
-        case .stop:
-            shutdownRunningVMs()
+        case .shutdown:
+            beginShutdownBeforeWindowClose()
             return false
-        case .closeAnyway:
-            isClosingAnyway = true
-            return true
+        case .forceQuit:
+            beginForceStopBeforeWindowClose()
+            return false
         case .cancel:
             return false
         }
@@ -1083,6 +1083,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             detail += "  |  Disk image expanded; grow the Linux partition/filesystem inside the guest."
         }
 
+        if let hostAvailableBytes = preparation?.hostAvailableBytes,
+           preparation?.hasLowHostFreeSpace == true {
+            let freeSpace = ByteCountFormatter.string(fromByteCount: Int64(hostAvailableBytes), countStyle: .file)
+            detail += "  |  Host volume low: \(freeSpace) free."
+        }
+
         return detail
     }
 
@@ -1122,9 +1128,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
 
         let detailLabel = NSTextField(wrappingLabelWithString: """
-        Closing Okrun while VMs are running can stop guest services abruptly and may risk disk consistency.
+        Closing Okrun before Linux shuts down cleanly can corrupt the guest disk.
 
-        Shutdown running VMs first, keep Okrun running, or close anyway.
+        Ask Linux to shut down, keep Okrun running, or force quit only if the VM is stuck.
         """)
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         detailLabel.font = .systemFont(ofSize: 13)
@@ -1138,7 +1144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
         let shutdownButton = NSButton(title: "Shutdown VMs", target: nil, action: nil)
-        let closeAnywayButton = NSButton(title: "Close Anyway", target: nil, action: nil)
+        let closeAnywayButton = NSButton(title: "Force Quit", target: nil, action: nil)
         cancelButton.setAccessibilityIdentifier("okrun.close.cancel")
         shutdownButton.setAccessibilityIdentifier("okrun.close.shutdown")
         closeAnywayButton.setAccessibilityIdentifier("okrun.close.anyway")
@@ -1181,7 +1187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         cancelButton.action = #selector(CloseAlertButtonHandler.cancel)
         shutdownButton.action = #selector(CloseAlertButtonHandler.shutdown)
-        closeAnywayButton.action = #selector(CloseAlertButtonHandler.closeAnyway)
+        closeAnywayButton.action = #selector(CloseAlertButtonHandler.forceQuit)
 
         let handler = CloseAlertButtonHandler()
         cancelButton.target = handler
@@ -1203,9 +1209,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         switch response {
         case .alertFirstButtonReturn:
-            return .stop
+            return .shutdown
         case .alertSecondButtonReturn:
-            return .closeAnyway
+            return .forceQuit
         default:
             return .cancel
         }
@@ -1265,13 +1271,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         shutdownSession(session, allowsForcePrompt: true)
     }
 
-    private func shutdownRunningVMs() {
-        for session in sessions where session.virtualMachine != nil {
-            shutdownSession(session, allowsForcePrompt: false)
+    @discardableResult
+    private func shutdownRunningVMs() -> Bool {
+        var allRunningVMsHandled = true
+
+        for session in sessions where session.isRunning {
+            if !shutdownSession(session, allowsForcePrompt: false) {
+                allRunningVMsHandled = false
+            }
         }
+
+        return allRunningVMsHandled
     }
 
-    private func shutdownSession(_ session: VMTabSession, allowsForcePrompt: Bool) {
+    @discardableResult
+    private func shutdownSession(_ session: VMTabSession, allowsForcePrompt: Bool) -> Bool {
         if session.fakeRunning {
             releaseProjectLock(for: session)
             releasePrivateNetworkRuntimes(for: session)
@@ -1279,21 +1293,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             session.shutdownRequested = false
             setControlsEnabled(for: session, canStart: true, canStop: false)
             setStatus(for: session, status: "Shutdown", detail: "Fake VM stopped.")
-            return
+            completePendingCloseIfReady()
+            return true
         }
 
-        guard let virtualMachine = session.virtualMachine else { return }
+        guard let virtualMachine = session.virtualMachine else {
+            completePendingCloseIfReady()
+            return true
+        }
 
         if session.shutdownRequested {
             guard allowsForcePrompt else {
                 setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
-                return
+                return true
             }
 
             if confirmForceStop(for: session) {
-                forceStopSession(session, virtualMachine: virtualMachine)
+                return forceStopSession(session, virtualMachine: virtualMachine)
             }
-            return
+            return true
         }
 
         do {
@@ -1302,36 +1320,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 session.shutdownRequested = true
                 AppLog.virtualMachine.info("Requested graceful shutdown project=\(session.paths.root.path, privacy: .public)")
                 setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
-                return
+                return true
             }
         } catch {
             AppLog.virtualMachine.error("Graceful shutdown failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             setStatus(for: session, status: "Graceful shutdown failed", detail: error.localizedDescription)
-            return
+            return false
         }
 
         guard virtualMachine.canStop else {
             setStatus(for: session, status: "Shutdown unavailable", detail: "The VM is not currently in a stoppable state.")
-            return
+            return false
         }
 
-        forceStopSession(session, virtualMachine: virtualMachine)
+        guard allowsForcePrompt else {
+            AppLog.virtualMachine.warning("Graceful shutdown unavailable project=\(session.paths.root.path, privacy: .public)")
+            setStatus(
+                for: session,
+                status: "Shutdown unavailable",
+                detail: "Linux cannot be asked to shut down from this VM state. Force quit only if it is stuck."
+            )
+            return false
+        }
+
+        if confirmForceStop(for: session) {
+            return forceStopSession(session, virtualMachine: virtualMachine)
+        }
+
+        return false
     }
 
     private func confirmForceStop(for session: VMTabSession) -> Bool {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Force stop \(session.title)?"
-        alert.informativeText = "A graceful shutdown is already in progress. Force stopping can interrupt guest services and may risk disk consistency."
+        alert.informativeText = "Force stopping does not let Linux shut down cleanly. It can interrupt guest writes and may corrupt the guest disk."
         alert.addButton(withTitle: "Force Stop")
         alert.addButton(withTitle: "Keep Waiting")
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    private func forceStopSession(_ session: VMTabSession, virtualMachine: VZVirtualMachine) {
+    @discardableResult
+    private func forceStopRunningVMs() -> Bool {
+        var allRunningVMsHandled = true
+
+        for session in sessions where session.isRunning {
+            if session.fakeRunning {
+                releaseProjectLock(for: session)
+                releasePrivateNetworkRuntimes(for: session)
+                session.fakeRunning = false
+                session.shutdownRequested = false
+                setControlsEnabled(for: session, canStart: true, canStop: false)
+                setStatus(for: session, status: "Force stopped", detail: "Fake VM stopped.")
+                completePendingCloseIfReady()
+                continue
+            }
+
+            guard let virtualMachine = session.virtualMachine else {
+                completePendingCloseIfReady()
+                continue
+            }
+
+            if !forceStopSession(session, virtualMachine: virtualMachine) {
+                allRunningVMsHandled = false
+            }
+        }
+
+        return allRunningVMsHandled
+    }
+
+    @discardableResult
+    private func forceStopSession(_ session: VMTabSession, virtualMachine: VZVirtualMachine) -> Bool {
         guard virtualMachine.canStop else {
-            setStatus(for: session, status: "Shutdown unavailable", detail: "The VM is not currently in a stoppable state.")
-            return
+            setStatus(for: session, status: "Force stop unavailable", detail: "The VM is not currently in a stoppable state.")
+            return false
         }
 
         setStatus(for: session, status: "Force shutdown", detail: "Force-stopping the VM.")
@@ -1341,6 +1403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 if let error {
                     AppLog.virtualMachine.error("Force stop failed error=\(error.localizedDescription, privacy: .public)")
                     self?.setStatus(for: session, status: "Shutdown failed", detail: error.localizedDescription)
+                    self?.cancelPendingClose()
                 } else {
                     AppLog.virtualMachine.info("Force stop completed")
                     self?.releaseProjectLock(for: session)
@@ -1353,9 +1416,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                     self?.window?.toolbar?.validateVisibleItems()
                     self?.updateTabButtonState()
                     self?.setStatus(for: session, status: "Shutdown", detail: "You can boot the installer or installed system again.")
+                    self?.completePendingCloseIfReady()
                 }
             }
         }
+
+        return true
+    }
+
+    private func beginShutdownBeforeTermination() -> NSApplication.TerminateReply {
+        terminateAfterVMsStop = true
+        closeWindowAfterVMsStop = false
+
+        guard shutdownRunningVMs() else {
+            terminateAfterVMsStop = false
+            return .terminateCancel
+        }
+
+        if hasRunningVMs {
+            return .terminateLater
+        }
+
+        terminateAfterVMsStop = false
+        return .terminateNow
+    }
+
+    private func beginForceStopBeforeTermination() -> NSApplication.TerminateReply {
+        terminateAfterVMsStop = true
+        closeWindowAfterVMsStop = false
+
+        guard forceStopRunningVMs() else {
+            terminateAfterVMsStop = false
+            return .terminateCancel
+        }
+
+        if hasRunningVMs {
+            return .terminateLater
+        }
+
+        terminateAfterVMsStop = false
+        return .terminateNow
+    }
+
+    private func beginShutdownBeforeWindowClose() {
+        closeWindowAfterVMsStop = true
+        terminateAfterVMsStop = false
+
+        guard shutdownRunningVMs() else {
+            closeWindowAfterVMsStop = false
+            return
+        }
+
+        completePendingCloseIfReady()
+    }
+
+    private func beginForceStopBeforeWindowClose() {
+        closeWindowAfterVMsStop = true
+        terminateAfterVMsStop = false
+
+        guard forceStopRunningVMs() else {
+            closeWindowAfterVMsStop = false
+            return
+        }
+
+        completePendingCloseIfReady()
+    }
+
+    private func completePendingCloseIfReady() {
+        guard !hasRunningVMs else { return }
+
+        if terminateAfterVMsStop {
+            terminateAfterVMsStop = false
+            closeWindowAfterVMsStop = false
+            NSApp.reply(toApplicationShouldTerminate: true)
+            return
+        }
+
+        if closeWindowAfterVMsStop {
+            closeWindowAfterVMsStop = false
+            isClosingAnyway = true
+            window?.close()
+        }
+    }
+
+    private func cancelPendingClose() {
+        if terminateAfterVMsStop {
+            terminateAfterVMsStop = false
+            closeWindowAfterVMsStop = false
+            NSApp.reply(toApplicationShouldTerminate: false)
+            return
+        }
+
+        closeWindowAfterVMsStop = false
     }
 
     private func start(mode: VMMode) {
@@ -1561,6 +1713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Shutdown", detail: "The VM has shut down.")
+            self.completePendingCloseIfReady()
         }
     }
 
@@ -1575,6 +1728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Stopped with error", detail: error.localizedDescription)
+            self.completePendingCloseIfReady()
         }
     }
 

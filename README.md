@@ -54,6 +54,10 @@ An Okrun project is a directory that owns one VM:
 - `vm/efi.variables` is the EFI variable store.
 - `vm/machine.identifier` is the stable Virtualization.framework machine ID.
 
+Keep the project on a local volume with plenty of free space. The virtual disk is
+sparse, so the Mac may allocate much less than the guest-visible disk size at
+first, but guest writes still need real host space later.
+
 Known projects are stored in:
 
 ```text
@@ -64,6 +68,20 @@ One app instance runs one VM at a time. Use the project selector to choose an
 existing project, **New** to create a project, and **Delete** to remove the
 selected project. Delete shows a destructive confirmation and removes the entire
 project folder.
+
+## Safe Shutdown
+
+Use the Okrun **Shutdown** control or shut down from inside Linux. Okrun asks the
+guest to power off and waits for the guest-stopped callback before closing after
+Quit or window close.
+
+Avoid force quitting Okrun or force-stopping the VM while Linux is writing to the
+disk. Force stop is only for a stuck VM; it is equivalent to cutting power to a
+machine and can leave the ext4 filesystem needing repair.
+
+If Linux reports `EXT4-fs error` or `iget: checksum invalid`, stop the VM and run
+`e2fsck` from a rescue environment or installer shell against the unmounted root
+filesystem before booting it for normal use again.
 
 ## Config
 

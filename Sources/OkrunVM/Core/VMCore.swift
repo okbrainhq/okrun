@@ -646,6 +646,8 @@ enum DirectorySharingDeviceFactory {
 
 enum VMStorage {
     struct PreparationResult: Equatable {
+        static let lowHostFreeSpaceThreshold: UInt64 = 16 * 1024 * 1024 * 1024
+
         enum DiskChange: Equatable {
             case created(size: UInt64)
             case expanded(from: UInt64, to: UInt64)
@@ -653,12 +655,18 @@ enum VMStorage {
         }
 
         let diskChange: DiskChange
+        let hostAvailableBytes: UInt64?
 
         var expandedDisk: Bool {
             if case .expanded = diskChange {
                 return true
             }
             return false
+        }
+
+        var hasLowHostFreeSpace: Bool {
+            guard let hostAvailableBytes else { return false }
+            return hostAvailableBytes < Self.lowHostFreeSpaceThreshold
         }
     }
 
@@ -699,11 +707,12 @@ enum VMStorage {
             try machineIdentifier.dataRepresentation.write(to: paths.machineIdentifier, options: .atomic)
         }
 
-        let result = PreparationResult(diskChange: diskChange)
+        let hostAvailableBytes = hostAvailableBytes(for: paths.vmDirectory)
+        let result = PreparationResult(diskChange: diskChange, hostAvailableBytes: hostAvailableBytes)
         let diskInfo = try? DiskImageInfo.load(from: paths.disk)
         AppLog.storage.info(
             """
-            Prepared storage project=\(paths.root.path, privacy: .public) disk=\(paths.disk.path, privacy: .public) configuredGB=\(config.diskGB) change=\(String(describing: diskChange), privacy: .public) apparentBytes=\(diskInfo?.apparentSize ?? 0) allocatedBytes=\(diskInfo?.allocatedSize ?? 0)
+            Prepared storage project=\(paths.root.path, privacy: .public) disk=\(paths.disk.path, privacy: .public) configuredGB=\(config.diskGB) change=\(String(describing: diskChange), privacy: .public) apparentBytes=\(diskInfo?.apparentSize ?? 0) allocatedBytes=\(diskInfo?.allocatedSize ?? 0) hostAvailableBytes=\(hostAvailableBytes ?? 0)
             """
         )
 
@@ -713,7 +722,32 @@ enum VMStorage {
             )
         }
 
+        if result.hasLowHostFreeSpace {
+            AppLog.storage.warning(
+                "Host volume is low on free space for project=\(paths.root.path, privacy: .public) availableBytes=\(hostAvailableBytes ?? 0)"
+            )
+        }
+
         return result
+    }
+
+    private static func hostAvailableBytes(for url: URL) -> UInt64? {
+        guard let values = try? url.resourceValues(forKeys: [
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeAvailableCapacityKey
+        ]) else {
+            return nil
+        }
+
+        if let importantCapacity = values.volumeAvailableCapacityForImportantUsage, importantCapacity >= 0 {
+            return UInt64(importantCapacity)
+        }
+
+        if let capacity = values.volumeAvailableCapacity, capacity >= 0 {
+            return UInt64(capacity)
+        }
+
+        return nil
     }
 }
 

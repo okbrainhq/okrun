@@ -36,6 +36,7 @@ if [[ -f "$HOME/.okrun" ]]; then
     while IFS= read -r project; do
       [[ -d "$project/vm" ]] || continue
       printf '\nProject %s\n' "$project"
+      df -h "$project" || true
       ls -lh "$project/vm"/*.raw 2>/dev/null || true
       for disk in "$project/vm"/*.raw; do
         [[ -e "$disk" ]] || continue
