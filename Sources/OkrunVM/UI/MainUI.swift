@@ -540,10 +540,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             tabPanel.widthAnchor.constraint(equalToConstant: 304),
             splitSeparator.widthAnchor.constraint(equalToConstant: 1),
             sidebarNewButton.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor, constant: -12),
-            sidebarNewButton.topAnchor.constraint(equalTo: tabPanel.topAnchor, constant: 12),
+            sidebarNewButton.centerYAnchor.constraint(equalTo: tabPanel.topAnchor, constant: 23),
             tabStack.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
             tabStack.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
-            tabStack.topAnchor.constraint(equalTo: sidebarNewButton.bottomAnchor, constant: 8),
+            tabStack.topAnchor.constraint(equalTo: tabPanel.topAnchor, constant: 46),
             tabStack.bottomAnchor.constraint(lessThanOrEqualTo: tabPanel.bottomAnchor)
         ])
 
