@@ -156,6 +156,7 @@ private final class VMTabSession {
 
     var config: VMConfig
     var virtualMachine: VZVirtualMachine?
+    var fakeRunning = false
     var projectLockFD: Int32?
     var privateNetworkRuntimes: [PrivateNetworkRuntime] = []
     var canStartControls = true
@@ -179,7 +180,7 @@ private final class VMTabSession {
     }
 
     var isRunning: Bool {
-        virtualMachine != nil
+        virtualMachine != nil || fakeRunning
     }
 }
 
@@ -236,6 +237,7 @@ private final class VMTabItemView: NSControl {
             action: deleteAction
         )
         super.init(frame: .zero)
+        setAccessibilityElement(false)
         setAccessibilityIdentifier("okrun.vm-tab.\(sessionID.uuidString)")
         settingsButton.setAccessibilityIdentifier("okrun.vm-tab.settings")
         deleteButton.setAccessibilityIdentifier("okrun.vm-tab.delete")
@@ -353,11 +355,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var skipAutomaticStartAfterCreate: Bool {
         ProcessInfo.processInfo.environment["OKRUN_UI_E2E_SKIP_AUTOSTART"] == "1"
     }
+    private var usesFakeVMBackend: Bool {
+        ProcessInfo.processInfo.environment["OKRUN_UI_E2E_FAKE_VM_BACKEND"] == "1"
+    }
+    private var enablesUITestCommands: Bool {
+        ProcessInfo.processInfo.environment["OKRUN_UI_E2E_TEST_COMMANDS"] == "1"
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         installAppIcon()
         buildWindow()
+        installUITestMenuIfNeeded()
         AppLog.lifecycle.info(
             "Launching OkrunVM pid=\(getpid()) bundle=\(Bundle.main.bundleURL.path, privacy: .public) executable=\(Bundle.main.executableURL?.path ?? "unknown", privacy: .public)"
         )
@@ -595,6 +604,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         window.toolbar = toolbar
     }
 
+    private func installUITestMenuIfNeeded() {
+        guard enablesUITestCommands else { return }
+
+        let mainMenu = NSMenu()
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+
+        let appMenu = NSMenu(title: "Okrun VM")
+        appMenu.addItem(NSMenuItem(title: "Quit Okrun VM", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appItem.submenu = appMenu
+
+        let vmItem = NSMenuItem()
+        mainMenu.addItem(vmItem)
+
+        let vmMenu = NSMenu(title: "VM")
+        let editConfigItem = NSMenuItem(title: "Edit VM Config", action: #selector(openSelectedConfigEditor), keyEquivalent: ",")
+        editConfigItem.target = self
+        vmMenu.addItem(editConfigItem)
+
+        let deleteItem = NSMenuItem(title: "Delete VM", action: #selector(deleteProject), keyEquivalent: "")
+        deleteItem.target = self
+        vmMenu.addItem(deleteItem)
+
+        vmMenu.addItem(.separator())
+
+        let selectFirstItem = NSMenuItem(title: "Select First VM", action: #selector(selectFirstVMForUITest), keyEquivalent: "")
+        selectFirstItem.target = self
+        vmMenu.addItem(selectFirstItem)
+
+        let selectLastItem = NSMenuItem(title: "Select Last VM", action: #selector(selectLastVMForUITest), keyEquivalent: "")
+        selectLastItem.target = self
+        vmMenu.addItem(selectLastItem)
+
+        vmItem.submenu = vmMenu
+        NSApp.mainMenu = mainMenu
+    }
+
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         []
     }
@@ -776,6 +822,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         selectSession(session)
         openConfigEditor(for: session)
+    }
+
+    @objc private func openSelectedConfigEditor() {
+        guard let session = selectedSession, !session.isRunning else { return }
+        openConfigEditor(for: session)
+    }
+
+    @objc private func selectFirstVMForUITest() {
+        guard let session = sessions.first else { return }
+        selectSession(session)
+    }
+
+    @objc private func selectLastVMForUITest() {
+        guard let session = sessions.last else { return }
+        selectSession(session)
     }
 
     @objc private func createProject() {
@@ -971,6 +1032,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func openConfigEditor(for session: VMTabSession) {
+        if let logPath = ProcessInfo.processInfo.environment["OKRUN_UI_E2E_CONFIG_OPEN_LOG"], !logPath.isEmpty {
+            let logURL = URL(fileURLWithPath: logPath)
+            do {
+                try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try session.paths.config.path.write(to: logURL, atomically: true, encoding: .utf8)
+            } catch {
+                setStatus(for: session, status: "Config open failed", detail: error.localizedDescription)
+            }
+            return
+        }
+
         guard NSWorkspace.shared.open(session.paths.config) else {
             setStatus(for: session, status: "Config open failed", detail: session.paths.config.path)
             return
@@ -1066,6 +1138,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
         let shutdownButton = NSButton(title: "Shutdown VMs", target: nil, action: nil)
         let closeAnywayButton = NSButton(title: "Close Anyway", target: nil, action: nil)
+        cancelButton.setAccessibilityIdentifier("okrun.close.cancel")
+        shutdownButton.setAccessibilityIdentifier("okrun.close.shutdown")
+        closeAnywayButton.setAccessibilityIdentifier("okrun.close.anyway")
 
         cancelButton.bezelStyle = .rounded
         shutdownButton.bezelStyle = .rounded
@@ -1196,6 +1271,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func shutdownSession(_ session: VMTabSession) {
+        if session.fakeRunning {
+            releaseProjectLock(for: session)
+            releasePrivateNetworkRuntimes(for: session)
+            session.fakeRunning = false
+            setControlsEnabled(for: session, canStart: true, canStop: false)
+            setStatus(for: session, status: "Shutdown", detail: "Fake VM stopped.")
+            return
+        }
+
         guard let virtualMachine = session.virtualMachine else { return }
         do {
             if virtualMachine.canRequestStop {
@@ -1243,7 +1327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             setStatus("Not ready", detail: "VM paths were not prepared.")
             return
         }
-        guard session.virtualMachine == nil else { return }
+        guard !session.isRunning else { return }
 
         do {
             try acquireProjectLock(for: session)
@@ -1251,13 +1335,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             AppLog.virtualMachine.info(
                 "Starting VM project=\(session.paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) cpu=\(loaded.config.cpuCount) memoryGB=\(loaded.config.memoryGB) diskGB=\(loaded.config.diskGB) privateNetwork=\(loaded.config.privateNetwork.enabled) sharedDirectories=\(loaded.config.sharedDirectories.count) diskChange=\(String(describing: loaded.preparation.diskChange), privacy: .public)"
             )
-            let configuration = try makeConfiguration(paths: session.paths, config: loaded.config, mode: mode, session: session)
-            let vm = VZVirtualMachine(configuration: configuration)
-            vm.delegate = self
-            session.virtualMachine = vm
-            session.vmView.virtualMachine = vm
-            setControlsEnabled(for: session, canStart: false, canStop: true)
-
             let modeText: String
             switch mode {
             case .installer(let iso):
@@ -1265,6 +1342,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             case .installed:
                 modeText = "installed system"
             }
+
+            if usesFakeVMBackend {
+                session.fakeRunning = true
+                setControlsEnabled(for: session, canStart: false, canStop: true)
+                setStatus(for: session, status: "Running", detail: runtimeDetail(for: session, "Mode: \(modeText)"))
+                return
+            }
+
+            let configuration = try makeConfiguration(paths: session.paths, config: loaded.config, mode: mode, session: session)
+            let vm = VZVirtualMachine(configuration: configuration)
+            vm.delegate = self
+            session.virtualMachine = vm
+            session.vmView.virtualMachine = vm
+            setControlsEnabled(for: session, canStart: false, canStop: true)
 
             setStatus(
                 "Starting \(modeText)",
