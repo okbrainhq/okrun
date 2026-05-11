@@ -30,7 +30,7 @@ extension AppDelegate {
 
     private func chooseProjectDirectory() -> URL? {
         let panel = NSOpenPanel()
-        panel.title = "Choose Project Directory"
+        panel.title = "Choose VM Directory"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
@@ -90,7 +90,7 @@ extension AppDelegate {
         isoButton.target = actions
         isoButton.action = #selector(DialogActions.chooseISO)
 
-        let subtitle = NSTextField(labelWithString: "Select the project folder, installer ISO, and starter resources.")
+        let subtitle = NSTextField(labelWithString: "Select the VM folder, installer ISO, and starter resources.")
         subtitle.font = .systemFont(ofSize: 12, weight: .regular)
         subtitle.textColor = .secondaryLabelColor
         subtitle.lineBreakMode = .byWordWrapping
@@ -98,7 +98,7 @@ extension AppDelegate {
         subtitle.alignment = .center
 
         let grid = NSGridView(views: [
-            [makeFieldLabel("Project"), projectPath, projectButton],
+            [makeFieldLabel("VM Folder"), projectPath, projectButton],
             [makeFieldLabel("ISO"), isoPath, isoButton],
             [makeFieldLabel("CPU"), cpuField, NSView()],
             [makeFieldLabel("Memory GB"), memoryField, NSView()],
@@ -127,7 +127,7 @@ extension AppDelegate {
         ])
 
         let alert = NSAlert()
-        alert.messageText = "New Project"
+        alert.messageText = "Add VM"
         alert.informativeText = ""
         alert.accessoryView = wrapper
         alert.addButton(withTitle: "Create")

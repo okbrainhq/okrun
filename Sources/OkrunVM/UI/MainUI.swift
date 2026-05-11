@@ -2,19 +2,14 @@ import AppKit
 import Darwin
 import Virtualization
 
-private final class GlassPanelView: NSVisualEffectView {
-    init(material: NSVisualEffectView.Material = .hudWindow, cornerRadius: CGFloat = 18) {
+private final class RoundedContainerView: NSView {
+    init() {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        blendingMode = .withinWindow
-        self.material = material
-        state = .active
         wantsLayer = true
-        layer?.cornerRadius = cornerRadius
-        layer?.cornerCurve = .continuous
+        layer?.backgroundColor = NSColor.black.cgColor
         layer?.masksToBounds = true
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        layer?.borderWidth = 0
     }
 
     required init?(coder: NSCoder) {
@@ -22,17 +17,13 @@ private final class GlassPanelView: NSVisualEffectView {
     }
 }
 
-private final class RoundedContainerView: NSView {
-    init(cornerRadius: CGFloat = 20) {
+private final class TabRailView: NSView {
+    init() {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
-        layer?.cornerRadius = cornerRadius
-        layer?.cornerCurve = .continuous
-        layer?.masksToBounds = true
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1).cgColor
+        layer?.borderWidth = 0
     }
 
     required init?(coder: NSCoder) {
@@ -41,13 +32,7 @@ private final class RoundedContainerView: NSView {
 }
 
 private extension NSToolbarItem.Identifier {
-    static let newInstance = NSToolbarItem.Identifier("OkrunVM.newInstance")
-    static let projectPicker = NSToolbarItem.Identifier("OkrunVM.projectPicker")
-    static let newProject = NSToolbarItem.Identifier("OkrunVM.newProject")
-    static let deleteProject = NSToolbarItem.Identifier("OkrunVM.deleteProject")
-    static let installer = NSToolbarItem.Identifier("OkrunVM.installer")
-    static let start = NSToolbarItem.Identifier("OkrunVM.start")
-    static let shutdown = NSToolbarItem.Identifier("OkrunVM.shutdown")
+    static let addVM = NSToolbarItem.Identifier("OkrunVM.addVM")
 }
 
 private enum RunningVMCloseAction {
@@ -70,23 +55,192 @@ private final class CloseAlertButtonHandler: NSObject {
     }
 }
 
+private final class VMTabSession {
+    let id = UUID()
+    let projectPath: String
+    let paths: VMPaths
+    let vmView = VZVirtualMachineView()
+
+    var config: VMConfig
+    var virtualMachine: VZVirtualMachine?
+    var projectLockFD: Int32?
+    var privateNetworkRuntimes: [PrivateNetworkRuntime] = []
+    var canStartControls = true
+    var canStopControls = false
+    var status = "Ready"
+    var detail = ""
+    weak var tabButton: VMTabItemView?
+
+    init(projectPath: String, paths: VMPaths, config: VMConfig) {
+        self.projectPath = projectPath
+        self.paths = paths
+        self.config = config
+        vmView.translatesAutoresizingMaskIntoConstraints = false
+        vmView.capturesSystemKeys = true
+    }
+
+    var title: String {
+        let url = URL(fileURLWithPath: projectPath, isDirectory: true)
+        let lastPathComponent = url.lastPathComponent
+        return lastPathComponent.isEmpty ? projectPath : lastPathComponent
+    }
+
+    var isRunning: Bool {
+        virtualMachine != nil
+    }
+}
+
+private final class VMTabDeleteButton: NSButton {
+    let sessionID: UUID
+
+    init(sessionID: UUID, target: AnyObject?, action: Selector) {
+        self.sessionID = sessionID
+        super.init(frame: .zero)
+        self.target = target
+        self.action = action
+        translatesAutoresizingMaskIntoConstraints = false
+        bezelStyle = .regularSquare
+        isBordered = false
+        image = NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete VM")
+        imagePosition = .imageOnly
+        contentTintColor = NSColor.white.withAlphaComponent(0.72)
+        toolTip = "Delete VM"
+        widthAnchor.constraint(equalToConstant: 26).isActive = true
+        heightAnchor.constraint(equalToConstant: 26).isActive = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+private final class VMTabItemView: NSControl {
+    let sessionID: UUID
+    private let numberBadge = NSView()
+    private let numberLabel = NSTextField(labelWithString: "")
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let deleteButton: VMTabDeleteButton
+    private static let activeColor = NSColor(calibratedRed: 0.02, green: 0.48, blue: 0.95, alpha: 1)
+
+    init(
+        sessionID: UUID,
+        index: Int,
+        title: String,
+        target: AnyObject?,
+        action: Selector,
+        deleteTarget: AnyObject?,
+        deleteAction: Selector
+    ) {
+        self.sessionID = sessionID
+        deleteButton = VMTabDeleteButton(sessionID: sessionID, target: deleteTarget, action: deleteAction)
+        super.init(frame: .zero)
+        self.target = target
+        self.action = action
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 0
+        layer?.masksToBounds = true
+
+        numberBadge.translatesAutoresizingMaskIntoConstraints = false
+        numberBadge.wantsLayer = true
+        numberBadge.layer?.cornerRadius = 10
+        numberBadge.layer?.backgroundColor = NSColor(calibratedWhite: 0.23, alpha: 1).cgColor
+
+        numberLabel.stringValue = "\(index)"
+        numberLabel.translatesAutoresizingMaskIntoConstraints = false
+        numberLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .bold)
+        numberLabel.textColor = .secondaryLabelColor
+        numberLabel.alignment = .center
+
+        titleLabel.stringValue = title
+        titleLabel.font = .systemFont(ofSize: 13, weight: .bold)
+        titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+
+        statusLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.maximumNumberOfLines = 1
+
+        let textStack = NSStackView(views: [titleLabel, statusLabel])
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 3
+
+        numberBadge.addSubview(numberLabel)
+        addSubview(numberBadge)
+        addSubview(textStack)
+        addSubview(deleteButton)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 62),
+            numberBadge.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            numberBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
+            numberBadge.widthAnchor.constraint(equalToConstant: 20),
+            numberBadge.heightAnchor.constraint(equalToConstant: 20),
+            numberLabel.leadingAnchor.constraint(equalTo: numberBadge.leadingAnchor),
+            numberLabel.trailingAnchor.constraint(equalTo: numberBadge.trailingAnchor),
+            numberLabel.centerYAnchor.constraint(equalTo: numberBadge.centerYAnchor),
+            textStack.leadingAnchor.constraint(equalTo: numberBadge.trailingAnchor, constant: 10),
+            textStack.trailingAnchor.constraint(lessThanOrEqualTo: deleteButton.leadingAnchor, constant: -8),
+            textStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            deleteButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            deleteButton.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        sendAction(action, to: target)
+    }
+
+    func update(status: String, isRunning: Bool, isSelected: Bool) {
+        statusLabel.stringValue = status
+        layer?.backgroundColor = isSelected ? Self.activeColor.cgColor : NSColor.clear.cgColor
+        titleLabel.textColor = isSelected ? .white : .labelColor
+        statusLabel.textColor = isSelected ? NSColor.white.withAlphaComponent(0.88) : .secondaryLabelColor
+        deleteButton.isHidden = !isSelected
+        deleteButton.isEnabled = isSelected && !isRunning
+        deleteButton.contentTintColor = isRunning
+            ? NSColor.white.withAlphaComponent(0.32)
+            : NSColor.white.withAlphaComponent(0.72)
+
+        let badgeColor: NSColor
+        if isRunning {
+            badgeColor = isSelected ? NSColor.white.withAlphaComponent(0.24) : .systemGreen
+        } else if status.localizedCaseInsensitiveContains("failed") || status.localizedCaseInsensitiveContains("error") {
+            badgeColor = isSelected ? NSColor.white.withAlphaComponent(0.24) : .systemRed
+        } else {
+            badgeColor = isSelected ? NSColor.white.withAlphaComponent(0.24) : NSColor(calibratedWhite: 0.23, alpha: 1)
+        }
+        numberBadge.layer?.backgroundColor = badgeColor.cgColor
+        numberLabel.textColor = isSelected ? .white : .secondaryLabelColor
+    }
+}
+
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, NSToolbarItemValidation, VZVirtualMachineDelegate {
     private var window: NSWindow!
-    private var vmView = VZVirtualMachineView()
     private var statusLabel = NSTextField(labelWithString: "Preparing")
     private var detailsLabel = NSTextField(labelWithString: "")
+    private var vmContainer: RoundedContainerView!
+    private var tabStack: NSStackView!
+    private var emptyStateLabel = NSTextField(labelWithString: "Add a VM to begin.")
+    private var installerButton: NSButton!
+    private var startButton: NSButton!
+    private var shutdownButton: NSButton!
     private let projectStore = ProjectStore()
     private var registry = ProjectRegistry.empty
-    private var virtualMachine: VZVirtualMachine?
-    private var paths: VMPaths?
-    private var vmConfig: VMConfig?
-    private var projectLockFD: Int32?
-    private var canStartControls = true
-    private var canStopControls = false
+    private var sessions: [VMTabSession] = []
+    private var selectedSessionID: UUID?
     private var isClosingAnyway = false
     private var closeAlertHandler: CloseAlertButtonHandler?
-    private weak var projectMenuButton: NSPopUpButton?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -98,11 +252,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         do {
             registry = try projectStore.load(defaultProject: ProjectStore.defaultProjectRoot())
-            refreshProjectMenu()
-            try loadSelectedProject()
+            try reloadSessionsFromRegistry()
         } catch {
             setStatus("Setup failed", detail: error.localizedDescription)
-            setControlsEnabled(canStart: false, canStop: false)
+            window?.toolbar?.validateVisibleItems()
         }
     }
 
@@ -111,13 +264,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard virtualMachine != nil, !isClosingAnyway else {
+        guard hasRunningVMs, !isClosingAnyway else {
             return .terminateNow
         }
 
         switch askBeforeClosingRunningVM() {
         case .stop:
-            shutdownVM()
+            shutdownRunningVMs()
             return .terminateCancel
         case .closeAnyway:
             isClosingAnyway = true
@@ -128,7 +281,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        releaseProjectLock()
+        for session in sessions {
+            releaseProjectLock(for: session)
+            releasePrivateNetworkRuntimes(for: session)
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -140,13 +296,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        guard virtualMachine != nil, !isClosingAnyway else {
+        guard hasRunningVMs, !isClosingAnyway else {
             return true
         }
 
         switch askBeforeClosingRunningVM() {
         case .stop:
-            shutdownVM()
+            shutdownRunningVMs()
             return false
         case .closeAnyway:
             isClosingAnyway = true
@@ -169,58 +325,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
         content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 1).cgColor
+        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.065, alpha: 1).cgColor
 
         let root = NSStackView()
-        root.orientation = .vertical
-        root.spacing = 8
+        root.orientation = .horizontal
+        root.spacing = 0
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        statusLabel.alignment = .right
-        detailsLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        let mainPane = NSStackView()
+        mainPane.orientation = .vertical
+        mainPane.spacing = 0
+        mainPane.translatesAutoresizingMaskIntoConstraints = false
+
+        statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
+        statusLabel.alignment = .left
+        detailsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         detailsLabel.textColor = .secondaryLabelColor
-        detailsLabel.lineBreakMode = .byWordWrapping
+        detailsLabel.lineBreakMode = .byTruncatingMiddle
         detailsLabel.maximumNumberOfLines = 1
-        detailsLabel.alignment = .right
+        detailsLabel.alignment = .left
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        detailsLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        vmView.translatesAutoresizingMaskIntoConstraints = false
-        vmView.capturesSystemKeys = true
+        let detailRow = NSStackView()
+        detailRow.orientation = .horizontal
+        detailRow.alignment = .firstBaseline
+        detailRow.spacing = 10
+        detailRow.translatesAutoresizingMaskIntoConstraints = false
+        detailRow.addArrangedSubview(statusLabel)
+        detailRow.addArrangedSubview(detailsLabel)
 
-        let statusRow = NSStackView()
+        installerButton = makeContextButton(label: "Boot Installer", symbolName: "opticaldiscdrive", action: #selector(startInstaller))
+        startButton = makeContextButton(label: "Start", symbolName: "play.fill", action: #selector(startInstalled))
+        shutdownButton = makeContextButton(label: "Shutdown", symbolName: "stop.fill", action: #selector(shutdownVM))
+
+        let actionRow = NSStackView(views: [installerButton, startButton, shutdownButton])
+        actionRow.orientation = .horizontal
+        actionRow.alignment = .centerY
+        actionRow.spacing = 8
+        actionRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let statusSpacer = NSView()
+        statusSpacer.translatesAutoresizingMaskIntoConstraints = false
+        statusSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let statusRow = NSStackView(views: [detailRow, statusSpacer, actionRow])
         statusRow.orientation = .horizontal
-        statusRow.alignment = .firstBaseline
-        statusRow.spacing = 8
+        statusRow.alignment = .centerY
+        statusRow.spacing = 12
         statusRow.translatesAutoresizingMaskIntoConstraints = false
-        statusRow.addArrangedSubview(statusLabel)
-        statusRow.addArrangedSubview(detailsLabel)
 
         let statusContainer = NSView()
         statusContainer.translatesAutoresizingMaskIntoConstraints = false
+        statusContainer.wantsLayer = true
+        statusContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.09, alpha: 1).cgColor
         statusContainer.addSubview(statusRow)
 
-        let vmContainer = RoundedContainerView()
-        vmContainer.addSubview(vmView)
+        vmContainer = RoundedContainerView()
 
-        root.addArrangedSubview(statusContainer)
-        root.addArrangedSubview(vmContainer)
+        emptyStateLabel.translatesAutoresizingMaskIntoConstraints = false
+        emptyStateLabel.font = .systemFont(ofSize: 15, weight: .medium)
+        emptyStateLabel.textColor = .secondaryLabelColor
+        emptyStateLabel.alignment = .center
+        vmContainer.addSubview(emptyStateLabel)
+
+        let tabPanel = TabRailView()
+        tabPanel.setContentHuggingPriority(.required, for: .horizontal)
+        tabPanel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        mainPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        mainPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        tabStack = NSStackView()
+        tabStack.orientation = .vertical
+        tabStack.alignment = .leading
+        tabStack.spacing = 0
+        tabStack.translatesAutoresizingMaskIntoConstraints = false
+        tabPanel.addSubview(tabStack)
+
+        mainPane.addArrangedSubview(statusContainer)
+        mainPane.addArrangedSubview(vmContainer)
+
+        let splitSeparator = NSView()
+        splitSeparator.translatesAutoresizingMaskIntoConstraints = false
+        splitSeparator.wantsLayer = true
+        splitSeparator.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.13).cgColor
+
+        root.addArrangedSubview(tabPanel)
+        root.addArrangedSubview(splitSeparator)
+        root.addArrangedSubview(mainPane)
         content.addSubview(root)
 
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            root.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            root.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            root.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
-            statusContainer.heightAnchor.constraint(equalToConstant: 24),
-            statusRow.trailingAnchor.constraint(equalTo: statusContainer.trailingAnchor),
-            statusRow.centerYAnchor.constraint(equalTo: statusContainer.centerYAnchor),
-            statusRow.leadingAnchor.constraint(greaterThanOrEqualTo: statusContainer.leadingAnchor),
+            root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            root.topAnchor.constraint(equalTo: content.topAnchor),
+            root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            statusContainer.heightAnchor.constraint(equalToConstant: 34),
+            statusRow.leadingAnchor.constraint(equalTo: statusContainer.leadingAnchor, constant: 12),
+            statusRow.trailingAnchor.constraint(equalTo: statusContainer.trailingAnchor, constant: -12),
+            statusRow.topAnchor.constraint(equalTo: statusContainer.topAnchor, constant: 4),
+            statusRow.bottomAnchor.constraint(equalTo: statusContainer.bottomAnchor, constant: -4),
             vmContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 720),
             vmContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 420),
-            vmView.leadingAnchor.constraint(equalTo: vmContainer.leadingAnchor),
-            vmView.trailingAnchor.constraint(equalTo: vmContainer.trailingAnchor),
-            vmView.topAnchor.constraint(equalTo: vmContainer.topAnchor),
-            vmView.bottomAnchor.constraint(equalTo: vmContainer.bottomAnchor)
+            emptyStateLabel.centerXAnchor.constraint(equalTo: vmContainer.centerXAnchor),
+            emptyStateLabel.centerYAnchor.constraint(equalTo: vmContainer.centerYAnchor),
+            tabPanel.widthAnchor.constraint(equalToConstant: 304),
+            splitSeparator.widthAnchor.constraint(equalToConstant: 1),
+            tabStack.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
+            tabStack.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
+            tabStack.topAnchor.constraint(equalTo: tabPanel.topAnchor),
+            tabStack.bottomAnchor.constraint(lessThanOrEqualTo: tabPanel.bottomAnchor)
         ])
 
         window = NSWindow(
@@ -229,25 +442,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             backing: .buffered,
             defer: false
         )
-        window.minSize = NSSize(width: 820, height: 560)
+        window.minSize = NSSize(width: 1040, height: 560)
         window.center()
         window.title = "Okrun VM"
         window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = false
-        window.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 1)
+        window.titlebarAppearsTransparent = true
+        window.backgroundColor = NSColor(calibratedWhite: 0.065, alpha: 1)
         window.contentView = content
         window.delegate = self
         installToolbar()
         window.makeKeyAndOrderFront(nil)
 
-        setControlsEnabled(canStart: true, canStop: false)
+        window?.toolbar?.validateVisibleItems()
+        updateContextControls()
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func makeSeparator() -> NSBox {
-        let separator = NSBox()
-        separator.boxType = .separator
-        return separator
     }
 
     private func installToolbar() {
@@ -259,7 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         toolbar.showsBaselineSeparator = false
 
         if #available(macOS 11.0, *) {
-            window.toolbarStyle = .unified
+            window.toolbarStyle = .unifiedCompact
             window.titlebarSeparatorStyle = .none
         }
 
@@ -268,16 +476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         [
-            .newInstance,
-            .flexibleSpace,
-            .flexibleSpace,
-            .projectPicker,
-            .newProject,
-            .deleteProject,
-            .space,
-            .installer,
-            .start,
-            .shutdown
+            .addVM
         ]
     }
 
@@ -291,32 +490,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
         switch itemIdentifier {
-        case .newInstance:
-            return makeToolbarItem(
-                itemIdentifier,
-                label: "New Instance",
-                symbolName: "plus.square.on.square",
-                action: #selector(createInstance)
-            )
-        case .projectPicker:
-            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "Project"
-            item.paletteLabel = "Project"
-            item.toolTip = "Select project"
-            let button = makeProjectMenuButton()
-            item.view = button
-            projectMenuButton = button
-            return item
-        case .newProject:
-            return makeToolbarItem(itemIdentifier, label: "New Project", symbolName: "plus", action: #selector(createProject))
-        case .deleteProject:
-            return makeToolbarItem(itemIdentifier, label: "Delete Project", symbolName: "trash", action: #selector(deleteProject))
-        case .installer:
-            return makeToolbarItem(itemIdentifier, label: "Boot Installer", symbolName: "opticaldiscdrive", action: #selector(startInstaller))
-        case .start:
-            return makeToolbarItem(itemIdentifier, label: "Start", symbolName: "play.fill", action: #selector(startInstalled))
-        case .shutdown:
-            return makeToolbarItem(itemIdentifier, label: "Shutdown", symbolName: "stop.fill", action: #selector(shutdownVM))
+        case .addVM:
+            return makeToolbarItem(itemIdentifier, label: "Add VM", symbolName: "plus", action: #selector(createProject))
         default:
             return nil
         }
@@ -335,136 +510,166 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         item.target = self
         item.action = action
         item.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
-        item.isBordered = true
+        item.isBordered = false
         return item
     }
 
-    private func makeProjectMenuButton() -> NSPopUpButton {
-        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+    private func makeContextButton(label: String, symbolName: String, action: Selector) -> NSButton {
+        let button = NSButton(frame: .zero)
         button.translatesAutoresizingMaskIntoConstraints = false
         button.target = self
-        button.action = #selector(projectMenuButtonChanged(_:))
-        button.controlSize = .regular
-        button.bezelStyle = .texturedRounded
-        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 136).isActive = true
-        button.widthAnchor.constraint(lessThanOrEqualToConstant: 190).isActive = true
-        populateProjectMenuButton(button)
+        button.action = action
+        button.toolTip = label
+        button.bezelStyle = .regularSquare
+        button.isBordered = false
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
+        button.imagePosition = .imageOnly
+        button.contentTintColor = .secondaryLabelColor
+        button.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 26).isActive = true
         return button
     }
 
-    private func populateProjectMenuButton(_ button: NSPopUpButton) {
-        button.removeAllItems()
-
-        if registry.projects.isEmpty {
-            button.addItem(withTitle: "No Project")
-            button.isEnabled = false
-            return
-        }
-
-        for project in registry.projects {
-            let url = URL(fileURLWithPath: project, isDirectory: true)
-            let label = url.lastPathComponent.isEmpty ? project : url.lastPathComponent
-            button.addItem(withTitle: label)
-            button.lastItem?.representedObject = project
-        }
-
-        if let selected = registry.selectedProject,
-           let index = registry.projects.firstIndex(of: selected) {
-            button.selectItem(at: index)
-        }
-    }
-
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
-        let hasProject = registry.selectedProject != nil
-
         switch item.itemIdentifier {
-        case .newInstance:
-            return hasProject
-        case .installer, .start:
-            return canStartControls && hasProject
-        case .projectPicker:
-            return canStartControls && !registry.projects.isEmpty
-        case .deleteProject:
-            return canStartControls && hasProject
-        case .newProject:
-            return !canStopControls
-        case .shutdown:
-            return canStopControls
+        case .addVM:
+            return true
         default:
             return true
         }
     }
 
-    private func makeGlassPanel(
-        containing child: NSView,
-        material: NSVisualEffectView.Material = .hudWindow,
-        horizontalInset: CGFloat,
-        verticalInset: CGFloat
-    ) -> NSView {
-        let panel = GlassPanelView(material: material)
-        panel.addSubview(child)
-
-        NSLayoutConstraint.activate([
-            child.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: horizontalInset),
-            child.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -horizontalInset),
-            child.topAnchor.constraint(equalTo: panel.topAnchor, constant: verticalInset),
-            child.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -verticalInset)
-        ])
-
-        return panel
+    private func updateContextControls() {
+        installerButton?.isEnabled = selectedSession?.canStartControls == true
+        startButton?.isEnabled = selectedSession?.canStartControls == true
+        shutdownButton?.isEnabled = selectedSession?.canStopControls == true
     }
 
-    private func loadSelectedProject() throws {
-        guard let selectedProject = registry.selectedProject else {
-            paths = nil
-            vmConfig = nil
-            setStatus("No project selected", detail: "Registry: \(projectStore.path)")
-            setControlsEnabled(canStart: false, canStop: false)
-            return
-        }
-
-        let projectURL = URL(fileURLWithPath: selectedProject, isDirectory: true)
-        let discoveredPaths = VMPaths.project(at: projectURL)
-        let config = try VMConfig.load(from: discoveredPaths.config)
-
-        paths = discoveredPaths
-        vmConfig = config
-        AppLog.lifecycle.info(
-            "Loaded project path=\(discoveredPaths.root.path, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count)"
-        )
-        setStatus("Ready", detail: statusDetail(paths: discoveredPaths, config: config))
-        setControlsEnabled(canStart: true, canStop: false)
+    private var selectedSession: VMTabSession? {
+        guard let selectedSessionID else { return nil }
+        return sessions.first { $0.id == selectedSessionID }
     }
 
-    private func refreshProjectMenu() {
-        if let projectMenuButton {
-            populateProjectMenuButton(projectMenuButton)
-        }
-        window?.toolbar?.validateVisibleItems()
+    private var hasRunningVMs: Bool {
+        sessions.contains { $0.isRunning }
     }
 
-    @objc private func projectMenuButtonChanged(_ sender: NSPopUpButton) {
-        guard virtualMachine == nil else {
-            refreshProjectMenu()
-            return
+    private func reloadSessionsFromRegistry() throws {
+        sessions.removeAll()
+
+        for project in registry.projects {
+            let projectURL = URL(fileURLWithPath: project, isDirectory: true)
+            let paths = VMPaths.project(at: projectURL)
+            let config = try VMConfig.load(from: paths.config)
+            let session = VMTabSession(projectPath: project, paths: paths, config: config)
+            session.status = "Ready"
+            session.detail = statusDetail(paths: paths, config: config)
+            sessions.append(session)
+            AppLog.lifecycle.info(
+                "Loaded VM tab path=\(paths.root.path, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count)"
+            )
         }
 
-        guard let selected = sender.selectedItem?.representedObject as? String else {
-            return
-        }
-
-        do {
-            registry.selectedProject = selected
+        if let selected = registry.selectedProject,
+           let session = sessions.first(where: { $0.projectPath == selected }) {
+            selectedSessionID = session.id
+        } else {
+            selectedSessionID = sessions.first?.id
+            registry.selectedProject = sessions.first?.projectPath
             try projectStore.save(registry)
-            try loadSelectedProject()
-        } catch {
-            setStatus("Project load failed", detail: error.localizedDescription)
-            setControlsEnabled(canStart: false, canStop: false)
         }
+
+        rebuildTabButtons()
+        showSelectedSession()
+    }
+
+    private func rebuildTabButtons() {
+        for view in tabStack.arrangedSubviews {
+            tabStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        for (index, session) in sessions.enumerated() {
+            let button = VMTabItemView(
+                sessionID: session.id,
+                index: index + 1,
+                title: session.title,
+                target: self,
+                action: #selector(tabButtonPressed(_:)),
+                deleteTarget: self,
+                deleteAction: #selector(deleteTabButtonPressed(_:))
+            )
+            button.toolTip = session.projectPath
+            session.tabButton = button
+            tabStack.addArrangedSubview(button)
+            button.widthAnchor.constraint(equalTo: tabStack.widthAnchor).isActive = true
+        }
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        tabStack.addArrangedSubview(spacer)
+        spacer.widthAnchor.constraint(equalTo: tabStack.widthAnchor).isActive = true
+        updateTabButtonState()
+    }
+
+    private func updateTabButtonState() {
+        for session in sessions {
+            let isSelected = session.id == selectedSessionID
+            session.tabButton?.update(status: session.status, isRunning: session.isRunning, isSelected: isSelected)
+        }
+    }
+
+    private func showSelectedSession() {
+        for subview in vmContainer.subviews where subview !== emptyStateLabel {
+            subview.removeFromSuperview()
+        }
+
+        guard let session = selectedSession else {
+            emptyStateLabel.isHidden = false
+            setStatus("No VM selected", detail: "Add a VM to create a new tab.")
+            window?.toolbar?.validateVisibleItems()
+            updateContextControls()
+            updateTabButtonState()
+            return
+        }
+
+        emptyStateLabel.isHidden = true
+        vmContainer.addSubview(session.vmView)
+        NSLayoutConstraint.activate([
+            session.vmView.leadingAnchor.constraint(equalTo: vmContainer.leadingAnchor),
+            session.vmView.trailingAnchor.constraint(equalTo: vmContainer.trailingAnchor),
+            session.vmView.topAnchor.constraint(equalTo: vmContainer.topAnchor),
+            session.vmView.bottomAnchor.constraint(equalTo: vmContainer.bottomAnchor)
+        ])
+        setStatus(session.status, detail: session.detail)
+        window?.toolbar?.validateVisibleItems()
+        updateContextControls()
+        updateTabButtonState()
+    }
+
+    private func selectSession(_ session: VMTabSession) {
+        selectedSessionID = session.id
+        registry.selectedProject = session.projectPath
+        try? projectStore.save(registry)
+        showSelectedSession()
+    }
+
+    @objc private func tabButtonPressed(_ sender: VMTabItemView) {
+        guard let session = sessions.first(where: { $0.id == sender.sessionID }) else { return }
+        selectSession(session)
+    }
+
+    @objc private func deleteTabButtonPressed(_ sender: NSButton) {
+        guard let sender = sender as? VMTabDeleteButton,
+              let session = sessions.first(where: { $0.id == sender.sessionID }) else {
+            return
+        }
+
+        selectSession(session)
+        deleteProject()
     }
 
     @objc private func createProject() {
-        guard virtualMachine == nil else { return }
         guard let request = askForNewProject() else { return }
 
         do {
@@ -482,33 +687,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             }
             registry.selectedProject = path
             try projectStore.save(registry)
-            refreshProjectMenu()
-            try loadSelectedProject()
+            let session = VMTabSession(projectPath: path, paths: paths, config: request.config)
+            session.status = "Ready"
+            session.detail = statusDetail(paths: paths, config: request.config)
+            sessions.append(session)
+            rebuildTabButtons()
+            selectSession(session)
             start(mode: .installer(request.isoURL))
         } catch {
             setStatus("Add project failed", detail: error.localizedDescription)
-            setControlsEnabled(canStart: false, canStop: false)
+            selectedSession?.status = "Add project failed"
+            selectedSession?.detail = error.localizedDescription
+            window?.toolbar?.validateVisibleItems()
         }
     }
 
     @objc private func deleteProject() {
-        guard virtualMachine == nil else { return }
-        guard let selectedProject = registry.selectedProject else { return }
+        guard let session = selectedSession, session.virtualMachine == nil else { return }
+        let selectedProject = session.projectPath
 
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Delete Project?"
-        alert.informativeText = """
-        This will permanently delete everything in this folder:
-
-        \(selectedProject)
-
-        This includes the VM disk, EFI state, machine identifier, and project config.
-        """
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard confirmDelete(session: session) else { return }
 
         do {
             AppLog.lifecycle.warning("Deleting project path=\(selectedProject, privacy: .public)")
@@ -520,34 +718,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             registry.projects.removeAll { $0 == selectedProject }
             registry.selectedProject = registry.projects.first
             try projectStore.save(registry)
-            refreshProjectMenu()
-
-            if registry.selectedProject == nil {
-                paths = nil
-                vmConfig = nil
-                vmView.virtualMachine = nil
-                setStatus("No project selected", detail: "Registry: \(projectStore.path)")
-                setControlsEnabled(canStart: false, canStop: false)
-            } else {
-                try loadSelectedProject()
-            }
+            sessions.removeAll { $0.id == session.id }
+            selectedSessionID = sessions.first { $0.projectPath == registry.selectedProject }?.id ?? sessions.first?.id
+            rebuildTabButtons()
+            showSelectedSession()
         } catch {
             setStatus("Delete failed", detail: error.localizedDescription)
-            setControlsEnabled(canStart: true, canStop: false)
+            session.status = "Delete failed"
+            session.detail = error.localizedDescription
+            window?.toolbar?.validateVisibleItems()
         }
     }
 
-    @objc private func createInstance() {
-        guard registry.selectedProject != nil else {
-            setStatus("No project selected", detail: "Create or select a project before opening a second VM instance.")
-            return
+    private func confirmDelete(session: VMTabSession) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Delete \(session.title)?"
+        alert.informativeText = """
+        This will permanently delete everything in this folder:
+
+        \(session.projectPath)
+
+        This includes the VM disk, EFI state, machine identifier, and project config.
+        """
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+
+        let prompt = NSTextField(labelWithString: "Type \(session.title) to confirm.")
+        prompt.translatesAutoresizingMaskIntoConstraints = false
+        prompt.font = .systemFont(ofSize: 12)
+
+        let textField = NSTextField(string: "")
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        textField.placeholderString = session.title
+        textField.widthAnchor.constraint(equalToConstant: 320).isActive = true
+
+        let wrapper = NSStackView(views: [prompt, textField])
+        wrapper.translatesAutoresizingMaskIntoConstraints = false
+        wrapper.orientation = .vertical
+        wrapper.alignment = .leading
+        wrapper.spacing = 8
+        alert.accessoryView = wrapper
+
+        while alert.runModal() == .alertFirstButtonReturn {
+            if textField.stringValue == session.title {
+                return true
+            }
+            NSSound.beep()
+            textField.stringValue = ""
         }
 
-        do {
-            try InstanceLauncher.spawnChild()
-        } catch {
-            setStatus("Launch failed", detail: error.localizedDescription)
-        }
+        return false
     }
 
     private func loadAndPrepareConfiguration(paths: VMPaths) throws -> (
@@ -559,16 +780,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         return (config, preparation)
     }
 
-    private func reloadSelectedProjectConfiguration() throws -> (
+    private func reloadConfiguration(for session: VMTabSession) throws -> (
         config: VMConfig,
         preparation: VMStorage.PreparationResult
     ) {
-        guard let paths else {
-            throw AppError("VM paths were not prepared.")
-        }
-
-        let loaded = try loadAndPrepareConfiguration(paths: paths)
-        vmConfig = loaded.config
+        let loaded = try loadAndPrepareConfiguration(paths: session.paths)
+        session.config = loaded.config
         return loaded
     }
 
@@ -591,13 +808,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func runtimeDetail(_ status: String) -> String {
-        guard let paths, let vmConfig else { return status }
+        guard let session = selectedSession else { return status }
+        return runtimeDetail(for: session, status)
+    }
 
-        return """
-        \(status)
-
-        \(statusDetail(paths: paths, config: vmConfig))
-        """
+    private func runtimeDetail(for session: VMTabSession, _ status: String) -> String {
+        "\(status)  |  \(statusDetail(paths: session.paths, config: session.config))"
     }
 
     private func askBeforeClosingRunningVM() -> RunningVMCloseAction {
@@ -622,14 +838,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .regular)
         icon.contentTintColor = .systemYellow
 
-        let titleLabel = NSTextField(labelWithString: "The VM is still running")
+        let titleLabel = NSTextField(labelWithString: "One or more VMs are still running")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
 
         let detailLabel = NSTextField(wrappingLabelWithString: """
-        Closing Okrun while the VM is running can stop guest services abruptly and may risk disk consistency.
+        Closing Okrun while VMs are running can stop guest services abruptly and may risk disk consistency.
 
-        Shutdown the VM first, keep Okrun running, or close anyway.
+        Shutdown running VMs first, keep Okrun running, or close anyway.
         """)
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         detailLabel.font = .systemFont(ofSize: 13)
@@ -642,7 +858,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         textStack.spacing = 8
 
         let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
-        let shutdownButton = NSButton(title: "Shutdown VM", target: nil, action: nil)
+        let shutdownButton = NSButton(title: "Shutdown VMs", target: nil, action: nil)
         let closeAnywayButton = NSButton(title: "Close Anyway", target: nil, action: nil)
 
         cancelButton.bezelStyle = .rounded
@@ -714,20 +930,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     @objc private func startInstaller() {
-        guard let paths else {
+        guard let session = selectedSession else {
             setStatus("Not ready", detail: "No project is selected.")
             return
         }
 
         let currentConfig: VMConfig
         do {
-            currentConfig = try VMConfig.load(from: paths.config)
-            vmConfig = currentConfig
+            currentConfig = try VMConfig.load(from: session.paths.config)
+            session.config = currentConfig
             AppLog.lifecycle.info(
-                "Reloaded installer config project=\(paths.root.path, privacy: .public) cpu=\(currentConfig.cpuCount) memoryGB=\(currentConfig.memoryGB) diskGB=\(currentConfig.diskGB)"
+                "Reloaded installer config project=\(session.paths.root.path, privacy: .public) cpu=\(currentConfig.cpuCount) memoryGB=\(currentConfig.memoryGB) diskGB=\(currentConfig.diskGB)"
             )
         } catch {
-            AppLog.lifecycle.error("Installer config reload failed project=\(paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            AppLog.lifecycle.error("Installer config reload failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             setStatus("Config reload failed", detail: error.localizedDescription)
             return
         }
@@ -748,12 +964,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 privateNetwork: currentConfig.privateNetwork,
                 sharedDirectories: currentConfig.sharedDirectories
             )
-            try updatedConfig.save(to: paths.config)
-            self.vmConfig = updatedConfig
-            AppLog.lifecycle.info("Updated installer ISO project=\(paths.root.path, privacy: .public) iso=\(iso.path, privacy: .public)")
+            try updatedConfig.save(to: session.paths.config)
+            session.config = updatedConfig
+            AppLog.lifecycle.info("Updated installer ISO project=\(session.paths.root.path, privacy: .public) iso=\(iso.path, privacy: .public)")
             start(mode: .installer(iso))
         } catch {
-            AppLog.lifecycle.error("ISO update failed project=\(paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            AppLog.lifecycle.error("ISO update failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             setStatus("ISO update failed", detail: error.localizedDescription)
         }
     }
@@ -763,66 +979,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     @objc private func shutdownVM() {
-        guard let virtualMachine else { return }
+        guard let session = selectedSession else { return }
+        shutdownSession(session)
+    }
+
+    private func shutdownRunningVMs() {
+        for session in sessions where session.virtualMachine != nil {
+            shutdownSession(session)
+        }
+    }
+
+    private func shutdownSession(_ session: VMTabSession) {
+        guard let virtualMachine = session.virtualMachine else { return }
         do {
             if virtualMachine.canRequestStop {
                 try virtualMachine.requestStop()
-                AppLog.virtualMachine.info("Requested graceful shutdown project=\(self.paths?.root.path ?? "unknown", privacy: .public)")
-                setStatus("Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
+                AppLog.virtualMachine.info("Requested graceful shutdown project=\(session.paths.root.path, privacy: .public)")
+                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
                 return
             }
         } catch {
-            AppLog.virtualMachine.error("Graceful shutdown failed project=\(self.paths?.root.path ?? "unknown", privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            setStatus("Graceful shutdown failed", detail: error.localizedDescription)
+            AppLog.virtualMachine.error("Graceful shutdown failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            setStatus(for: session, status: "Graceful shutdown failed", detail: error.localizedDescription)
             return
         }
 
         guard virtualMachine.canStop else {
-            setStatus("Shutdown unavailable", detail: "The VM is not currently in a stoppable state.")
+            setStatus(for: session, status: "Shutdown unavailable", detail: "The VM is not currently in a stoppable state.")
             return
         }
 
-        setStatus("Force shutdown", detail: "Force-stopping the VM.")
-        AppLog.virtualMachine.warning("Force-stopping VM project=\(self.paths?.root.path ?? "unknown", privacy: .public)")
+        setStatus(for: session, status: "Force shutdown", detail: "Force-stopping the VM.")
+        AppLog.virtualMachine.warning("Force-stopping VM project=\(session.paths.root.path, privacy: .public)")
         virtualMachine.stop { [weak self] error in
-            if let error {
-                AppLog.virtualMachine.error("Force stop failed error=\(error.localizedDescription, privacy: .public)")
-                self?.setStatus("Shutdown failed", detail: error.localizedDescription)
-            } else {
-                AppLog.virtualMachine.info("Force stop completed")
-                self?.releaseProjectLock()
-                PrivateNetworkRuntimeRegistry.shared.releaseAll()
-                self?.virtualMachine = nil
-                self?.vmView.virtualMachine = nil
-                self?.setControlsEnabled(canStart: true, canStop: false)
-                self?.setStatus("Shutdown", detail: "You can boot the installer or installed system again.")
+            DispatchQueue.main.async {
+                if let error {
+                    AppLog.virtualMachine.error("Force stop failed error=\(error.localizedDescription, privacy: .public)")
+                    self?.setStatus(for: session, status: "Shutdown failed", detail: error.localizedDescription)
+                } else {
+                    AppLog.virtualMachine.info("Force stop completed")
+                    self?.releaseProjectLock(for: session)
+                    self?.releasePrivateNetworkRuntimes(for: session)
+                    session.virtualMachine = nil
+                    session.vmView.virtualMachine = nil
+                    session.canStartControls = true
+                    session.canStopControls = false
+                    self?.window?.toolbar?.validateVisibleItems()
+                    self?.updateTabButtonState()
+                    self?.setStatus(for: session, status: "Shutdown", detail: "You can boot the installer or installed system again.")
+                }
             }
         }
     }
 
     private func start(mode: VMMode) {
-        guard virtualMachine == nil else { return }
-        guard let paths else {
+        guard let session = selectedSession else {
             setStatus("Not ready", detail: "VM paths were not prepared.")
             return
         }
-        guard vmConfig != nil else {
-            setStatus("Not ready", detail: "VM config was not loaded.")
-            return
-        }
+        guard session.virtualMachine == nil else { return }
 
         do {
-            try acquireProjectLock(paths: paths)
-            let loaded = try reloadSelectedProjectConfiguration()
+            try acquireProjectLock(for: session)
+            let loaded = try reloadConfiguration(for: session)
             AppLog.virtualMachine.info(
-                "Starting VM project=\(paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) cpu=\(loaded.config.cpuCount) memoryGB=\(loaded.config.memoryGB) diskGB=\(loaded.config.diskGB) privateNetwork=\(loaded.config.privateNetwork.enabled) sharedDirectories=\(loaded.config.sharedDirectories.count) diskChange=\(String(describing: loaded.preparation.diskChange), privacy: .public)"
+                "Starting VM project=\(session.paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) cpu=\(loaded.config.cpuCount) memoryGB=\(loaded.config.memoryGB) diskGB=\(loaded.config.diskGB) privateNetwork=\(loaded.config.privateNetwork.enabled) sharedDirectories=\(loaded.config.sharedDirectories.count) diskChange=\(String(describing: loaded.preparation.diskChange), privacy: .public)"
             )
-            let configuration = try makeConfiguration(paths: paths, config: loaded.config, mode: mode)
+            let configuration = try makeConfiguration(paths: session.paths, config: loaded.config, mode: mode, session: session)
             let vm = VZVirtualMachine(configuration: configuration)
             vm.delegate = self
-            virtualMachine = vm
-            vmView.virtualMachine = vm
-            setControlsEnabled(canStart: false, canStop: true)
+            session.virtualMachine = vm
+            session.vmView.virtualMachine = vm
+            setControlsEnabled(for: session, canStart: false, canStop: true)
 
             let modeText: String
             switch mode {
@@ -834,41 +1062,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
             setStatus(
                 "Starting \(modeText)",
-                detail: statusDetail(paths: paths, config: loaded.config, preparation: loaded.preparation)
+                detail: statusDetail(paths: session.paths, config: loaded.config, preparation: loaded.preparation)
             )
 
             vm.start { [weak self] result in
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
-                        AppLog.virtualMachine.info("VM started project=\(self?.paths?.root.path ?? "unknown", privacy: .public)")
-                        self?.setControlsEnabled(canStart: false, canStop: true)
-                        self?.setStatus("Running", detail: self?.runtimeDetail("Mode: \(modeText)") ?? "")
+                        AppLog.virtualMachine.info("VM started project=\(session.paths.root.path, privacy: .public)")
+                        self?.setControlsEnabled(for: session, canStart: false, canStop: true)
+                        self?.setStatus(for: session, status: "Running", detail: self?.runtimeDetail(for: session, "Mode: \(modeText)") ?? "")
                     case .failure(let error):
-                        AppLog.virtualMachine.error("VM start failed project=\(self?.paths?.root.path ?? "unknown", privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-                        self?.releaseProjectLock()
-                        PrivateNetworkRuntimeRegistry.shared.releaseAll()
-                        self?.virtualMachine = nil
-                        self?.vmView.virtualMachine = nil
-                        self?.setControlsEnabled(canStart: true, canStop: false)
-                        self?.setStatus("Start failed", detail: error.localizedDescription)
+                        AppLog.virtualMachine.error("VM start failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                        self?.releaseProjectLock(for: session)
+                        self?.releasePrivateNetworkRuntimes(for: session)
+                        session.virtualMachine = nil
+                        session.vmView.virtualMachine = nil
+                        self?.setControlsEnabled(for: session, canStart: true, canStop: false)
+                        self?.setStatus(for: session, status: "Start failed", detail: error.localizedDescription)
                     }
                 }
             }
         } catch {
-            AppLog.virtualMachine.error("VM configuration failed project=\(paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            releaseProjectLock()
-            PrivateNetworkRuntimeRegistry.shared.releaseAll()
-            setControlsEnabled(canStart: true, canStop: false)
-            setStatus("Configuration failed", detail: error.localizedDescription)
+            AppLog.virtualMachine.error("VM configuration failed project=\(session.paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            releaseProjectLock(for: session)
+            releasePrivateNetworkRuntimes(for: session)
+            setControlsEnabled(for: session, canStart: true, canStop: false)
+            setStatus(for: session, status: "Configuration failed", detail: error.localizedDescription)
         }
     }
 
-    private func acquireProjectLock(paths: VMPaths) throws {
-        guard projectLockFD == nil else { return }
+    private func acquireProjectLock(for session: VMTabSession) throws {
+        guard session.projectLockFD == nil else { return }
 
-        try FileManager.default.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
-        let lockURL = paths.vmDirectory.appendingPathComponent("okrun.lock")
+        try FileManager.default.createDirectory(at: session.paths.vmDirectory, withIntermediateDirectories: true)
+        let lockURL = session.paths.vmDirectory.appendingPathComponent("okrun.lock")
         let fd = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
         guard fd >= 0 else {
             throw AppError("Unable to create VM lock at \(lockURL.path).")
@@ -876,20 +1104,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             close(fd)
-            throw AppError("This project is already running in another Okrun VM instance: \(paths.root.path)")
+            throw AppError("This project is already running in another Okrun VM instance: \(session.paths.root.path)")
         }
 
-        projectLockFD = fd
+        session.projectLockFD = fd
     }
 
-    private func releaseProjectLock() {
-        guard let fd = projectLockFD else { return }
+    private func releaseProjectLock(for session: VMTabSession) {
+        guard let fd = session.projectLockFD else { return }
         flock(fd, LOCK_UN)
         close(fd)
-        projectLockFD = nil
+        session.projectLockFD = nil
     }
 
-    private func makeConfiguration(paths: VMPaths, config: VMConfig, mode: VMMode) throws -> VZVirtualMachineConfiguration {
+    private func releasePrivateNetworkRuntimes(for session: VMTabSession) {
+        PrivateNetworkRuntimeRegistry.shared.release(session.privateNetworkRuntimes)
+        session.privateNetworkRuntimes.removeAll()
+    }
+
+    private func makeConfiguration(paths: VMPaths, config: VMConfig, mode: VMMode, session: VMTabSession) throws -> VZVirtualMachineConfiguration {
         let configuration = VZVirtualMachineConfiguration()
 
         let platform = VZGenericPlatformConfiguration()
@@ -906,7 +1139,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         configuration.graphicsDevices = [makeGraphicsDevice()]
         configuration.keyboards = [VZUSBKeyboardConfiguration()]
         configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork)
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork) { runtime in
+            session.privateNetworkRuntimes.append(runtime)
+        }
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode)
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
@@ -952,39 +1187,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
     }
 
-    private func setControlsEnabled(canStart: Bool, canStop: Bool) {
-        canStartControls = canStart
-        canStopControls = canStop
-        projectMenuButton?.isEnabled = canStart && !registry.projects.isEmpty
+    private func setControlsEnabled(for session: VMTabSession, canStart: Bool, canStop: Bool) {
+        session.canStartControls = canStart
+        session.canStopControls = canStop
         window?.toolbar?.validateVisibleItems()
+        updateContextControls()
+        updateTabButtonState()
     }
 
     private func setStatus(_ status: String, detail: String) {
         statusLabel.stringValue = status
         detailsLabel.stringValue = detail
+        selectedSession?.status = status
+        selectedSession?.detail = detail
+        updateTabButtonState()
+    }
+
+    private func setStatus(for session: VMTabSession, status: String, detail: String) {
+        session.status = status
+        session.detail = detail
+        if session.id == selectedSessionID {
+            statusLabel.stringValue = status
+            detailsLabel.stringValue = detail
+        }
+        updateTabButtonState()
     }
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         DispatchQueue.main.async { [weak self] in
-            AppLog.virtualMachine.info("Guest stopped project=\(self?.paths?.root.path ?? "unknown", privacy: .public)")
-            self?.releaseProjectLock()
-            PrivateNetworkRuntimeRegistry.shared.releaseAll()
-            self?.virtualMachine = nil
-            self?.vmView.virtualMachine = nil
-            self?.setControlsEnabled(canStart: true, canStop: false)
-            self?.setStatus("Shutdown", detail: "The VM has shut down.")
+            guard let self, let session = self.session(for: virtualMachine) else { return }
+            AppLog.virtualMachine.info("Guest stopped project=\(session.paths.root.path, privacy: .public)")
+            self.releaseProjectLock(for: session)
+            self.releasePrivateNetworkRuntimes(for: session)
+            session.virtualMachine = nil
+            session.vmView.virtualMachine = nil
+            self.setControlsEnabled(for: session, canStart: true, canStop: false)
+            self.setStatus(for: session, status: "Shutdown", detail: "The VM has shut down.")
         }
     }
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         DispatchQueue.main.async { [weak self] in
-            AppLog.virtualMachine.error("VM stopped with error project=\(self?.paths?.root.path ?? "unknown", privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            self?.releaseProjectLock()
-            PrivateNetworkRuntimeRegistry.shared.releaseAll()
-            self?.virtualMachine = nil
-            self?.vmView.virtualMachine = nil
-            self?.setControlsEnabled(canStart: true, canStop: false)
-            self?.setStatus("Stopped with error", detail: error.localizedDescription)
+            guard let self, let session = self.session(for: virtualMachine) else { return }
+            AppLog.virtualMachine.error("VM stopped with error project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            self.releaseProjectLock(for: session)
+            self.releasePrivateNetworkRuntimes(for: session)
+            session.virtualMachine = nil
+            session.vmView.virtualMachine = nil
+            self.setControlsEnabled(for: session, canStart: true, canStop: false)
+            self.setStatus(for: session, status: "Stopped with error", detail: error.localizedDescription)
         }
+    }
+
+    private func session(for virtualMachine: VZVirtualMachine) -> VMTabSession? {
+        sessions.first { $0.virtualMachine === virtualMachine }
     }
 }

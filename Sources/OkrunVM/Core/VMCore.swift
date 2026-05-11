@@ -321,11 +321,17 @@ struct SharedDirectoryConfig: Codable, Equatable {
 }
 
 enum NetworkDeviceFactory {
-    static func makeDevices(privateNetwork: PrivateNetworkConfig) throws -> [VZNetworkDeviceConfiguration] {
+    static func makeDevices(
+        privateNetwork: PrivateNetworkConfig,
+        onRetainPrivateNetworkRuntime: ((PrivateNetworkRuntime) -> Void)? = nil
+    ) throws -> [VZNetworkDeviceConfiguration] {
         var devices: [VZNetworkDeviceConfiguration] = [makeNATDevice()]
 
         if privateNetwork.enabled {
-            devices.append(try makePrivateNetworkDevice(identifier: privateNetwork.identifier))
+            devices.append(try makePrivateNetworkDevice(
+                identifier: privateNetwork.identifier,
+                onRetainPrivateNetworkRuntime: onRetainPrivateNetworkRuntime
+            ))
         }
 
         return devices
@@ -337,11 +343,15 @@ enum NetworkDeviceFactory {
         return networkDevice
     }
 
-    private static func makePrivateNetworkDevice(identifier: String) throws -> VZNetworkDeviceConfiguration {
+    private static func makePrivateNetworkDevice(
+        identifier: String,
+        onRetainPrivateNetworkRuntime: ((PrivateNetworkRuntime) -> Void)?
+    ) throws -> VZNetworkDeviceConfiguration {
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
         let runtime = try PrivateNetworkRuntime(identifier: identifier)
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
         PrivateNetworkRuntimeRegistry.shared.retain(runtime)
+        onRetainPrivateNetworkRuntime?(runtime)
         return networkDevice
     }
 }
@@ -359,6 +369,13 @@ final class PrivateNetworkRuntimeRegistry {
 
     func releaseAll() {
         runtimes.removeAll()
+    }
+
+    func release(_ ownedRuntimes: [PrivateNetworkRuntime]) {
+        guard !ownedRuntimes.isEmpty else { return }
+        runtimes.removeAll { runtime in
+            ownedRuntimes.contains { $0 === runtime }
+        }
     }
 }
 
