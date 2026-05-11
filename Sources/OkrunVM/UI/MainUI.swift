@@ -55,6 +55,33 @@ private final class CloseAlertButtonHandler: NSObject {
     }
 }
 
+private final class DeleteConfirmationActions: NSObject, NSTextFieldDelegate {
+    let expectedName: String
+    weak var panel: NSPanel?
+    weak var deleteButton: NSButton?
+    var confirmed = false
+
+    init(expectedName: String) {
+        self.expectedName = expectedName
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let textField = notification.object as? NSTextField else { return }
+        deleteButton?.isEnabled = textField.stringValue == expectedName
+    }
+
+    @objc func delete() {
+        confirmed = true
+        panel?.close()
+        NSApp.stopModal()
+    }
+
+    @objc func cancel() {
+        panel?.close()
+        NSApp.stopModal()
+    }
+}
+
 private final class VMTabSession {
     let id = UUID()
     let projectPath: String
@@ -731,44 +758,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func confirmDelete(session: VMTabSession) -> Bool {
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Delete \(session.title)?"
-        alert.informativeText = """
-        This will permanently delete everything in this folder:
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 310),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Delete VM"
+        panel.isReleasedWhenClosed = false
+        panel.level = .modalPanel
+        panel.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1)
 
-        \(session.projectPath)
+        let content = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1).cgColor
 
-        This includes the VM disk, EFI state, machine identifier, and project config.
-        """
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
+        let icon = NSImageView(image: NSImage(
+            systemSymbolName: "exclamationmark.triangle.fill",
+            accessibilityDescription: "Warning"
+        ) ?? NSImage())
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 32, weight: .regular)
+        icon.contentTintColor = .systemYellow
+
+        let title = NSTextField(labelWithString: "Delete \(session.title)?")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
+
+        let path = NSTextField(labelWithString: session.projectPath)
+        path.translatesAutoresizingMaskIntoConstraints = false
+        path.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        path.textColor = .secondaryLabelColor
+        path.lineBreakMode = .byTruncatingMiddle
+
+        let message = NSTextField(wrappingLabelWithString: "This permanently deletes the VM disk, EFI state, machine identifier, and project config.")
+        message.translatesAutoresizingMaskIntoConstraints = false
+        message.font = .systemFont(ofSize: 13)
+        message.textColor = .secondaryLabelColor
 
         let prompt = NSTextField(labelWithString: "Type \(session.title) to confirm.")
         prompt.translatesAutoresizingMaskIntoConstraints = false
-        prompt.font = .systemFont(ofSize: 12)
+        prompt.font = .systemFont(ofSize: 12, weight: .medium)
 
         let textField = NSTextField(string: "")
         textField.translatesAutoresizingMaskIntoConstraints = false
         textField.placeholderString = session.title
-        textField.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        textField.font = .systemFont(ofSize: 13)
 
-        let wrapper = NSStackView(views: [prompt, textField])
-        wrapper.translatesAutoresizingMaskIntoConstraints = false
-        wrapper.orientation = .vertical
-        wrapper.alignment = .leading
-        wrapper.spacing = 8
-        alert.accessoryView = wrapper
+        let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        cancelButton.bezelStyle = .rounded
+        cancelButton.controlSize = .large
+        cancelButton.keyEquivalent = "\u{1b}"
 
-        while alert.runModal() == .alertFirstButtonReturn {
-            if textField.stringValue == session.title {
-                return true
-            }
-            NSSound.beep()
-            textField.stringValue = ""
+        let deleteButton = NSButton(title: "Delete", target: nil, action: nil)
+        deleteButton.bezelStyle = .rounded
+        deleteButton.controlSize = .large
+        deleteButton.keyEquivalent = "\r"
+        deleteButton.isEnabled = false
+
+        let buttonRow = NSStackView(views: [cancelButton, deleteButton])
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.spacing = 12
+
+        let actions = DeleteConfirmationActions(expectedName: session.title)
+        actions.panel = panel
+        actions.deleteButton = deleteButton
+        textField.delegate = actions
+        cancelButton.target = actions
+        cancelButton.action = #selector(DeleteConfirmationActions.cancel)
+        deleteButton.target = actions
+        deleteButton.action = #selector(DeleteConfirmationActions.delete)
+
+        content.addSubview(icon)
+        content.addSubview(title)
+        content.addSubview(path)
+        content.addSubview(message)
+        content.addSubview(prompt)
+        content.addSubview(textField)
+        content.addSubview(buttonRow)
+        panel.contentView = content
+
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
+            icon.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
+            icon.widthAnchor.constraint(equalToConstant: 40),
+            icon.heightAnchor.constraint(equalToConstant: 40),
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 16),
+            title.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+            title.topAnchor.constraint(equalTo: content.topAnchor, constant: 30),
+            path.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            path.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            path.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 14),
+            message.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            message.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            message.topAnchor.constraint(equalTo: path.bottomAnchor, constant: 12),
+            prompt.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            prompt.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            prompt.topAnchor.constraint(equalTo: message.bottomAnchor, constant: 18),
+            textField.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            textField.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            textField.topAnchor.constraint(equalTo: prompt.bottomAnchor, constant: 8),
+            buttonRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+            buttonRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
+            cancelButton.widthAnchor.constraint(equalToConstant: 110),
+            deleteButton.widthAnchor.constraint(equalToConstant: 110)
+        ])
+
+        if let window {
+            panel.setFrameOrigin(NSPoint(
+                x: window.frame.midX - panel.frame.width / 2,
+                y: window.frame.midY - panel.frame.height / 2
+            ))
+        } else {
+            panel.center()
         }
 
-        return false
+        NSApp.runModal(for: panel)
+        _ = actions
+        return actions.confirmed
     }
 
     private func loadAndPrepareConfiguration(paths: VMPaths) throws -> (
