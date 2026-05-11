@@ -157,6 +157,7 @@ private final class VMTabSession {
     var config: VMConfig
     var virtualMachine: VZVirtualMachine?
     var fakeRunning = false
+    var shutdownRequested = false
     var projectLockFD: Int32?
     var privateNetworkRuntimes: [PrivateNetworkRuntime] = []
     var canStartControls = true
@@ -1261,29 +1262,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     @objc private func shutdownVM() {
         guard let session = selectedSession else { return }
-        shutdownSession(session)
+        shutdownSession(session, allowsForcePrompt: true)
     }
 
     private func shutdownRunningVMs() {
         for session in sessions where session.virtualMachine != nil {
-            shutdownSession(session)
+            shutdownSession(session, allowsForcePrompt: false)
         }
     }
 
-    private func shutdownSession(_ session: VMTabSession) {
+    private func shutdownSession(_ session: VMTabSession, allowsForcePrompt: Bool) {
         if session.fakeRunning {
             releaseProjectLock(for: session)
             releasePrivateNetworkRuntimes(for: session)
             session.fakeRunning = false
+            session.shutdownRequested = false
             setControlsEnabled(for: session, canStart: true, canStop: false)
             setStatus(for: session, status: "Shutdown", detail: "Fake VM stopped.")
             return
         }
 
         guard let virtualMachine = session.virtualMachine else { return }
+
+        if session.shutdownRequested {
+            guard allowsForcePrompt else {
+                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
+                return
+            }
+
+            if confirmForceStop(for: session) {
+                forceStopSession(session, virtualMachine: virtualMachine)
+            }
+            return
+        }
+
         do {
             if virtualMachine.canRequestStop {
                 try virtualMachine.requestStop()
+                session.shutdownRequested = true
                 AppLog.virtualMachine.info("Requested graceful shutdown project=\(session.paths.root.path, privacy: .public)")
                 setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
                 return
@@ -1294,6 +1310,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             return
         }
 
+        guard virtualMachine.canStop else {
+            setStatus(for: session, status: "Shutdown unavailable", detail: "The VM is not currently in a stoppable state.")
+            return
+        }
+
+        forceStopSession(session, virtualMachine: virtualMachine)
+    }
+
+    private func confirmForceStop(for session: VMTabSession) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Force stop \(session.title)?"
+        alert.informativeText = "A graceful shutdown is already in progress. Force stopping can interrupt guest services and may risk disk consistency."
+        alert.addButton(withTitle: "Force Stop")
+        alert.addButton(withTitle: "Keep Waiting")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func forceStopSession(_ session: VMTabSession, virtualMachine: VZVirtualMachine) {
         guard virtualMachine.canStop else {
             setStatus(for: session, status: "Shutdown unavailable", detail: "The VM is not currently in a stoppable state.")
             return
@@ -1312,6 +1347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                     self?.releasePrivateNetworkRuntimes(for: session)
                     session.virtualMachine = nil
                     session.vmView.virtualMachine = nil
+                    session.shutdownRequested = false
                     session.canStartControls = true
                     session.canStopControls = false
                     self?.window?.toolbar?.validateVisibleItems()
@@ -1345,6 +1381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
             if usesFakeVMBackend {
                 session.fakeRunning = true
+                session.shutdownRequested = false
                 setControlsEnabled(for: session, canStart: false, canStop: true)
                 setStatus(for: session, status: "Running", detail: runtimeDetail(for: session, "Mode: \(modeText)"))
                 return
@@ -1355,6 +1392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             vm.delegate = self
             session.virtualMachine = vm
             session.vmView.virtualMachine = vm
+            session.shutdownRequested = false
             setControlsEnabled(for: session, canStart: false, canStop: true)
 
             setStatus(
@@ -1375,6 +1413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                         self?.releasePrivateNetworkRuntimes(for: session)
                         session.virtualMachine = nil
                         session.vmView.virtualMachine = nil
+                        session.shutdownRequested = false
                         self?.setControlsEnabled(for: session, canStart: true, canStop: false)
                         self?.setStatus(for: session, status: "Start failed", detail: error.localizedDescription)
                     }
@@ -1384,6 +1423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             AppLog.virtualMachine.error("VM configuration failed project=\(session.paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             releaseProjectLock(for: session)
             releasePrivateNetworkRuntimes(for: session)
+            session.shutdownRequested = false
             setControlsEnabled(for: session, canStart: true, canStop: false)
             setStatus(for: session, status: "Configuration failed", detail: error.localizedDescription)
         }
@@ -1518,6 +1558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             self.releasePrivateNetworkRuntimes(for: session)
             session.virtualMachine = nil
             session.vmView.virtualMachine = nil
+            session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Shutdown", detail: "The VM has shut down.")
         }
@@ -1531,6 +1572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             self.releasePrivateNetworkRuntimes(for: session)
             session.virtualMachine = nil
             session.vmView.virtualMachine = nil
+            session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Stopped with error", detail: error.localizedDescription)
         }
