@@ -59,7 +59,7 @@ extension AppDelegate {
         var result: NewProjectRequest?
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 430),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 390),
             styleMask: [.titled],
             backing: .buffered,
             defer: false
@@ -85,10 +85,8 @@ extension AppDelegate {
         subtitle.textColor = .secondaryLabelColor
         subtitle.alignment = .center
 
-        let projectPath = makeValueLabel("Not selected")
-        let isoPath = makeValueLabel("Not selected")
-        let projectButton = makeChooserButton(title: "Choose...", symbolName: "folder")
-        let isoButton = makeChooserButton(title: "Choose...", symbolName: "opticaldisc")
+        let projectButton = makeChooserButton(title: "Choose VM Folder...", symbolName: "folder")
+        let isoButton = makeChooserButton(title: "Choose Installer ISO...", symbolName: "opticaldisc")
         let cpuField = makeNumberField("4")
         let memoryField = makeNumberField("4")
         let diskField = makeNumberField("64")
@@ -110,17 +108,17 @@ extension AppDelegate {
         buttonRow.spacing = 12
 
         let actions = DialogActions()
-        actions.onChooseProject = { [weak self, weak projectPath] in
+        actions.onChooseProject = { [weak self, weak projectButton] in
             guard let url = self?.chooseProjectDirectory() else { return }
             projectURL = url
-            projectPath?.stringValue = url.path
-            projectPath?.textColor = .labelColor
+            projectButton?.title = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+            projectButton?.toolTip = url.path
         }
-        actions.onChooseISO = { [weak self, weak isoPath] in
+        actions.onChooseISO = { [weak self, weak isoButton] in
             guard let url = self?.chooseInstallerISO() else { return }
             isoURL = url
-            isoPath?.stringValue = url.path
-            isoPath?.textColor = .labelColor
+            isoButton?.title = url.lastPathComponent
+            isoButton?.toolTip = url.path
         }
         actions.onCreate = { [weak panel, weak cpuField, weak memoryField, weak diskField] in
             guard let projectURL,
@@ -151,16 +149,15 @@ extension AppDelegate {
         cancelButton.action = #selector(DialogActions.cancel)
 
         let grid = NSGridView(views: [
-            [makeFieldLabel("VM Folder"), projectPath, projectButton],
-            [makeFieldLabel("ISO"), isoPath, isoButton],
-            [makeFieldLabel("CPU"), cpuField, NSView()],
-            [makeFieldLabel("Memory GB"), memoryField, NSView()],
-            [makeFieldLabel("Disk GB"), diskField, NSView()]
+            [makeFieldLabel("VM Folder"), projectButton],
+            [makeFieldLabel("ISO"), isoButton],
+            [makeFieldLabel("CPU"), cpuField],
+            [makeFieldLabel("Memory GB"), memoryField],
+            [makeFieldLabel("Disk GB"), diskField]
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 0).width = 116
-        grid.column(at: 1).width = 310
-        grid.column(at: 2).width = 112
+        grid.column(at: 1).width = 280
         grid.rowSpacing = 14
         grid.columnSpacing = 12
         grid.translatesAutoresizingMaskIntoConstraints = false
@@ -206,10 +203,12 @@ extension AppDelegate {
         let button = NSButton(title: title, target: nil, action: nil)
         button.bezelStyle = .rounded
         button.controlSize = .large
+        button.alignment = .left
         button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
         button.imagePosition = .imageLeading
         button.imageHugsTitle = true
-        button.widthAnchor.constraint(equalToConstant: 112).isActive = true
+        button.lineBreakMode = .byTruncatingMiddle
+        button.widthAnchor.constraint(equalToConstant: 280).isActive = true
         return button
     }
 
@@ -218,15 +217,6 @@ extension AppDelegate {
         label.font = .systemFont(ofSize: 13, weight: .medium)
         label.textColor = .labelColor
         label.alignment = .right
-        return label
-    }
-
-    private func makeValueLabel(_ text: String) -> NSTextField {
-        let label = NSTextField(labelWithString: text)
-        label.font = .systemFont(ofSize: 13, weight: .regular)
-        label.textColor = .secondaryLabelColor
-        label.maximumNumberOfLines = 1
-        label.lineBreakMode = .byTruncatingMiddle
         return label
     }
 

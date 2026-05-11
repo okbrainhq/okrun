@@ -31,8 +31,73 @@ private final class TabRailView: NSView {
     }
 }
 
-private extension NSToolbarItem.Identifier {
-    static let addVM = NSToolbarItem.Identifier("OkrunVM.addVM")
+private class HoverIconButton: NSButton {
+    var normalTint = NSColor.secondaryLabelColor {
+        didSet { updateAppearance() }
+    }
+    var disabledTint = NSColor.secondaryLabelColor.withAlphaComponent(0.35) {
+        didSet { updateAppearance() }
+    }
+    var hoverBackground = NSColor.white.withAlphaComponent(0.10)
+    private var isHovering = false
+    private var trackingAreaRef: NSTrackingArea?
+
+    init(symbolName: String, label: String, target: AnyObject?, action: Selector) {
+        super.init(frame: .zero)
+        self.target = target
+        self.action = action
+        translatesAutoresizingMaskIntoConstraints = false
+        bezelStyle = .regularSquare
+        isBordered = false
+        image = NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
+        imagePosition = .imageOnly
+        toolTip = label
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        layer?.cornerCurve = .continuous
+        widthAnchor.constraint(equalToConstant: 26).isActive = true
+        heightAnchor.constraint(equalToConstant: 22).isActive = true
+        updateAppearance()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isEnabled: Bool {
+        didSet { updateAppearance() }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingAreaRef {
+            removeTrackingArea(trackingAreaRef)
+        }
+
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+        updateAppearance()
+    }
+
+    private func updateAppearance() {
+        contentTintColor = isEnabled ? normalTint : disabledTint
+        layer?.backgroundColor = isHovering && isEnabled ? hoverBackground.cgColor : NSColor.clear.cgColor
+    }
 }
 
 private enum RunningVMCloseAction {
@@ -117,23 +182,15 @@ private final class VMTabSession {
     }
 }
 
-private final class VMTabDeleteButton: NSButton {
+private final class VMTabActionButton: HoverIconButton {
     let sessionID: UUID
 
-    init(sessionID: UUID, target: AnyObject?, action: Selector) {
+    init(sessionID: UUID, symbolName: String, label: String, target: AnyObject?, action: Selector) {
         self.sessionID = sessionID
-        super.init(frame: .zero)
-        self.target = target
-        self.action = action
-        translatesAutoresizingMaskIntoConstraints = false
-        bezelStyle = .regularSquare
-        isBordered = false
-        image = NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete VM")
-        imagePosition = .imageOnly
-        contentTintColor = NSColor.white.withAlphaComponent(0.72)
-        toolTip = "Delete VM"
-        widthAnchor.constraint(equalToConstant: 26).isActive = true
-        heightAnchor.constraint(equalToConstant: 26).isActive = true
+        super.init(symbolName: symbolName, label: label, target: target, action: action)
+        normalTint = NSColor.white.withAlphaComponent(0.72)
+        disabledTint = NSColor.white.withAlphaComponent(0.32)
+        hoverBackground = NSColor.white.withAlphaComponent(0.16)
     }
 
     required init?(coder: NSCoder) {
@@ -147,7 +204,8 @@ private final class VMTabItemView: NSControl {
     private let numberLabel = NSTextField(labelWithString: "")
     private let titleLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
-    private let deleteButton: VMTabDeleteButton
+    private let settingsButton: VMTabActionButton
+    private let deleteButton: VMTabActionButton
     private static let activeColor = NSColor(calibratedRed: 0.02, green: 0.48, blue: 0.95, alpha: 1)
 
     init(
@@ -156,11 +214,26 @@ private final class VMTabItemView: NSControl {
         title: String,
         target: AnyObject?,
         action: Selector,
+        settingsTarget: AnyObject?,
+        settingsAction: Selector,
         deleteTarget: AnyObject?,
         deleteAction: Selector
     ) {
         self.sessionID = sessionID
-        deleteButton = VMTabDeleteButton(sessionID: sessionID, target: deleteTarget, action: deleteAction)
+        settingsButton = VMTabActionButton(
+            sessionID: sessionID,
+            symbolName: "gearshape",
+            label: "Edit VM Config",
+            target: settingsTarget,
+            action: settingsAction
+        )
+        deleteButton = VMTabActionButton(
+            sessionID: sessionID,
+            symbolName: "trash",
+            label: "Delete VM",
+            target: deleteTarget,
+            action: deleteAction
+        )
         super.init(frame: .zero)
         self.target = target
         self.action = action
@@ -197,10 +270,16 @@ private final class VMTabItemView: NSControl {
         textStack.alignment = .leading
         textStack.spacing = 3
 
+        let actionStack = NSStackView(views: [settingsButton, deleteButton])
+        actionStack.translatesAutoresizingMaskIntoConstraints = false
+        actionStack.orientation = .horizontal
+        actionStack.alignment = .centerY
+        actionStack.spacing = 2
+
         numberBadge.addSubview(numberLabel)
         addSubview(numberBadge)
         addSubview(textStack)
-        addSubview(deleteButton)
+        addSubview(actionStack)
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 62),
@@ -212,10 +291,10 @@ private final class VMTabItemView: NSControl {
             numberLabel.trailingAnchor.constraint(equalTo: numberBadge.trailingAnchor),
             numberLabel.centerYAnchor.constraint(equalTo: numberBadge.centerYAnchor),
             textStack.leadingAnchor.constraint(equalTo: numberBadge.trailingAnchor, constant: 10),
-            textStack.trailingAnchor.constraint(lessThanOrEqualTo: deleteButton.leadingAnchor, constant: -8),
+            textStack.trailingAnchor.constraint(lessThanOrEqualTo: actionStack.leadingAnchor, constant: -8),
             textStack.centerYAnchor.constraint(equalTo: centerYAnchor),
-            deleteButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            deleteButton.centerYAnchor.constraint(equalTo: centerYAnchor)
+            actionStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            actionStack.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
     }
 
@@ -232,11 +311,10 @@ private final class VMTabItemView: NSControl {
         layer?.backgroundColor = isSelected ? Self.activeColor.cgColor : NSColor.clear.cgColor
         titleLabel.textColor = isSelected ? .white : .labelColor
         statusLabel.textColor = isSelected ? NSColor.white.withAlphaComponent(0.88) : .secondaryLabelColor
+        settingsButton.isHidden = !isSelected
+        settingsButton.isEnabled = isSelected && !isRunning
         deleteButton.isHidden = !isSelected
         deleteButton.isEnabled = isSelected && !isRunning
-        deleteButton.contentTintColor = isRunning
-            ? NSColor.white.withAlphaComponent(0.32)
-            : NSColor.white.withAlphaComponent(0.72)
 
         let badgeColor: NSColor
         if isRunning {
@@ -421,11 +499,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         tabPanel.setContentCompressionResistancePriority(.required, for: .horizontal)
         mainPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
         mainPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let sidebarNewButton = makeSidebarNewVMButton()
+
         tabStack = NSStackView()
         tabStack.orientation = .vertical
         tabStack.alignment = .leading
         tabStack.spacing = 0
         tabStack.translatesAutoresizingMaskIntoConstraints = false
+        tabPanel.addSubview(sidebarNewButton)
         tabPanel.addSubview(tabStack)
 
         mainPane.addArrangedSubview(statusContainer)
@@ -457,9 +539,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             emptyStateLabel.centerYAnchor.constraint(equalTo: vmContainer.centerYAnchor),
             tabPanel.widthAnchor.constraint(equalToConstant: 304),
             splitSeparator.widthAnchor.constraint(equalToConstant: 1),
+            sidebarNewButton.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor, constant: -12),
+            sidebarNewButton.topAnchor.constraint(equalTo: tabPanel.topAnchor, constant: 12),
             tabStack.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
             tabStack.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
-            tabStack.topAnchor.constraint(equalTo: tabPanel.topAnchor),
+            tabStack.topAnchor.constraint(equalTo: sidebarNewButton.bottomAnchor, constant: 8),
             tabStack.bottomAnchor.constraint(lessThanOrEqualTo: tabPanel.bottomAnchor)
         ])
 
@@ -502,9 +586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [
-            .addVM
-        ]
+        []
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -516,54 +598,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
-        switch itemIdentifier {
-        case .addVM:
-            return makeToolbarItem(itemIdentifier, label: "Add VM", symbolName: "plus", action: #selector(createProject))
-        default:
-            return nil
-        }
-    }
-
-    private func makeToolbarItem(
-        _ identifier: NSToolbarItem.Identifier,
-        label: String,
-        symbolName: String,
-        action: Selector
-    ) -> NSToolbarItem {
-        let item = NSToolbarItem(itemIdentifier: identifier)
-        item.label = label
-        item.paletteLabel = label
-        item.toolTip = label
-        item.target = self
-        item.action = action
-        item.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
-        item.isBordered = false
-        return item
+        nil
     }
 
     private func makeContextButton(label: String, symbolName: String, action: Selector) -> NSButton {
-        let button = NSButton(frame: .zero)
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.target = self
-        button.action = action
-        button.toolTip = label
-        button.bezelStyle = .regularSquare
-        button.isBordered = false
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
-        button.imagePosition = .imageOnly
-        button.contentTintColor = .secondaryLabelColor
-        button.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        let button = HoverIconButton(symbolName: symbolName, label: label, target: self, action: action)
+        button.normalTint = .secondaryLabelColor
+        button.disabledTint = NSColor.secondaryLabelColor.withAlphaComponent(0.35)
+        button.hoverBackground = NSColor.white.withAlphaComponent(0.10)
+        return button
+    }
+
+    private func makeSidebarNewVMButton() -> NSButton {
+        let button = HoverIconButton(symbolName: "plus", label: "New VM", target: self, action: #selector(createProject))
+        button.normalTint = .labelColor
+        button.disabledTint = NSColor.labelColor.withAlphaComponent(0.35)
+        button.hoverBackground = NSColor.white.withAlphaComponent(0.12)
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
         return button
     }
 
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
-        switch item.itemIdentifier {
-        case .addVM:
-            return true
-        default:
-            return true
-        }
+        true
     }
 
     private func updateContextControls() {
@@ -623,6 +680,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 title: session.title,
                 target: self,
                 action: #selector(tabButtonPressed(_:)),
+                settingsTarget: self,
+                settingsAction: #selector(settingsTabButtonPressed(_:)),
                 deleteTarget: self,
                 deleteAction: #selector(deleteTabButtonPressed(_:))
             )
@@ -687,13 +746,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     @objc private func deleteTabButtonPressed(_ sender: NSButton) {
-        guard let sender = sender as? VMTabDeleteButton,
+        guard let sender = sender as? VMTabActionButton,
               let session = sessions.first(where: { $0.id == sender.sessionID }) else {
             return
         }
 
         selectSession(session)
         deleteProject()
+    }
+
+    @objc private func settingsTabButtonPressed(_ sender: NSButton) {
+        guard let sender = sender as? VMTabActionButton,
+              let session = sessions.first(where: { $0.id == sender.sessionID }),
+              session.virtualMachine == nil else {
+            return
+        }
+
+        selectSession(session)
+        openConfigEditor(for: session)
     }
 
     @objc private func createProject() {
@@ -879,6 +949,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         NSApp.runModal(for: panel)
         _ = actions
         return actions.confirmed
+    }
+
+    private func openConfigEditor(for session: VMTabSession) {
+        guard NSWorkspace.shared.open(session.paths.config) else {
+            setStatus(for: session, status: "Config open failed", detail: session.paths.config.path)
+            return
+        }
     }
 
     private func loadAndPrepareConfiguration(paths: VMPaths) throws -> (
