@@ -46,6 +46,7 @@ private class HoverIconButton: NSButton {
         super.init(frame: .zero)
         self.target = target
         self.action = action
+        setAccessibilityLabel(label)
         translatesAutoresizingMaskIntoConstraints = false
         bezelStyle = .regularSquare
         isBordered = false
@@ -235,6 +236,9 @@ private final class VMTabItemView: NSControl {
             action: deleteAction
         )
         super.init(frame: .zero)
+        setAccessibilityIdentifier("okrun.vm-tab.\(sessionID.uuidString)")
+        settingsButton.setAccessibilityIdentifier("okrun.vm-tab.settings")
+        deleteButton.setAccessibilityIdentifier("okrun.vm-tab.delete")
         self.target = target
         self.action = action
         translatesAutoresizingMaskIntoConstraints = false
@@ -346,6 +350,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var selectedSessionID: UUID?
     private var isClosingAnyway = false
     private var closeAlertHandler: CloseAlertButtonHandler?
+    private var skipAutomaticStartAfterCreate: Bool {
+        ProcessInfo.processInfo.environment["OKRUN_UI_E2E_SKIP_AUTOSTART"] == "1"
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -443,8 +450,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         mainPane.translatesAutoresizingMaskIntoConstraints = false
 
         statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
+        statusLabel.setAccessibilityIdentifier("okrun.status")
         statusLabel.alignment = .left
         detailsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        detailsLabel.setAccessibilityIdentifier("okrun.status-detail")
         detailsLabel.textColor = .secondaryLabelColor
         detailsLabel.lineBreakMode = .byTruncatingMiddle
         detailsLabel.maximumNumberOfLines = 1
@@ -489,6 +498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         vmContainer = RoundedContainerView()
 
         emptyStateLabel.translatesAutoresizingMaskIntoConstraints = false
+        emptyStateLabel.setAccessibilityIdentifier("okrun.empty-state")
         emptyStateLabel.font = .systemFont(ofSize: 15, weight: .medium)
         emptyStateLabel.textColor = .secondaryLabelColor
         emptyStateLabel.alignment = .center
@@ -603,6 +613,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func makeContextButton(label: String, symbolName: String, action: Selector) -> NSButton {
         let button = HoverIconButton(symbolName: symbolName, label: label, target: self, action: action)
+        button.setAccessibilityIdentifier("okrun.context.\(label.lowercased().replacingOccurrences(of: " ", with: "-"))")
         button.normalTint = .secondaryLabelColor
         button.disabledTint = NSColor.secondaryLabelColor.withAlphaComponent(0.35)
         button.hoverBackground = NSColor.white.withAlphaComponent(0.10)
@@ -611,6 +622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func makeSidebarNewVMButton() -> NSButton {
         let button = HoverIconButton(symbolName: "plus", label: "New VM", target: self, action: #selector(createProject))
+        button.setAccessibilityIdentifier("okrun.new-vm")
         button.normalTint = .labelColor
         button.disabledTint = NSColor.labelColor.withAlphaComponent(0.35)
         button.hoverBackground = NSColor.white.withAlphaComponent(0.12)
@@ -790,7 +802,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             sessions.append(session)
             rebuildTabButtons()
             selectSession(session)
-            start(mode: .installer(request.isoURL))
+            if skipAutomaticStartAfterCreate {
+                setStatus(for: session, status: "Ready", detail: statusDetail(paths: paths, config: request.config))
+            } else {
+                start(mode: .installer(request.isoURL))
+            }
         } catch {
             setStatus("Add project failed", detail: error.localizedDescription)
             selectedSession?.status = "Add project failed"
@@ -872,16 +888,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         prompt.font = .systemFont(ofSize: 12, weight: .medium)
 
         let textField = NSTextField(string: "")
+        textField.setAccessibilityIdentifier("okrun.delete.confirm-name")
         textField.translatesAutoresizingMaskIntoConstraints = false
         textField.placeholderString = session.title
         textField.font = .systemFont(ofSize: 13)
 
         let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        cancelButton.setAccessibilityIdentifier("okrun.delete.cancel")
         cancelButton.bezelStyle = .rounded
         cancelButton.controlSize = .large
         cancelButton.keyEquivalent = "\u{1b}"
 
         let deleteButton = NSButton(title: "Delete", target: nil, action: nil)
+        deleteButton.setAccessibilityIdentifier("okrun.delete.confirm")
         deleteButton.bezelStyle = .rounded
         deleteButton.controlSize = .large
         deleteButton.keyEquivalent = "\r"

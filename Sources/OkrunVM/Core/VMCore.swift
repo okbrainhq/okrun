@@ -68,8 +68,14 @@ struct ProjectRegistry: Codable, Equatable {
 final class ProjectStore {
     private let url: URL
 
-    init(url: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".okrun")) {
-        self.url = url
+    init(url: URL? = nil) {
+        if let url {
+            self.url = url
+        } else if let registryPath = ProcessInfo.processInfo.environment["OKRUN_REGISTRY_PATH"], !registryPath.isEmpty {
+            self.url = URL(fileURLWithPath: registryPath)
+        } else {
+            self.url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".okrun")
+        }
     }
 
     func load(defaultProject: URL?) throws -> ProjectRegistry {

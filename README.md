@@ -32,6 +32,19 @@ The E2E script downloads Alpine Linux aarch64 netboot artifacts into `.e2e/`,
 builds a tiny initramfs that prints `OKRUN_E2E_BOOTED`, builds the signed app,
 and boots that Linux image with Virtualization.framework headlessly.
 
+Run the GUI add/delete smoke test without booting a VM:
+
+```sh
+./scripts/e2e-ui-add-delete.sh
+```
+
+This builds the app, launches it with an isolated registry at
+`.e2e/ui-add-delete/.okrun`, drives the Add VM and Delete VM UI with macOS
+Accessibility automation, and saves screenshots under
+`.e2e/ui-add-delete/screenshots`. If macOS blocks the script, allow the current
+terminal or Codex app in System Settings > Privacy & Security > Accessibility
+and rerun it.
+
 ## Projects
 
 An Okrun project is a directory that owns one VM:

@@ -54,8 +54,8 @@ extension AppDelegate {
     }
 
     func askForNewProject() -> NewProjectRequest? {
-        var projectURL: URL?
-        var isoURL: URL?
+        var projectURL = environmentURL("OKRUN_UI_E2E_PROJECT_PATH")
+        var isoURL = environmentURL("OKRUN_UI_E2E_ISO_PATH")
         var result: NewProjectRequest?
 
         let panel = NSPanel(
@@ -85,18 +85,30 @@ extension AppDelegate {
         subtitle.textColor = .secondaryLabelColor
         subtitle.alignment = .center
 
-        let projectButton = makeChooserButton(title: "Choose VM Folder...", symbolName: "folder")
-        let isoButton = makeChooserButton(title: "Choose Installer ISO...", symbolName: "opticaldisc")
-        let cpuField = makeNumberField("4")
-        let memoryField = makeNumberField("4")
-        let diskField = makeNumberField("64")
+        let projectButton = makeChooserButton(
+            title: projectURL.map { displayName(for: $0) } ?? "Choose VM Folder...",
+            symbolName: "folder",
+            identifier: "okrun.add.project"
+        )
+        projectButton.toolTip = projectURL?.path
+        let isoButton = makeChooserButton(
+            title: isoURL?.lastPathComponent ?? "Choose Installer ISO...",
+            symbolName: "opticaldisc",
+            identifier: "okrun.add.iso"
+        )
+        isoButton.toolTip = isoURL?.path
+        let cpuField = makeNumberField(environmentValue("OKRUN_UI_E2E_CPU", default: "4"), identifier: "okrun.add.cpu")
+        let memoryField = makeNumberField(environmentValue("OKRUN_UI_E2E_MEMORY_GB", default: "4"), identifier: "okrun.add.memory")
+        let diskField = makeNumberField(environmentValue("OKRUN_UI_E2E_DISK_GB", default: "64"), identifier: "okrun.add.disk")
 
         let createButton = NSButton(title: "Create", target: nil, action: nil)
+        createButton.setAccessibilityIdentifier("okrun.add.create")
         createButton.bezelStyle = .rounded
         createButton.controlSize = .large
         createButton.keyEquivalent = "\r"
 
         let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        cancelButton.setAccessibilityIdentifier("okrun.add.cancel")
         cancelButton.bezelStyle = .rounded
         cancelButton.controlSize = .large
         cancelButton.keyEquivalent = "\u{1b}"
@@ -190,8 +202,9 @@ extension AppDelegate {
         return result
     }
 
-    private func makeNumberField(_ value: String) -> NSTextField {
+    private func makeNumberField(_ value: String, identifier: String) -> NSTextField {
         let field = NSTextField(string: value)
+        field.setAccessibilityIdentifier(identifier)
         field.alignment = .right
         field.controlSize = .large
         field.font = .systemFont(ofSize: 13)
@@ -199,8 +212,9 @@ extension AppDelegate {
         return field
     }
 
-    private func makeChooserButton(title: String, symbolName: String) -> NSButton {
+    private func makeChooserButton(title: String, symbolName: String, identifier: String) -> NSButton {
         let button = NSButton(title: title, target: nil, action: nil)
+        button.setAccessibilityIdentifier(identifier)
         button.bezelStyle = .rounded
         button.controlSize = .large
         button.alignment = .left
@@ -230,5 +244,23 @@ extension AppDelegate {
             x: hostWindow.frame.midX - panel.frame.width / 2,
             y: hostWindow.frame.midY - panel.frame.height / 2
         ))
+    }
+
+    private func environmentURL(_ name: String) -> URL? {
+        guard let value = ProcessInfo.processInfo.environment[name], !value.isEmpty else {
+            return nil
+        }
+        return URL(fileURLWithPath: value)
+    }
+
+    private func environmentValue(_ name: String, default defaultValue: String) -> String {
+        guard let value = ProcessInfo.processInfo.environment[name], !value.isEmpty else {
+            return defaultValue
+        }
+        return value
+    }
+
+    private func displayName(for url: URL) -> String {
+        url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
     }
 }
