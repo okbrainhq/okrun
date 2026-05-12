@@ -238,8 +238,10 @@ private final class VMTabItemView: NSControl {
             action: deleteAction
         )
         super.init(frame: .zero)
-        setAccessibilityElement(false)
-        setAccessibilityIdentifier("okrun.vm-tab.\(sessionID.uuidString)")
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
+        setAccessibilityIdentifier("okrun.vm-tab.item")
         settingsButton.setAccessibilityIdentifier("okrun.vm-tab.settings")
         deleteButton.setAccessibilityIdentifier("okrun.vm-tab.delete")
         self.target = target
@@ -261,6 +263,7 @@ private final class VMTabItemView: NSControl {
         numberLabel.alignment = .center
 
         titleLabel.stringValue = title
+        titleLabel.setAccessibilityIdentifier("okrun.vm-tab.title")
         titleLabel.font = .systemFont(ofSize: 13, weight: .bold)
         titleLabel.textColor = .labelColor
         titleLabel.lineBreakMode = .byTruncatingTail
@@ -337,7 +340,7 @@ private final class VMTabItemView: NSControl {
 }
 
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, NSToolbarItemValidation, VZVirtualMachineDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtualMachineDelegate {
     private var window: NSWindow!
     private var statusLabel = NSTextField(labelWithString: "Preparing")
     private var detailsLabel = NSTextField(labelWithString: "")
@@ -535,13 +538,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         mainPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let sidebarNewButton = makeSidebarNewVMButton()
+        let sidebarHeader = NSView()
+        sidebarHeader.translatesAutoresizingMaskIntoConstraints = false
 
         tabStack = NSStackView()
         tabStack.orientation = .vertical
         tabStack.alignment = .leading
         tabStack.spacing = 0
         tabStack.translatesAutoresizingMaskIntoConstraints = false
-        tabPanel.addSubview(sidebarNewButton)
+        sidebarHeader.addSubview(sidebarNewButton)
+        tabPanel.addSubview(sidebarHeader)
         tabPanel.addSubview(tabStack)
 
         mainPane.addArrangedSubview(statusContainer)
@@ -557,10 +563,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         root.addArrangedSubview(mainPane)
         content.addSubview(root)
 
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 780),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.minSize = NSSize(width: 1040, height: 560)
+        window.center()
+        window.title = "Okrun VM"
+        window.backgroundColor = NSColor(calibratedWhite: 0.065, alpha: 1)
+        window.contentView = content
+        window.delegate = self
+
+        let contentTopAnchor = (window.contentLayoutGuide as? NSLayoutGuide)?.topAnchor ?? content.safeAreaLayoutGuide.topAnchor
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            root.topAnchor.constraint(equalTo: content.topAnchor),
+            root.topAnchor.constraint(equalTo: contentTopAnchor),
             root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             statusContainer.heightAnchor.constraint(equalToConstant: 34),
             statusRow.leadingAnchor.constraint(equalTo: statusContainer.leadingAnchor, constant: 12),
@@ -573,50 +593,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             emptyStateLabel.centerYAnchor.constraint(equalTo: vmContainer.centerYAnchor),
             tabPanel.widthAnchor.constraint(equalToConstant: 304),
             splitSeparator.widthAnchor.constraint(equalToConstant: 1),
-            sidebarNewButton.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor, constant: -12),
-            sidebarNewButton.centerYAnchor.constraint(equalTo: tabPanel.topAnchor, constant: 23),
+            sidebarHeader.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
+            sidebarHeader.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
+            sidebarHeader.topAnchor.constraint(equalTo: tabPanel.topAnchor),
+            sidebarHeader.heightAnchor.constraint(equalToConstant: 46),
+            sidebarNewButton.trailingAnchor.constraint(equalTo: sidebarHeader.trailingAnchor, constant: -12),
+            sidebarNewButton.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor),
             tabStack.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
             tabStack.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
-            tabStack.topAnchor.constraint(equalTo: tabPanel.topAnchor, constant: 46),
-            tabStack.bottomAnchor.constraint(lessThanOrEqualTo: tabPanel.bottomAnchor)
+            tabStack.topAnchor.constraint(equalTo: sidebarHeader.bottomAnchor),
+            tabStack.bottomAnchor.constraint(equalTo: tabPanel.bottomAnchor)
         ])
 
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 780),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.minSize = NSSize(width: 1040, height: 560)
-        window.center()
-        window.title = "Okrun VM"
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.backgroundColor = NSColor(calibratedWhite: 0.065, alpha: 1)
-        window.contentView = content
-        window.delegate = self
-        installToolbar()
         window.makeKeyAndOrderFront(nil)
 
         window?.toolbar?.validateVisibleItems()
         updateContextControls()
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func installToolbar() {
-        let toolbar = NSToolbar(identifier: "OkrunVM.mainToolbar")
-        toolbar.delegate = self
-        toolbar.displayMode = .iconOnly
-        toolbar.allowsUserCustomization = false
-        toolbar.autosavesConfiguration = false
-        toolbar.showsBaselineSeparator = false
-
-        if #available(macOS 11.0, *) {
-            window.toolbarStyle = .unifiedCompact
-            window.titlebarSeparatorStyle = .none
-        }
-
-        window.toolbar = toolbar
     }
 
     private func installUITestMenuIfNeeded() {
@@ -652,24 +645,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         selectLastItem.target = self
         vmMenu.addItem(selectLastItem)
 
+        let zoomItem = NSMenuItem(title: "Zoom Window", action: #selector(zoomWindowForUITest), keyEquivalent: "")
+        zoomItem.target = self
+        vmMenu.addItem(zoomItem)
+
         vmItem.submenu = vmMenu
         NSApp.mainMenu = mainMenu
-    }
-
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        []
-    }
-
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        toolbarDefaultItemIdentifiers(toolbar)
-    }
-
-    func toolbar(
-        _ toolbar: NSToolbar,
-        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
-        willBeInsertedIntoToolbar flag: Bool
-    ) -> NSToolbarItem? {
-        nil
     }
 
     private func makeContextButton(label: String, symbolName: String, action: Selector) -> NSButton {
@@ -690,10 +671,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         button.layer?.borderWidth = 1
         button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
         return button
-    }
-
-    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
-        true
     }
 
     private func updateContextControls() {
@@ -852,6 +829,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     @objc private func selectLastVMForUITest() {
         guard let session = sessions.last else { return }
         selectSession(session)
+    }
+
+    @objc private func zoomWindowForUITest() {
+        window?.zoom(nil)
     }
 
     @objc private func createProject() {

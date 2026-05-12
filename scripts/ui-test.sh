@@ -122,6 +122,98 @@ error "Timed out waiting for app window"
 APPLESCRIPT
 }
 
+assert_sidebar_visible() {
+  local phase="$1"
+  osascript <<APPLESCRIPT
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        try
+          set targetWindow to window 1
+          set newButton to first UI element of targetWindow whose description is "New VM"
+          set firstTab to first UI element of targetWindow whose description is "first-vm"
+          set buttonPosition to position of newButton
+          set buttonSize to size of newButton
+          set tabPosition to position of firstTab
+          set tabSize to size of firstTab
+          set windowPosition to position of targetWindow
+          if (item 1 of buttonSize) < 20 or (item 2 of buttonSize) < 20 then
+            error "New VM button is collapsed during $phase"
+          end if
+          if (item 1 of tabSize) < 200 or (item 2 of tabSize) < 40 then
+            error "VM tab row is collapsed during $phase"
+          end if
+          if (item 2 of buttonPosition) < ((item 2 of windowPosition) + 34) then
+            error "New VM button is hidden under the titlebar during $phase"
+          end if
+          if (item 2 of tabPosition) < ((item 2 of buttonPosition) + (item 2 of buttonSize)) then
+            error "VM tab row is hidden behind the sidebar header during $phase"
+          end if
+          return true
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for visible sidebar during $phase"
+APPLESCRIPT
+}
+
+window_width() {
+  osascript <<'APPLESCRIPT'
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        try
+          set windowSize to size of window 1
+          return item 1 of windowSize
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for app window width"
+APPLESCRIPT
+}
+
+wait_for_window_width_change() {
+  local before_width="$1"
+  local deadline=$((SECONDS + 12))
+  while [[ "$(window_width)" == "$before_width" ]]; do
+    if (( SECONDS >= deadline )); then
+      printf 'Timed out waiting for window width to change from %s\n' "$before_width" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
 click_menu_item() {
   local menu_name="$1"
   local item_name="$2"
@@ -250,6 +342,24 @@ wait_for_file() {
   done
 }
 
+wait_for_any_file() {
+  local deadline=$((SECONDS + 12))
+  until false; do
+    for path in "$@"; do
+      if [[ -e "$path" ]]; then
+        return 0
+      fi
+    done
+
+    if (( SECONDS >= deadline )); then
+      printf 'Timed out waiting for one of:\n' >&2
+      printf '  %s\n' "$@" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
 wait_for_missing() {
   local path="$1"
   local deadline=$((SECONDS + 12))
@@ -358,7 +468,7 @@ run_project_lifecycle_smoke() {
   capture "01-lifecycle-add-dialog"
   click_button "Create" "okrun.add.create"
   wait_for_file "$project_path/okrun-vm.json"
-  wait_for_file "$project_path/vm/linux.raw"
+  wait_for_any_file "$project_path/vm/linux.raw" "$project_path/vm/linux.asif"
   registry_contains_project "$registry_path" "$project_path"
   capture "02-lifecycle-after-add"
 
@@ -436,6 +546,34 @@ run_registry_restore_and_selection() {
   cleanup
 }
 
+run_titlebar_zoom_keeps_sidebar_visible() {
+  printf 'Running titlebar zoom sidebar visibility...\n'
+  local test_dir="$ARTIFACT_DIR/titlebar-zoom"
+  local registry_path="$test_dir/.okrun"
+  local iso_path="$test_dir/alpine-ui-e2e.iso"
+  local first_project="$test_dir/first-vm"
+  local second_project="$test_dir/second-vm"
+
+  rm -rf "$test_dir"
+  mkdir -p "$test_dir"
+  printf 'okrun-ui-e2e placeholder iso\n' >"$iso_path"
+  write_config "$first_project" "$iso_path" 1
+  write_config "$second_project" "$iso_path" 1
+  write_registry "$registry_path" "$first_project" "$first_project" "$second_project"
+
+  launch_app "$registry_path" "$test_dir/default-project"
+  assert_sidebar_visible "before titlebar zoom"
+  capture "11-titlebar-before-zoom"
+  local before_width
+  before_width="$(window_width)"
+  click_menu_item "VM" "Zoom Window"
+  wait_for_window_width_change "$before_width"
+  sleep 0.8
+  assert_sidebar_visible "after titlebar zoom"
+  capture "12-titlebar-after-zoom"
+  cleanup
+}
+
 run_fake_running_close_flow() {
   printf 'Running fake running VM close alert flow...\n'
   local test_dir="$ARTIFACT_DIR/fake-running-close"
@@ -472,6 +610,7 @@ mkdir -p "$SCREENSHOT_DIR"
 run_project_lifecycle_smoke
 run_add_dialog_validation
 run_registry_restore_and_selection
+run_titlebar_zoom_keeps_sidebar_visible
 run_fake_running_close_flow
 
 printf 'Critical UI E2E suite passed.\n'
