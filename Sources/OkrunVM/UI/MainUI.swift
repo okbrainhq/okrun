@@ -1250,7 +1250,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 diskGB: currentConfig.diskGB,
                 installerISOPath: iso.path,
                 privateNetwork: currentConfig.privateNetwork,
-                sharedDirectories: currentConfig.sharedDirectories
+                sharedDirectories: currentConfig.sharedDirectories,
+                diskIO: currentConfig.diskIO
             )
             try updatedConfig.save(to: session.paths.config)
             session.config = updatedConfig
@@ -1632,7 +1633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             session.privateNetworkRuntimes.append(runtime)
         }
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-        configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode)
+        configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode, config: config)
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
             for: config.sharedDirectories,
             managedGuestLogsDirectory: ManagedGuestTools.guestLogsDirectory(in: paths)
@@ -1662,8 +1663,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         return graphicsDevice
     }
 
-    private func makeStorageDevices(paths: VMPaths, mode: VMMode) throws -> [VZStorageDeviceConfiguration] {
-        let diskAttachment = try DiskImageAttachmentFactory.make(url: paths.disk, readOnly: false)
+    private func makeStorageDevices(paths: VMPaths, mode: VMMode, config: VMConfig) throws -> [VZStorageDeviceConfiguration] {
+        let diskAttachment = try DiskImageAttachmentFactory.make(
+            url: paths.disk,
+            readOnly: false,
+            diskIO: config.diskIO
+        )
         let diskDevice = VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
 
         switch mode {

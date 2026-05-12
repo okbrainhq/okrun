@@ -194,6 +194,48 @@ struct DiskImageInfo: Equatable {
     }
 }
 
+enum DiskCachingMode: String, Codable, Equatable {
+    case automatic
+    case cached
+    case uncached
+
+    var virtualizationMode: VZDiskImageCachingMode {
+        switch self {
+        case .automatic:
+            return .automatic
+        case .cached:
+            return .cached
+        case .uncached:
+            return .uncached
+        }
+    }
+}
+
+enum DiskSynchronizationMode: String, Codable, Equatable {
+    case none
+    case fsync
+    case full
+
+    var virtualizationMode: VZDiskImageSynchronizationMode {
+        switch self {
+        case .none:
+            return .none
+        case .fsync:
+            return .fsync
+        case .full:
+            return .full
+        }
+    }
+}
+
+struct DiskIOConfig: Codable, Equatable {
+    static let defaults = DiskIOConfig(caching: .cached, synchronization: .full)
+    static let readOnlyDefaults = DiskIOConfig(caching: .automatic, synchronization: .fsync)
+
+    let caching: DiskCachingMode
+    let synchronization: DiskSynchronizationMode
+}
+
 struct VMConfig: Codable, Equatable {
     static let defaults = VMConfig(cpuCount: 4, memoryGB: 4, diskGB: 64, installerISOPath: nil)
 
@@ -203,6 +245,7 @@ struct VMConfig: Codable, Equatable {
     let installerISOPath: String?
     let privateNetwork: PrivateNetworkConfig
     let sharedDirectories: [SharedDirectoryConfig]
+    let diskIO: DiskIOConfig
 
     enum CodingKeys: String, CodingKey {
         case cpuCount
@@ -211,6 +254,7 @@ struct VMConfig: Codable, Equatable {
         case installerISOPath
         case privateNetwork
         case sharedDirectories
+        case diskIO
     }
 
     init(
@@ -219,7 +263,8 @@ struct VMConfig: Codable, Equatable {
         diskGB: Int,
         installerISOPath: String?,
         privateNetwork: PrivateNetworkConfig = .disabled,
-        sharedDirectories: [SharedDirectoryConfig] = []
+        sharedDirectories: [SharedDirectoryConfig] = [],
+        diskIO: DiskIOConfig = .defaults
     ) {
         self.cpuCount = cpuCount
         self.memoryGB = memoryGB
@@ -227,6 +272,7 @@ struct VMConfig: Codable, Equatable {
         self.installerISOPath = installerISOPath
         self.privateNetwork = privateNetwork
         self.sharedDirectories = sharedDirectories
+        self.diskIO = diskIO
     }
 
     init(from decoder: Decoder) throws {
@@ -237,6 +283,7 @@ struct VMConfig: Codable, Equatable {
         installerISOPath = try container.decodeIfPresent(String.self, forKey: .installerISOPath)
         privateNetwork = try container.decodeIfPresent(PrivateNetworkConfig.self, forKey: .privateNetwork) ?? .disabled
         sharedDirectories = try container.decodeIfPresent([SharedDirectoryConfig].self, forKey: .sharedDirectories) ?? []
+        diskIO = try container.decodeIfPresent(DiskIOConfig.self, forKey: .diskIO) ?? .defaults
     }
 
     static func load(from url: URL) throws -> VMConfig {
@@ -251,7 +298,11 @@ struct VMConfig: Codable, Equatable {
         }
 
         let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(VMConfig.self, from: data).validated()
+        let config = try JSONDecoder().decode(VMConfig.self, from: data).validated()
+        if !Self.configDataContainsDiskIO(data) {
+            try config.save(to: url)
+        }
+        return config
     }
 
     func save(to url: URL) throws {
@@ -274,6 +325,14 @@ struct VMConfig: Codable, Equatable {
         try PrivateNetworkValidator.validate(privateNetwork)
         try SharedDirectoryValidator.validate(sharedDirectories)
         return self
+    }
+
+    private static func configDataContainsDiskIO(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else {
+            return false
+        }
+        return dictionary.keys.contains(CodingKeys.diskIO.rawValue)
     }
 }
 
@@ -752,12 +811,13 @@ enum VMStorage {
 }
 
 enum DiskImageAttachmentFactory {
-    static func make(url: URL, readOnly: Bool) throws -> VZDiskImageStorageDeviceAttachment {
-        try VZDiskImageStorageDeviceAttachment(
+    static func make(url: URL, readOnly: Bool, diskIO: DiskIOConfig? = nil) throws -> VZDiskImageStorageDeviceAttachment {
+        let options = diskIO ?? (readOnly ? DiskIOConfig.readOnlyDefaults : DiskIOConfig.defaults)
+        return try VZDiskImageStorageDeviceAttachment(
             url: url,
             readOnly: readOnly,
-            cachingMode: .automatic,
-            synchronizationMode: readOnly ? .fsync : .full
+            cachingMode: options.caching.virtualizationMode,
+            synchronizationMode: options.synchronization.virtualizationMode
         )
     }
 }

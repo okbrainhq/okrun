@@ -90,6 +90,10 @@ filesystem before booting it for normal use again.
   "cpuCount": 4,
   "memoryGB": 4,
   "diskGB": 64,
+  "diskIO": {
+    "caching": "cached",
+    "synchronization": "full"
+  },
   "installerISOPath": "/path/to/linux.iso",
   "privateNetwork": {
     "enabled": false,
@@ -112,6 +116,12 @@ filesystem before booting it for normal use again.
 
 Increasing `diskGB` expands the raw disk file. Existing disks are not shrunk
 automatically.
+
+`diskIO.caching` accepts `automatic`, `cached`, or `uncached`. Okrun defaults to
+`cached` for the writable Linux disk, matching Tart's Linux disk default.
+`diskIO.synchronization` accepts `full`, `fsync`, or `none`. Keep `full` for the
+best durability; `fsync` and especially `none` can improve disk-heavy throwaway
+workloads at the cost of weaker crash and power-loss safety.
 
 ## Guest Tools
 

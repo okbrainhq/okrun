@@ -76,6 +76,13 @@ struct OkrunVMTests {
         #expect(config.installerISOPath == nil)
         #expect(config.privateNetwork == .disabled)
         #expect(config.sharedDirectories == [])
+        #expect(config.diskIO == .defaults)
+
+        let migratedData = try Data(contentsOf: configURL)
+        let migratedJSON = try #require(JSONSerialization.jsonObject(with: migratedData) as? [String: Any])
+        let diskIO = try #require(migratedJSON["diskIO"] as? [String: Any])
+        #expect(diskIO["caching"] as? String == "cached")
+        #expect(diskIO["synchronization"] as? String == "full")
     }
 
     @Test
@@ -95,7 +102,8 @@ struct OkrunVMTests {
             privateNetwork: PrivateNetworkConfig(enabled: true, identifier: "team"),
             sharedDirectories: [
                 SharedDirectoryConfig(name: "project", hostPath: sharedDirectory.path, readOnly: false)
-            ]
+            ],
+            diskIO: DiskIOConfig(caching: .uncached, synchronization: .fsync)
         )
         try config.save(to: configURL)
 
@@ -333,6 +341,44 @@ struct OkrunVMTests {
 
         attributes = try FileManager.default.attributesOfItem(atPath: paths.disk.path)
         #expect(attributes[.size] as? UInt64 == 2_147_483_648)
+    }
+
+    @Test
+    func diskImageAttachmentFactoryUsesCachedWritableDiskDefault() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let disk = project.appendingPathComponent("disk.raw")
+        FileManager.default.createFile(atPath: disk.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: disk)
+        try handle.truncate(atOffset: 1_048_576)
+        try handle.close()
+
+        let attachment = try DiskImageAttachmentFactory.make(url: disk, readOnly: false)
+
+        #expect(attachment.cachingMode == .cached)
+        #expect(attachment.synchronizationMode == .full)
+    }
+
+    @Test
+    func diskImageAttachmentFactoryAppliesConfiguredDiskIO() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let disk = project.appendingPathComponent("disk.raw")
+        FileManager.default.createFile(atPath: disk.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: disk)
+        try handle.truncate(atOffset: 1_048_576)
+        try handle.close()
+
+        let attachment = try DiskImageAttachmentFactory.make(
+            url: disk,
+            readOnly: false,
+            diskIO: DiskIOConfig(caching: .uncached, synchronization: .fsync)
+        )
+
+        #expect(attachment.cachingMode == .uncached)
+        #expect(attachment.synchronizationMode == .fsync)
     }
 
     @Test
