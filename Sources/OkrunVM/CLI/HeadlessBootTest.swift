@@ -847,7 +847,8 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
 
         try fileManager.createDirectory(at: targetPaths.vmDirectory, withIntermediateDirectories: true)
         try copyFile(from: sourcePaths.config, to: targetPaths.config)
-        try copyFile(from: sourcePaths.disk, to: targetPaths.disk)
+        let sourceConfig = try VMConfig.load(from: sourcePaths.config)
+        try copyFile(from: sourcePaths.diskURL(for: sourceConfig), to: targetPaths.diskURL(for: sourceConfig))
         try copyFile(from: sourcePaths.efiStore, to: targetPaths.efiStore)
         try copyFile(from: sourcePaths.machineIdentifier, to: targetPaths.machineIdentifier)
 
@@ -927,7 +928,7 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
 
     private func makeStorageDevice() throws -> VZStorageDeviceConfiguration {
         let attachment = try DiskImageAttachmentFactory.make(
-            url: diskOverride ?? paths.disk,
+            url: diskOverride ?? paths.diskURL(for: config),
             readOnly: false,
             diskIO: config.diskIO
         )

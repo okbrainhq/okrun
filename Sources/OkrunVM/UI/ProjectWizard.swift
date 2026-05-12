@@ -100,6 +100,7 @@ extension AppDelegate {
         let cpuField = makeNumberField(environmentValue("OKRUN_UI_E2E_CPU", default: "4"), identifier: "okrun.add.cpu")
         let memoryField = makeNumberField(environmentValue("OKRUN_UI_E2E_MEMORY_GB", default: "4"), identifier: "okrun.add.memory")
         let diskField = makeNumberField(environmentValue("OKRUN_UI_E2E_DISK_GB", default: "64"), identifier: "okrun.add.disk")
+        let diskFormatPopup = makeDiskFormatPopup()
 
         let createButton = NSButton(title: "Create", target: nil, action: nil)
         createButton.setAccessibilityIdentifier("okrun.add.create")
@@ -132,13 +133,21 @@ extension AppDelegate {
             isoButton?.title = url.lastPathComponent
             isoButton?.toolTip = url.path
         }
-        actions.onCreate = { [weak panel, weak cpuField, weak memoryField, weak diskField] in
+        actions.onCreate = { [weak panel, weak cpuField, weak memoryField, weak diskField, weak diskFormatPopup] in
+            let diskFormatRaw = diskFormatPopup?.selectedItem?.representedObject as? String
+            let diskFormat = diskFormatRaw.flatMap(DiskImageFormat.init(rawValue:)) ?? .raw
             guard let projectURL,
                   let isoURL,
                   let cpu = Int(cpuField?.stringValue ?? ""),
                   let memory = Int(memoryField?.stringValue ?? ""),
                   let disk = Int(diskField?.stringValue ?? ""),
-                  let config = try? VMConfig(cpuCount: cpu, memoryGB: memory, diskGB: disk, installerISOPath: isoURL.path).validated() else {
+                  let config = try? VMConfig(
+                    cpuCount: cpu,
+                    memoryGB: memory,
+                    diskGB: disk,
+                    installerISOPath: isoURL.path,
+                    diskFormat: diskFormat
+                  ).validated() else {
                 NSSound.beep()
                 return
             }
@@ -165,7 +174,8 @@ extension AppDelegate {
             [makeFieldLabel("ISO"), isoButton],
             [makeFieldLabel("CPU"), cpuField],
             [makeFieldLabel("Memory GB"), memoryField],
-            [makeFieldLabel("Disk GB"), diskField]
+            [makeFieldLabel("Disk GB"), diskField],
+            [makeFieldLabel("Disk Format"), diskFormatPopup]
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 0).width = 116
@@ -224,6 +234,25 @@ extension AppDelegate {
         button.lineBreakMode = .byTruncatingMiddle
         button.widthAnchor.constraint(equalToConstant: 280).isActive = true
         return button
+    }
+
+    private func makeDiskFormatPopup() -> NSPopUpButton {
+        let popup = NSPopUpButton()
+        popup.setAccessibilityIdentifier("okrun.add.disk-format")
+        popup.controlSize = .large
+        popup.widthAnchor.constraint(equalToConstant: 280).isActive = true
+
+        let formats: [DiskImageFormat] = DiskImageFormat.asif.isSupported ? [.asif, .raw] : [.raw]
+        for format in formats {
+            popup.addItem(withTitle: format.displayName)
+            popup.lastItem?.representedObject = format.rawValue
+        }
+
+        if let index = formats.firstIndex(of: .defaultForNewProjects) {
+            popup.selectItem(at: index)
+        }
+
+        return popup
     }
 
     private func makeFieldLabel(_ text: String) -> NSTextField {

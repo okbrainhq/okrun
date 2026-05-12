@@ -434,6 +434,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
     }
 
+    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
+        let candidateFrame = (window.screen ?? NSScreen.main)?.visibleFrame ?? newFrame
+        guard candidateFrame.width >= window.minSize.width,
+              candidateFrame.height >= window.minSize.height else {
+            var fallbackFrame = window.frame
+            fallbackFrame.origin.x = min(fallbackFrame.origin.x, candidateFrame.origin.x)
+            fallbackFrame.size.width = max(fallbackFrame.width, candidateFrame.width, window.minSize.width)
+            fallbackFrame.size.height = max(fallbackFrame.height, window.minSize.height)
+            return fallbackFrame
+        }
+
+        return candidateFrame
+    }
+
     private func installAppIcon() {
         guard let iconURL = Bundle.main.url(forResource: "OkrunVM", withExtension: "png"),
               let icon = NSImage(contentsOf: iconURL) else {
@@ -1077,7 +1091,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         config: VMConfig,
         preparation: VMStorage.PreparationResult? = nil
     ) -> String {
-        var detail = "\(paths.root.path)  |  CPU \(config.cpuCount)  Memory \(config.memoryGB) GB  Disk \(config.diskGB) GB"
+        var detail = "\(paths.root.path)  |  CPU \(config.cpuCount)  Memory \(config.memoryGB) GB  Disk \(config.diskGB) GB \(config.diskFormat.displayName)"
 
         if preparation?.expandedDisk == true {
             detail += "  |  Disk image expanded; grow the Linux partition/filesystem inside the guest."
@@ -1249,6 +1263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 memoryGB: currentConfig.memoryGB,
                 diskGB: currentConfig.diskGB,
                 installerISOPath: iso.path,
+                diskFormat: currentConfig.diskFormat,
                 privateNetwork: currentConfig.privateNetwork,
                 sharedDirectories: currentConfig.sharedDirectories,
                 diskIO: currentConfig.diskIO
@@ -1664,8 +1679,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func makeStorageDevices(paths: VMPaths, mode: VMMode, config: VMConfig) throws -> [VZStorageDeviceConfiguration] {
+        let diskURL = try paths.diskURL(for: config)
         let diskAttachment = try DiskImageAttachmentFactory.make(
-            url: paths.disk,
+            url: diskURL,
             readOnly: false,
             diskIO: config.diskIO
         )

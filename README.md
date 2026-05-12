@@ -50,7 +50,7 @@ Settings > Privacy & Security > Accessibility and rerun it.
 An Okrun project is a directory that owns one VM:
 
 - `okrun-vm.json` is the project config.
-- `vm/linux.raw` is the sparse virtual disk.
+- `vm/linux.raw` or `vm/linux.asif` is the sparse virtual disk.
 - `vm/efi.variables` is the EFI variable store.
 - `vm/machine.identifier` is the stable Virtualization.framework machine ID.
 
@@ -90,6 +90,7 @@ filesystem before booting it for normal use again.
   "cpuCount": 4,
   "memoryGB": 4,
   "diskGB": 64,
+  "diskFormat": "asif",
   "diskIO": {
     "caching": "cached",
     "synchronization": "full"
@@ -114,7 +115,13 @@ filesystem before booting it for normal use again.
 }
 ```
 
-Increasing `diskGB` expands the raw disk file. Existing disks are not shrunk
+`diskFormat` accepts `raw` or `asif`. ASIF uses Apple Sparse Image Format and is
+used by default for new projects on macOS 26 Tahoe or later. Older hosts and
+legacy configs use `raw`. Existing disks are never converted automatically; if a
+project already has `vm/linux.raw`, keep `diskFormat` as `raw`, and if it has
+`vm/linux.asif`, keep `diskFormat` as `asif`.
+
+Increasing `diskGB` expands the virtual disk. Existing disks are not shrunk
 automatically.
 
 `diskIO.caching` accepts `automatic`, `cached`, or `uncached`. Okrun defaults to
@@ -404,7 +411,9 @@ sudo resize2fs /dev/vda2
 ```
 
 Shrinking must be done manually: shrink the guest filesystem and partition first,
-then shut down the VM and shrink `vm/linux.raw` on macOS with `truncate`.
+then shut down the VM. For RAW disks, shrink `vm/linux.raw` on macOS with
+`truncate`. ASIF shrinking should be handled with `diskutil image resize` on
+macOS 26 or later.
 
 ## Memory Allocation
 

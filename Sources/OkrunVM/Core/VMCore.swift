@@ -21,6 +21,9 @@ struct VMPaths {
     let config: URL
     let vmDirectory: URL
     let disk: URL
+    let rawDisk: URL
+    let asifDisk: URL
+    let legacyDisk: URL
     let savedStateDisk: URL
     let efiStore: URL
     let savedStateEfiStore: URL
@@ -30,12 +33,18 @@ struct VMPaths {
 
     static func project(at root: URL) -> VMPaths {
         let vmDirectory = root.appendingPathComponent("vm", isDirectory: true)
-        let disk = preferredDisk(in: vmDirectory)
+        let rawDisk = vmDirectory.appendingPathComponent("linux.raw")
+        let asifDisk = vmDirectory.appendingPathComponent("linux.asif")
+        let legacyDisk = vmDirectory.appendingPathComponent("debian.raw")
+        let disk = preferredDisk(rawDisk: rawDisk, asifDisk: asifDisk, legacyDisk: legacyDisk)
         return VMPaths(
             root: root,
             config: root.appendingPathComponent("okrun-vm.json"),
             vmDirectory: vmDirectory,
             disk: disk,
+            rawDisk: rawDisk,
+            asifDisk: asifDisk,
+            legacyDisk: legacyDisk,
             savedStateDisk: vmDirectory.appendingPathComponent("machine-state.raw"),
             efiStore: vmDirectory.appendingPathComponent("efi.variables"),
             savedStateEfiStore: vmDirectory.appendingPathComponent("efi.variables.machine-state"),
@@ -45,16 +54,63 @@ struct VMPaths {
         )
     }
 
-    private static func preferredDisk(in vmDirectory: URL) -> URL {
-        let linuxDisk = vmDirectory.appendingPathComponent("linux.raw")
-        let legacyDisk = vmDirectory.appendingPathComponent("debian.raw")
+    private static func preferredDisk(rawDisk: URL, asifDisk: URL, legacyDisk: URL) -> URL {
+        if FileManager.default.fileExists(atPath: asifDisk.path),
+           !FileManager.default.fileExists(atPath: rawDisk.path),
+           !FileManager.default.fileExists(atPath: legacyDisk.path) {
+            return asifDisk
+        }
 
         if FileManager.default.fileExists(atPath: legacyDisk.path),
-           !FileManager.default.fileExists(atPath: linuxDisk.path) {
+           !FileManager.default.fileExists(atPath: rawDisk.path),
+           !FileManager.default.fileExists(atPath: asifDisk.path) {
             return legacyDisk
         }
 
-        return linuxDisk
+        return rawDisk
+    }
+
+    func diskURL(for config: VMConfig) throws -> URL {
+        try diskURL(for: config.diskFormat)
+    }
+
+    func diskURL(for format: DiskImageFormat) throws -> URL {
+        let fileManager = FileManager.default
+        let rawExists = fileManager.fileExists(atPath: rawDisk.path)
+        let asifExists = fileManager.fileExists(atPath: asifDisk.path)
+        let legacyExists = fileManager.fileExists(atPath: legacyDisk.path)
+
+        if [rawExists, asifExists, legacyExists].filter({ $0 }).count > 1 {
+            throw AppError("Multiple VM disks exist in \(vmDirectory.path). Keep only one of linux.raw, linux.asif, or debian.raw.")
+        }
+
+        if asifExists {
+            guard format == .asif else {
+                throw AppError("Existing disk is linux.asif but diskFormat is '\(format.rawValue)'. Set diskFormat to 'asif' or move \(asifDisk.path).")
+            }
+            return asifDisk
+        }
+
+        if rawExists {
+            guard format == .raw else {
+                throw AppError("Existing disk is linux.raw but diskFormat is '\(format.rawValue)'. Set diskFormat to 'raw' or move \(rawDisk.path).")
+            }
+            return rawDisk
+        }
+
+        if legacyExists {
+            guard format == .raw else {
+                throw AppError("Existing legacy disk is debian.raw but diskFormat is '\(format.rawValue)'. Set diskFormat to 'raw' or migrate the disk manually.")
+            }
+            return legacyDisk
+        }
+
+        switch format {
+        case .raw:
+            return rawDisk
+        case .asif:
+            return asifDisk
+        }
     }
 }
 
@@ -194,6 +250,39 @@ struct DiskImageInfo: Equatable {
     }
 }
 
+enum DiskImageFormat: String, Codable, Equatable {
+    case raw
+    case asif
+
+    static var defaultForNewProjects: DiskImageFormat {
+        if #available(macOS 26.0, *) {
+            return .asif
+        }
+        return .raw
+    }
+
+    var isSupported: Bool {
+        switch self {
+        case .raw:
+            return true
+        case .asif:
+            if #available(macOS 26.0, *) {
+                return true
+            }
+            return false
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .raw:
+            return "RAW"
+        case .asif:
+            return "ASIF"
+        }
+    }
+}
+
 enum DiskCachingMode: String, Codable, Equatable {
     case automatic
     case cached
@@ -237,11 +326,20 @@ struct DiskIOConfig: Codable, Equatable {
 }
 
 struct VMConfig: Codable, Equatable {
-    static let defaults = VMConfig(cpuCount: 4, memoryGB: 4, diskGB: 64, installerISOPath: nil)
+    static var defaults: VMConfig {
+        VMConfig(
+            cpuCount: 4,
+            memoryGB: 4,
+            diskGB: 64,
+            installerISOPath: nil,
+            diskFormat: .defaultForNewProjects
+        )
+    }
 
     let cpuCount: Int
     let memoryGB: Int
     let diskGB: Int
+    let diskFormat: DiskImageFormat
     let installerISOPath: String?
     let privateNetwork: PrivateNetworkConfig
     let sharedDirectories: [SharedDirectoryConfig]
@@ -251,6 +349,7 @@ struct VMConfig: Codable, Equatable {
         case cpuCount
         case memoryGB
         case diskGB
+        case diskFormat
         case installerISOPath
         case privateNetwork
         case sharedDirectories
@@ -262,6 +361,7 @@ struct VMConfig: Codable, Equatable {
         memoryGB: Int,
         diskGB: Int,
         installerISOPath: String?,
+        diskFormat: DiskImageFormat = .raw,
         privateNetwork: PrivateNetworkConfig = .disabled,
         sharedDirectories: [SharedDirectoryConfig] = [],
         diskIO: DiskIOConfig = .defaults
@@ -269,6 +369,7 @@ struct VMConfig: Codable, Equatable {
         self.cpuCount = cpuCount
         self.memoryGB = memoryGB
         self.diskGB = diskGB
+        self.diskFormat = diskFormat
         self.installerISOPath = installerISOPath
         self.privateNetwork = privateNetwork
         self.sharedDirectories = sharedDirectories
@@ -280,6 +381,7 @@ struct VMConfig: Codable, Equatable {
         cpuCount = try container.decode(Int.self, forKey: .cpuCount)
         memoryGB = try container.decode(Int.self, forKey: .memoryGB)
         diskGB = try container.decode(Int.self, forKey: .diskGB)
+        diskFormat = try container.decodeIfPresent(DiskImageFormat.self, forKey: .diskFormat) ?? .raw
         installerISOPath = try container.decodeIfPresent(String.self, forKey: .installerISOPath)
         privateNetwork = try container.decodeIfPresent(PrivateNetworkConfig.self, forKey: .privateNetwork) ?? .disabled
         sharedDirectories = try container.decodeIfPresent([SharedDirectoryConfig].self, forKey: .sharedDirectories) ?? []
@@ -299,7 +401,7 @@ struct VMConfig: Codable, Equatable {
 
         let data = try Data(contentsOf: url)
         let config = try JSONDecoder().decode(VMConfig.self, from: data).validated()
-        if !Self.configDataContainsDiskIO(data) {
+        if !Self.configDataContainsDiskFormat(data) || !Self.configDataContainsDiskIO(data) {
             try config.save(to: url)
         }
         return config
@@ -322,17 +424,28 @@ struct VMConfig: Codable, Equatable {
         guard diskGB > 0 else {
             throw AppError("diskGB must be greater than 0.")
         }
+        guard diskFormat.isSupported else {
+            throw AppError("diskFormat 'asif' requires macOS 26 Tahoe or later.")
+        }
         try PrivateNetworkValidator.validate(privateNetwork)
         try SharedDirectoryValidator.validate(sharedDirectories)
         return self
     }
 
+    private static func configDataContainsDiskFormat(_ data: Data) -> Bool {
+        configData(data, contains: CodingKeys.diskFormat.rawValue)
+    }
+
     private static func configDataContainsDiskIO(_ data: Data) -> Bool {
+        configData(data, contains: CodingKeys.diskIO.rawValue)
+    }
+
+    private static func configData(_ data: Data, contains key: String) -> Bool {
         guard let object = try? JSONSerialization.jsonObject(with: data),
               let dictionary = object as? [String: Any] else {
             return false
         }
-        return dictionary.keys.contains(CodingKeys.diskIO.rawValue)
+        return dictionary.keys.contains(key)
     }
 }
 
@@ -703,6 +816,137 @@ enum DirectorySharingDeviceFactory {
     }
 }
 
+enum DiskImageCreator {
+    private struct DiskutilImageInfo: Decodable {
+        let sizeInfo: SizeInfo?
+        let size: UInt64?
+
+        enum CodingKeys: String, CodingKey {
+            case sizeInfo = "Size Info"
+            case size = "Size"
+        }
+
+        func virtualSizeBytes() throws -> UInt64 {
+            if let totalBytes = sizeInfo?.totalBytes {
+                return totalBytes
+            }
+            if let size {
+                return size
+            }
+            throw AppError("Could not read ASIF disk size from diskutil image info.")
+        }
+    }
+
+    private struct SizeInfo: Decodable {
+        let totalBytes: UInt64?
+
+        enum CodingKeys: String, CodingKey {
+            case totalBytes = "Total Bytes"
+        }
+    }
+
+    static func create(url: URL, sizeBytes: UInt64, format: DiskImageFormat) throws {
+        switch format {
+        case .raw:
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            try resizeRawDisk(url: url, sizeBytes: sizeBytes)
+        case .asif:
+            try validateASIFSupport()
+            _ = try runDiskutil([
+                "image", "create", "blank",
+                "--fs", "none",
+                "--format", "ASIF",
+                "--size", sizeArgument(sizeBytes),
+                url.path
+            ])
+        }
+    }
+
+    static func resize(url: URL, sizeBytes: UInt64, format: DiskImageFormat) throws {
+        switch format {
+        case .raw:
+            try resizeRawDisk(url: url, sizeBytes: sizeBytes)
+        case .asif:
+            try validateASIFSupport()
+            _ = try runDiskutil([
+                "image", "resize",
+                "--size", sizeArgument(sizeBytes),
+                url.path
+            ])
+        }
+    }
+
+    static func virtualSize(url: URL, format: DiskImageFormat) throws -> UInt64 {
+        switch format {
+        case .raw:
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            return attributes[.size] as? UInt64 ?? 0
+        case .asif:
+            try validateASIFSupport()
+            let output = try runDiskutil(["image", "info", "--plist", url.path])
+            return try PropertyListDecoder().decode(DiskutilImageInfo.self, from: output.stdout).virtualSizeBytes()
+        }
+    }
+
+    private static func resizeRawDisk(url: URL, sizeBytes: UInt64) throws {
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: sizeBytes)
+        try handle.close()
+    }
+
+    private static func validateASIFSupport() throws {
+        guard DiskImageFormat.asif.isSupported else {
+            throw AppError("ASIF disk images require macOS 26 Tahoe or later.")
+        }
+    }
+
+    private static func sizeArgument(_ bytes: UInt64) -> String {
+        "\(bytes)b"
+    }
+
+    private static func runDiskutil(_ arguments: [String]) throws -> (stdout: Data, stderr: Data) {
+        let diskutilURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        guard FileManager.default.isExecutableFile(atPath: diskutilURL.path) else {
+            throw AppError("diskutil is not available at \(diskutilURL.path).")
+        }
+
+        let process = Process()
+        process.executableURL = diskutilURL
+        process.arguments = arguments
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            throw AppError("Failed to run diskutil \(arguments.joined(separator: " ")): \(error.localizedDescription)")
+        }
+
+        let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            let message = firstNonEmptyLine(stderr, stdout) ?? "exit code \(process.terminationStatus)"
+            throw AppError("diskutil \(arguments.joined(separator: " ")) failed: \(message)")
+        }
+
+        return (stdout, stderr)
+    }
+
+    private static func firstNonEmptyLine(_ outputs: Data...) -> String? {
+        for output in outputs {
+            guard let string = String(data: output, encoding: .utf8) else { continue }
+            if let line = string.split(separator: "\n").first(where: { !$0.isEmpty }) {
+                return String(line)
+            }
+        }
+        return nil
+    }
+}
+
 enum VMStorage {
     struct PreparationResult: Equatable {
         static let lowHostFreeSpaceThreshold: UInt64 = 16 * 1024 * 1024 * 1024
@@ -734,24 +978,19 @@ enum VMStorage {
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
 
+        let diskURL = try paths.diskURL(for: config)
         let configuredDiskSize = UInt64(config.diskGB) * 1024 * 1024 * 1024
         let diskChange: PreparationResult.DiskChange
-        if !fileManager.fileExists(atPath: paths.disk.path) {
-            fileManager.createFile(atPath: paths.disk.path, contents: nil)
-            let handle = try FileHandle(forWritingTo: paths.disk)
-            try handle.truncate(atOffset: configuredDiskSize)
-            try handle.close()
+        if !fileManager.fileExists(atPath: diskURL.path) {
+            try DiskImageCreator.create(url: diskURL, sizeBytes: configuredDiskSize, format: config.diskFormat)
             diskChange = .created(size: configuredDiskSize)
         } else {
-            let attributes = try fileManager.attributesOfItem(atPath: paths.disk.path)
-            let currentSize = attributes[.size] as? UInt64 ?? 0
+            let currentSize = try DiskImageCreator.virtualSize(url: diskURL, format: config.diskFormat)
             if currentSize < configuredDiskSize {
-                let handle = try FileHandle(forWritingTo: paths.disk)
-                try handle.truncate(atOffset: configuredDiskSize)
-                try handle.close()
+                try DiskImageCreator.resize(url: diskURL, sizeBytes: configuredDiskSize, format: config.diskFormat)
                 diskChange = .expanded(from: currentSize, to: configuredDiskSize)
             } else if currentSize > configuredDiskSize {
-                throw AppError("Existing disk is larger than diskGB in the config. Increase diskGB or move \(paths.disk.path).")
+                throw AppError("Existing disk is larger than diskGB in the config. Increase diskGB or move \(diskURL.path).")
             } else {
                 diskChange = .unchanged(size: currentSize)
             }
@@ -768,10 +1007,10 @@ enum VMStorage {
 
         let hostAvailableBytes = hostAvailableBytes(for: paths.vmDirectory)
         let result = PreparationResult(diskChange: diskChange, hostAvailableBytes: hostAvailableBytes)
-        let diskInfo = try? DiskImageInfo.load(from: paths.disk)
+        let diskInfo = try? DiskImageInfo.load(from: diskURL)
         AppLog.storage.info(
             """
-            Prepared storage project=\(paths.root.path, privacy: .public) disk=\(paths.disk.path, privacy: .public) configuredGB=\(config.diskGB) change=\(String(describing: diskChange), privacy: .public) apparentBytes=\(diskInfo?.apparentSize ?? 0) allocatedBytes=\(diskInfo?.allocatedSize ?? 0) hostAvailableBytes=\(hostAvailableBytes ?? 0)
+            Prepared storage project=\(paths.root.path, privacy: .public) disk=\(diskURL.path, privacy: .public) format=\(config.diskFormat.rawValue, privacy: .public) configuredGB=\(config.diskGB) change=\(String(describing: diskChange), privacy: .public) apparentBytes=\(diskInfo?.apparentSize ?? 0) allocatedBytes=\(diskInfo?.allocatedSize ?? 0) hostAvailableBytes=\(hostAvailableBytes ?? 0)
             """
         )
 

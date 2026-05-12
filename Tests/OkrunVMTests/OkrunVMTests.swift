@@ -39,6 +39,30 @@ struct OkrunVMTests {
     }
 
     @Test
+    func vmPathsResolveASIFDiskForASIFFormat() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let paths = VMPaths.project(at: project)
+
+        #expect(try paths.diskURL(for: .asif).lastPathComponent == "linux.asif")
+    }
+
+    @Test
+    func vmPathsRejectDiskFormatMismatch() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let paths = VMPaths.project(at: project)
+        try FileManager.default.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: paths.rawDisk.path, contents: Data())
+
+        #expect(throws: (any Error).self) {
+            try paths.diskURL(for: .asif)
+        }
+    }
+
+    @Test
     func vmConfigLoadCreatesDefaultConfigAndValidatesSavedValues() throws {
         let project = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(project) }
@@ -80,6 +104,7 @@ struct OkrunVMTests {
 
         let migratedData = try Data(contentsOf: configURL)
         let migratedJSON = try #require(JSONSerialization.jsonObject(with: migratedData) as? [String: Any])
+        #expect(migratedJSON["diskFormat"] as? String == "raw")
         let diskIO = try #require(migratedJSON["diskIO"] as? [String: Any])
         #expect(diskIO["caching"] as? String == "cached")
         #expect(diskIO["synchronization"] as? String == "full")
@@ -99,6 +124,7 @@ struct OkrunVMTests {
             memoryGB: 8,
             diskGB: 64,
             installerISOPath: "/tmp/debian.iso",
+            diskFormat: .raw,
             privateNetwork: PrivateNetworkConfig(enabled: true, identifier: "team"),
             sharedDirectories: [
                 SharedDirectoryConfig(name: "project", hostPath: sharedDirectory.path, readOnly: false)
@@ -120,6 +146,11 @@ struct OkrunVMTests {
         }
         #expect(throws: (any Error).self) {
             try VMConfig(cpuCount: 4, memoryGB: 4, diskGB: 0, installerISOPath: nil).validated()
+        }
+        if #unavailable(macOS 26.0) {
+            #expect(throws: (any Error).self) {
+                try VMConfig(cpuCount: 4, memoryGB: 4, diskGB: 64, installerISOPath: nil, diskFormat: .asif).validated()
+            }
         }
         #expect(throws: (any Error).self) {
             try VMConfig(
@@ -312,6 +343,31 @@ struct OkrunVMTests {
 
         let attributes = try FileManager.default.attributesOfItem(atPath: paths.disk.path)
         #expect(attributes[.size] as? UInt64 == 1_073_741_824)
+    }
+
+    @Test
+    func storagePrepareCreatesASIFDiskOnSupportedHosts() throws {
+        guard #available(macOS 26.0, *) else { return }
+
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let paths = VMPaths.project(at: project)
+        let config = VMConfig(cpuCount: 2, memoryGB: 2, diskGB: 1, installerISOPath: nil, diskFormat: .asif)
+
+        let result = try VMStorage.prepare(paths: paths, config: config)
+
+        #expect(FileManager.default.fileExists(atPath: paths.asifDisk.path))
+        #expect(result.diskChange == .created(size: 1_073_741_824))
+        #expect(try DiskImageCreator.virtualSize(url: paths.asifDisk, format: .asif) == 1_073_741_824)
+
+        let expanded = try VMStorage.prepare(
+            paths: paths,
+            config: VMConfig(cpuCount: 2, memoryGB: 2, diskGB: 2, installerISOPath: nil, diskFormat: .asif)
+        )
+
+        #expect(expanded.diskChange == .expanded(from: 1_073_741_824, to: 2_147_483_648))
+        #expect(try DiskImageCreator.virtualSize(url: paths.asifDisk, format: .asif) == 2_147_483_648)
     }
 
     @Test
