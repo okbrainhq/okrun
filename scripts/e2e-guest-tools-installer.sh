@@ -13,6 +13,31 @@ trap cleanup EXIT
 
 mkdir -p "$BIN_DIR"
 
+STEP_COUNT=0
+run_step() {
+  local name="$1"
+  shift
+
+  STEP_COUNT=$((STEP_COUNT + 1))
+  local log_file="$WORK_DIR/step-$STEP_COUNT.log"
+  local start="$SECONDS"
+
+  printf '  -> %s\n' "$name"
+  if "$@" >"$log_file" 2>&1; then
+    printf '  OK %s (%ss)\n' "$name" "$((SECONDS - start))"
+    return 0
+  fi
+
+  local status="$?"
+  printf '  FAIL %s (%ss)\n' "$name" "$((SECONDS - start))" >&2
+  printf '\n--- %s output ---\n' "$name" >&2
+  sed -n '1,240p' "$log_file" >&2
+  if [[ "$(wc -l <"$log_file")" -gt 240 ]]; then
+    printf '... output truncated; full log: %s\n' "$log_file" >&2
+  fi
+  return "$status"
+}
+
 cat >"$BIN_DIR/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -31,7 +56,8 @@ EOF
 
 chmod +x "$BIN_DIR/ssh" "$BIN_DIR/scp"
 
-OKRUN_E2E_LOG="$LOG_FILE" PATH="$BIN_DIR:$PATH" "$ROOT/scripts/install-guest-tools.sh" \
+run_step "Record remote guest tools install command" \
+  env OKRUN_E2E_LOG="$LOG_FILE" PATH="$BIN_DIR:$PATH" "$ROOT/scripts/install-guest-tools.sh" \
   --user tester \
   --port 2222 \
   --identity "$WORK_DIR/id_ed25519" \
@@ -53,16 +79,16 @@ if ! grep -q 'sudo.*install-okrun-guest-tools.sh.*--health-interval.*5.*--log-sh
   exit 1
 fi
 
-if ! bash -n "$ROOT/scripts/install-guest-tools.sh" \
-  || ! bash -n "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
-  || ! bash -n "$ROOT/scripts/guest-tools/okrun-guest-health.sh"; then
-  echo "Shell syntax validation failed." >&2
-  exit 1
-fi
+run_step "Validate guest tools shell syntax" \
+  bash -c 'bash -n "$1" && bash -n "$2" && bash -n "$3"' _ \
+  "$ROOT/scripts/install-guest-tools.sh" \
+  "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+  "$ROOT/scripts/guest-tools/okrun-guest-health.sh"
 
 GUEST_ROOT="$WORK_DIR/guest-root"
 mkdir -p "$GUEST_ROOT/mnt/okrun/okrun-guest-logs"
-OKRUN_GUEST_ROOT="$GUEST_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+run_step "Install into test guest root with static private IP" \
+  env OKRUN_GUEST_ROOT="$GUEST_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --private-ip 10.77.0.9/24 \
   --private-iface enp0s2 \
   --health-interval 7 \
@@ -98,7 +124,8 @@ if grep -q "DHCP=ipv4" "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network
   exit 1
 fi
 
-OKRUN_GUEST_ROOT="$GUEST_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+run_step "Replace existing static private IP" \
+  env OKRUN_GUEST_ROOT="$GUEST_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --private-ip 10.77.0.10/24 \
   --health-interval 7
 
@@ -112,7 +139,8 @@ fi
 
 DHCP_ROOT="$WORK_DIR/dhcp-root"
 mkdir -p "$DHCP_ROOT/mnt/okrun/okrun-guest-logs"
-OKRUN_GUEST_ROOT="$DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+run_step "Install DHCP private network config" \
+  env OKRUN_GUEST_ROOT="$DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --private-iface enp0s2 \
   --health-interval 7
 
@@ -139,7 +167,8 @@ Name=enp0s2
 Address=10.77.0.55/24
 EOF
 
-OKRUN_GUEST_ROOT="$STATIC_TO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+run_step "Preserve existing static private config by default" \
+  env OKRUN_GUEST_ROOT="$STATIC_TO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --health-interval 7
 
 assert_file_contains "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.55/24"
@@ -148,7 +177,8 @@ if grep -q "DHCP=ipv4" "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-privat
   exit 1
 fi
 
-OKRUN_GUEST_ROOT="$STATIC_TO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+run_step "Replace static private config with DHCP" \
+  env OKRUN_GUEST_ROOT="$STATIC_TO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --private-dhcp \
   --health-interval 7
 
@@ -173,7 +203,8 @@ Name=enp0s9
 Address=10.77.0.44/24
 EOF
 
-OKRUN_GUEST_ROOT="$MANUAL_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+run_step "Preserve unrelated manual network config" \
+  env OKRUN_GUEST_ROOT="$MANUAL_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --private-ip 10.77.0.9/24 \
   --private-iface enp0s2 \
   --health-interval 9
@@ -210,7 +241,8 @@ chmod +x "$BIN_DIR/ip"
 
 NO_PRIVATE_ROOT="$WORK_DIR/no-private-root"
 mkdir -p "$NO_PRIVATE_ROOT/mnt/okrun/okrun-guest-logs"
-PATH="$BIN_DIR:$PATH" OKRUN_GUEST_ROOT="$NO_PRIVATE_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+run_step "Skip private config when no private interface exists" \
+  env PATH="$BIN_DIR:$PATH" OKRUN_GUEST_ROOT="$NO_PRIVATE_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --private-ip 10.77.0.9/24 \
   --health-interval 11
 
@@ -242,12 +274,13 @@ chmod +x "$BIN_DIR/cut" "$BIN_DIR/date"
 ROTATE_LOG_DIR="$WORK_DIR/rotate-logs"
 mkdir -p "$ROTATE_LOG_DIR"
 printf '%060000d\n' 1 >"$ROTATE_LOG_DIR/guest-health.log"
-OKRUN_LOG_DIR="$ROTATE_LOG_DIR" \
+run_step "Rotate guest health log" \
+  env OKRUN_LOG_DIR="$ROTATE_LOG_DIR" \
   OKRUN_LOG_MAX_BYTES=50000 \
   OKRUN_LOG_KEEP=2 \
   OKRUN_HEALTH_ONCE=1 \
   PATH="$BIN_DIR:$PATH" \
-  "$ROOT/scripts/guest-tools/okrun-guest-health.sh" >/dev/null
+  "$ROOT/scripts/guest-tools/okrun-guest-health.sh"
 
 if [[ ! -f "$ROTATE_LOG_DIR/guest-health.log.1" ]]; then
   echo "Guest health log should rotate before appending when over the size limit." >&2
@@ -259,6 +292,8 @@ assert_file_contains "$ROTATE_LOG_DIR/guest-health.log" "health-start"
 assert_file_contains "$ROTATE_LOG_DIR/guest-health.log.1" "000000000000"
 
 MISSING_SHARE_ROOT="$WORK_DIR/missing-share-root"
+printf '  -> Reject missing guest log share\n'
+MISSING_START="$SECONDS"
 set +e
 MISSING_OUTPUT="$(
   OKRUN_GUEST_ROOT="$MISSING_SHARE_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
@@ -281,4 +316,4 @@ if ! grep -q 'Missing writable Okrun guest log share: /mnt/okrun/okrun-guest-log
   exit 1
 fi
 
-echo "Guest tools installer E2E passed."
+printf '  OK Reject missing guest log share (%ss)\n' "$((SECONDS - MISSING_START))"
