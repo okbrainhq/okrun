@@ -224,22 +224,61 @@ final class DHCPLeaseStore {
     }
 
     private let url: URL
+    private let lockURL: URL
 
     init(stateDirectory: URL) {
         url = stateDirectory.appendingPathComponent("leases.json")
+        lockURL = stateDirectory.appendingPathComponent("leases.lock")
     }
 
     func load() throws -> [DHCPLease] {
+        try withFileLock {
+            try loadUnlocked()
+        }
+    }
+
+    func save(_ leases: [DHCPLease]) throws {
+        try withFileLock {
+            try saveUnlocked(leases)
+        }
+    }
+
+    func update<T>(_ body: (inout [DHCPLease]) throws -> T) throws -> T {
+        try withFileLock {
+            var leases = try loadUnlocked()
+            let result = try body(&leases)
+            try saveUnlocked(leases)
+            return result
+        }
+    }
+
+    private func loadUnlocked() throws -> [DHCPLease] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         let data = try Data(contentsOf: url)
         return try JSONDecoder().decode(LeaseFile.self, from: data).leases
     }
 
-    func save(_ leases: [DHCPLease]) throws {
+    private func saveUnlocked(_ leases: [DHCPLease]) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try encoder.encode(LeaseFile(version: 1, leases: leases)).write(to: url, options: .atomic)
+    }
+
+    private func withFileLock<T>(_ body: () throws -> T) throws -> T {
+        try FileManager.default.createDirectory(at: lockURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw AppError("Failed to open DHCP lease lock: \(String(cString: strerror(errno))).")
+        }
+        defer { close(descriptor) }
+
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            throw AppError("Failed to lock DHCP leases: \(String(cString: strerror(errno))).")
+        }
+        defer { flock(descriptor, LOCK_UN) }
+
+        return try body()
     }
 }
 
@@ -254,7 +293,6 @@ final class DHCPLeaseAllocator {
     private let rangeEnd: IPv4Address
     private let leaseSeconds: UInt32
     private let store: DHCPLeaseStore
-    private var leases: [DHCPLease]
 
     init(config: PrivateNetworkDHCPConfig, store: DHCPLeaseStore) throws {
         let validated = try config.validated()
@@ -262,68 +300,135 @@ final class DHCPLeaseAllocator {
         rangeEnd = try IPv4Address(validated.rangeEnd)
         leaseSeconds = validated.leaseSeconds
         self.store = store
-        leases = try store.load()
     }
 
     func lease(for identity: String, requestedIP: IPv4Address?, now: Date = Date()) throws -> DHCPLease {
-        pruneExpired(now: now)
-        if let existing = leases.first(where: { $0.identity == identity }) {
-            let renewed = DHCPLease(
+        try store.update { leases in
+            pruneExpired(&leases, now: now)
+            if let existing = leases.first(where: { $0.identity == identity }) {
+                let renewed = DHCPLease(
+                    identity: identity,
+                    ipAddress: existing.ipAddress,
+                    expiresAt: now.addingTimeInterval(TimeInterval(leaseSeconds))
+                )
+                replace(renewed, in: &leases)
+                return renewed
+            }
+
+            let selectedIP: IPv4Address
+            if let requestedIP, isInRange(requestedIP), !isLeased(requestedIP, in: leases) {
+                selectedIP = requestedIP
+            } else if let available = firstAvailableAddress(in: leases) {
+                selectedIP = available
+            } else {
+                throw AppError("private network DHCP range is exhausted.")
+            }
+
+            let lease = DHCPLease(
                 identity: identity,
-                ipAddress: existing.ipAddress,
+                ipAddress: selectedIP,
                 expiresAt: now.addingTimeInterval(TimeInterval(leaseSeconds))
             )
-            try replace(renewed)
-            return renewed
+            leases.append(lease)
+            return lease
         }
+    }
 
-        let selectedIP: IPv4Address
-        if let requestedIP, isInRange(requestedIP), !isLeased(requestedIP) {
-            selectedIP = requestedIP
-        } else if let available = firstAvailableAddress() {
-            selectedIP = available
-        } else {
-            throw AppError("private network DHCP range is exhausted.")
+    func requestedLease(for identity: String, requestedIP: IPv4Address?, now: Date = Date()) throws -> DHCPLease {
+        try store.update { leases in
+            pruneExpired(&leases, now: now)
+            if let requestedIP {
+                guard isInRange(requestedIP) else {
+                    throw AppError("Requested DHCP address \(requestedIP.description) is outside the configured range.")
+                }
+                if let existing = leases.first(where: { $0.identity == identity }) {
+                    guard existing.ipAddress == requestedIP else {
+                        throw AppError("Requested DHCP address does not match the existing lease.")
+                    }
+                    let renewed = DHCPLease(
+                        identity: identity,
+                        ipAddress: existing.ipAddress,
+                        expiresAt: now.addingTimeInterval(TimeInterval(leaseSeconds))
+                    )
+                    replace(renewed, in: &leases)
+                    return renewed
+                }
+                guard !isLeased(requestedIP, in: leases) else {
+                    throw AppError("Requested DHCP address \(requestedIP.description) is already leased.")
+                }
+                let lease = DHCPLease(
+                    identity: identity,
+                    ipAddress: requestedIP,
+                    expiresAt: now.addingTimeInterval(TimeInterval(leaseSeconds))
+                )
+                leases.append(lease)
+                return lease
+            }
+
+            if let existing = leases.first(where: { $0.identity == identity }) {
+                let renewed = DHCPLease(
+                    identity: identity,
+                    ipAddress: existing.ipAddress,
+                    expiresAt: now.addingTimeInterval(TimeInterval(leaseSeconds))
+                )
+                replace(renewed, in: &leases)
+                return renewed
+            }
+
+            guard let available = firstAvailableAddress(in: leases) else {
+                throw AppError("private network DHCP range is exhausted.")
+            }
+            let lease = DHCPLease(
+                identity: identity,
+                ipAddress: available,
+                expiresAt: now.addingTimeInterval(TimeInterval(leaseSeconds))
+            )
+            leases.append(lease)
+            return lease
         }
-
-        let lease = DHCPLease(
-            identity: identity,
-            ipAddress: selectedIP,
-            expiresAt: now.addingTimeInterval(TimeInterval(leaseSeconds))
-        )
-        leases.append(lease)
-        try store.save(leases)
-        return lease
     }
 
     func release(identity: String) throws {
-        leases.removeAll { $0.identity == identity }
-        try store.save(leases)
+        try store.update { leases in
+            leases.removeAll { $0.identity == identity }
+        }
     }
 
-    private func pruneExpired(now: Date) {
+    func decline(identity: String, address: IPv4Address, now: Date = Date()) throws {
+        guard isInRange(address) else { return }
+        try store.update { leases in
+            pruneExpired(&leases, now: now)
+            leases.removeAll { $0.identity == identity || $0.ipAddress == address }
+            leases.append(DHCPLease(
+                identity: "declined:\(address.description)",
+                ipAddress: address,
+                expiresAt: now.addingTimeInterval(TimeInterval(min(leaseSeconds, 600)))
+            ))
+        }
+    }
+
+    private func pruneExpired(_ leases: inout [DHCPLease], now: Date) {
         leases.removeAll { $0.expiresAt <= now }
     }
 
-    private func replace(_ lease: DHCPLease) throws {
+    private func replace(_ lease: DHCPLease, in leases: inout [DHCPLease]) {
         leases.removeAll { $0.identity == lease.identity }
         leases.append(lease)
-        try store.save(leases)
     }
 
     private func isInRange(_ address: IPv4Address) -> Bool {
         address.value >= rangeStart.value && address.value <= rangeEnd.value
     }
 
-    private func isLeased(_ address: IPv4Address) -> Bool {
+    private func isLeased(_ address: IPv4Address, in leases: [DHCPLease]) -> Bool {
         leases.contains { $0.ipAddress == address }
     }
 
-    private func firstAvailableAddress() -> IPv4Address? {
+    private func firstAvailableAddress(in leases: [DHCPLease]) -> IPv4Address? {
         var value = rangeStart.value
         while value <= rangeEnd.value {
             let address = IPv4Address(value: value)
-            if !isLeased(address) {
+            if !isLeased(address, in: leases) {
                 return address
             }
             if value == UInt32.max { break }
@@ -379,17 +484,30 @@ final class HostDHCPServer {
                    requestedServer != network.serverAddress {
                     return
                 }
-                let lease = try allocator.lease(
+                let requestedAddress = request.requestedIPAddress ?? request.nonZeroClientIPAddress
+                let lease = try allocator.requestedLease(
                     for: request.identity,
-                    requestedIP: request.requestedIPAddress ?? request.clientIPAddress
+                    requestedIP: requestedAddress
                 )
                 sendReply(to: request, messageType: .ack, leasedAddress: lease.ipAddress)
             case .release:
                 try allocator.release(identity: request.identity)
-            case .decline, .inform, .offer, .ack, .nak:
+            case .decline:
+                if let declinedAddress = request.requestedIPAddress ?? request.nonZeroClientIPAddress {
+                    try allocator.decline(identity: request.identity, address: declinedAddress)
+                    AppLog.virtualMachine.info(
+                        "Declined DHCP lease privateNetwork=\(self.identifier, privacy: .public) ip=\(declinedAddress.description, privacy: .public)"
+                    )
+                }
+            case .inform:
+                sendReply(to: request, messageType: .ack, leasedAddress: IPv4Address(value: 0))
+            case .offer, .ack, .nak:
                 break
             }
         } catch {
+            AppLog.virtualMachine.error(
+                "DHCP lease conflict privateNetwork=\(self.identifier, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+            )
             sendReply(to: request, messageType: .nak, leasedAddress: IPv4Address(value: 0))
         }
     }
@@ -460,12 +578,14 @@ enum DHCPMessageType: UInt8, Codable {
 
 enum DHCPOption {
     case messageType(DHCPMessageType)
+    case requestedIPAddress(IPv4Address)
     case subnetMask(IPv4Address)
     case leaseTime(UInt32)
     case renewalTime(UInt32)
     case rebindingTime(UInt32)
     case serverIdentifier(IPv4Address)
     case broadcastAddress(IPv4Address)
+    case clientIdentifier(Data)
 }
 
 struct DHCPMessage {
@@ -479,6 +599,10 @@ struct DHCPMessage {
     let serverIdentifier: IPv4Address?
     let clientIdentifier: Data?
     let options: [DHCPOption]
+
+    var nonZeroClientIPAddress: IPv4Address? {
+        clientIPAddress.value == 0 ? nil : clientIPAddress
+    }
 
     var identity: String {
         if let clientIdentifier, !clientIdentifier.isEmpty {
@@ -643,6 +767,8 @@ struct DHCPMessage {
             data.append(53)
             data.append(1)
             data.append(messageType.rawValue)
+        case .requestedIPAddress(let address):
+            appendIPOption(50, address, to: &data)
         case .subnetMask(let address):
             appendIPOption(1, address, to: &data)
         case .leaseTime(let seconds):
@@ -655,6 +781,10 @@ struct DHCPMessage {
             appendIPOption(54, address, to: &data)
         case .broadcastAddress(let address):
             appendIPOption(28, address, to: &data)
+        case .clientIdentifier(let identifier):
+            data.append(61)
+            data.append(UInt8(min(identifier.count, Int(UInt8.max))))
+            data.append(identifier.prefix(Int(UInt8.max)))
         }
     }
 }

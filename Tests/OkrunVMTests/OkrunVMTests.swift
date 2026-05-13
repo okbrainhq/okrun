@@ -430,8 +430,63 @@ struct OkrunVMTests {
     }
 
     @Test
+    func dhcpLeaseAllocatorCoordinatesAcrossInstances() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let config = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.21",
+            leaseSeconds: 3600
+        )
+        let store = DHCPLeaseStore(stateDirectory: root)
+        let firstAllocator = try DHCPLeaseAllocator(config: config, store: store)
+        let secondAllocator = try DHCPLeaseAllocator(config: config, store: store)
+
+        let first = try firstAllocator.lease(for: "client-a", requestedIP: nil)
+        let second = try secondAllocator.lease(for: "client-b", requestedIP: nil)
+        let expectedFirst = try IPv4Address("10.77.0.20")
+        let expectedSecond = try IPv4Address("10.77.0.21")
+        let persistedAddresses = try store.load().map(\.ipAddress).sorted()
+
+        #expect(first.ipAddress == expectedFirst)
+        #expect(second.ipAddress == expectedSecond)
+        #expect(persistedAddresses == [expectedFirst, expectedSecond])
+    }
+
+    @Test
+    func dhcpLeaseAllocatorRejectsConflictsAndReservesDeclines() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let config = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.21",
+            leaseSeconds: 3600
+        )
+        let allocator = try DHCPLeaseAllocator(config: config, store: DHCPLeaseStore(stateDirectory: root))
+        let declinedAddress = try IPv4Address("10.77.0.20")
+
+        _ = try allocator.requestedLease(for: "client-a", requestedIP: declinedAddress)
+        #expect(throws: (any Error).self) {
+            _ = try allocator.requestedLease(for: "client-b", requestedIP: declinedAddress)
+        }
+
+        try allocator.decline(identity: "client-a", address: declinedAddress)
+        let replacement = try allocator.lease(for: "client-b", requestedIP: nil)
+        let expectedReplacement = try IPv4Address("10.77.0.21")
+
+        #expect(replacement.ipAddress == expectedReplacement)
+    }
+
+    @Test
     func dhcpPacketParserAndEncoderRoundTrip() throws {
         let clientMAC = EthernetAddress([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+        let clientIdentifier = Data([1, 2, 3, 4])
         let discover = DHCPMessage(
             messageType: .discover,
             transactionID: 0x1234_5678,
@@ -441,9 +496,10 @@ struct OkrunVMTests {
             yourIPAddress: IPv4Address(value: 0),
             requestedIPAddress: nil,
             serverIdentifier: nil,
-            clientIdentifier: Data([1, 2, 3, 4]),
+            clientIdentifier: clientIdentifier,
             options: [
-                .messageType(.discover)
+                .messageType(.discover),
+                .clientIdentifier(clientIdentifier)
             ]
         ).ethernetFrame(
             sourceMAC: clientMAC,
@@ -459,6 +515,41 @@ struct OkrunVMTests {
         #expect(parsed.messageType == .discover)
         #expect(parsed.transactionID == 0x1234_5678)
         #expect(parsed.clientHardwareAddress == clientMAC)
+        #expect(parsed.clientIdentifier == clientIdentifier)
+
+        let requestedAddress = try IPv4Address("10.77.0.20")
+        let serverAddress = try IPv4Address("10.77.0.1")
+        let request = DHCPMessage(
+            messageType: .request,
+            transactionID: 0x1234_5679,
+            flags: 0x8000,
+            clientHardwareAddress: clientMAC,
+            clientIPAddress: IPv4Address(value: 0),
+            yourIPAddress: IPv4Address(value: 0),
+            requestedIPAddress: requestedAddress,
+            serverIdentifier: serverAddress,
+            clientIdentifier: clientIdentifier,
+            options: [
+                .messageType(.request),
+                .requestedIPAddress(requestedAddress),
+                .serverIdentifier(serverAddress),
+                .clientIdentifier(clientIdentifier)
+            ]
+        ).ethernetFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: .broadcast,
+            sourceIP: IPv4Address(value: 0),
+            destinationIP: IPv4Address(value: 0xffff_ffff),
+            sourcePort: 68,
+            destinationPort: 67,
+            bootpOperation: 1
+        )
+
+        let parsedRequest = try #require(DHCPMessage.parse(fromEthernetFrame: request))
+        #expect(parsedRequest.messageType == .request)
+        #expect(parsedRequest.requestedIPAddress == requestedAddress)
+        #expect(parsedRequest.serverIdentifier == serverAddress)
+        #expect(parsedRequest.clientIdentifier == clientIdentifier)
 
         let offer = DHCPMessage(
             messageType: .offer,
@@ -474,7 +565,10 @@ struct OkrunVMTests {
                 .messageType(.offer),
                 .serverIdentifier(try IPv4Address("10.77.0.1")),
                 .subnetMask(try IPv4Address("255.255.255.0")),
-                .leaseTime(3600)
+                .broadcastAddress(try IPv4Address("10.77.0.255")),
+                .leaseTime(3600),
+                .renewalTime(1800),
+                .rebindingTime(3150)
             ]
         ).ethernetFrame(
             sourceMAC: EthernetAddress([0x02, 0x6f, 0x6b, 0x72, 0x75, 0x6e]),
@@ -486,6 +580,17 @@ struct OkrunVMTests {
         #expect(offer.count > discover.count - 32)
         #expect(offer[12] == 0x08)
         #expect(offer[13] == 0x00)
+        #expect(dhcpIPv4ChecksumIsValid(offer))
+        #expect(dhcpUDPChecksumIsValid(offer))
+        let optionCodes = dhcpOptionCodes(in: offer)
+        #expect(optionCodes.contains(1))
+        #expect(optionCodes.contains(28))
+        #expect(optionCodes.contains(51))
+        #expect(optionCodes.contains(54))
+        #expect(optionCodes.contains(58))
+        #expect(optionCodes.contains(59))
+        #expect(!optionCodes.contains(3))
+        #expect(!optionCodes.contains(6))
     }
 
     @Test
@@ -656,6 +761,80 @@ struct OkrunVMTests {
 
         #expect(before == after)
         #expect(!FileManager.default.fileExists(atPath: paths.installerEfiStore.path))
+    }
+
+    private func dhcpIPv4ChecksumIsValid(_ frame: Data) -> Bool {
+        let bytes = [UInt8](frame)
+        let ipOffset = 14
+        guard bytes.count >= ipOffset + 20 else { return false }
+        let headerLength = Int(bytes[ipOffset] & 0x0f) * 4
+        guard headerLength >= 20, bytes.count >= ipOffset + headerLength else { return false }
+        return dhcpInternetChecksum(Array(bytes[ipOffset..<(ipOffset + headerLength)])) == 0
+    }
+
+    private func dhcpUDPChecksumIsValid(_ frame: Data) -> Bool {
+        let bytes = [UInt8](frame)
+        let ipOffset = 14
+        guard bytes.count >= ipOffset + 20 else { return false }
+        let headerLength = Int(bytes[ipOffset] & 0x0f) * 4
+        let udpOffset = ipOffset + headerLength
+        guard bytes.count >= udpOffset + 8 else { return false }
+        let udpLength = Int(dhcpReadUInt16(bytes, udpOffset + 4))
+        guard udpLength >= 8, bytes.count >= udpOffset + udpLength else { return false }
+
+        var checksumBytes = [UInt8]()
+        checksumBytes.append(contentsOf: bytes[(ipOffset + 12)..<(ipOffset + 20)])
+        checksumBytes.append(0)
+        checksumBytes.append(17)
+        checksumBytes.append(UInt8((udpLength >> 8) & 0xff))
+        checksumBytes.append(UInt8(udpLength & 0xff))
+        checksumBytes.append(contentsOf: bytes[udpOffset..<(udpOffset + udpLength)])
+        return dhcpInternetChecksum(checksumBytes) == 0
+    }
+
+    private func dhcpOptionCodes(in frame: Data) -> [UInt8] {
+        let bytes = [UInt8](frame)
+        let ipOffset = 14
+        guard bytes.count >= ipOffset + 20 else { return [] }
+        let headerLength = Int(bytes[ipOffset] & 0x0f) * 4
+        let optionStart = ipOffset + headerLength + 8 + 240
+        guard bytes.count > optionStart else { return [] }
+
+        var codes: [UInt8] = []
+        var offset = optionStart
+        while offset < bytes.count {
+            let code = bytes[offset]
+            offset += 1
+            if code == 255 { break }
+            if code == 0 { continue }
+            guard offset < bytes.count else { break }
+            let length = Int(bytes[offset])
+            offset += 1
+            guard offset + length <= bytes.count else { break }
+            codes.append(code)
+            offset += length
+        }
+        return codes
+    }
+
+    private func dhcpInternetChecksum(_ bytes: [UInt8]) -> UInt16 {
+        var sum: UInt32 = 0
+        var index = 0
+        while index + 1 < bytes.count {
+            sum += UInt32(dhcpReadUInt16(bytes, index))
+            index += 2
+        }
+        if index < bytes.count {
+            sum += UInt32(bytes[index]) << 8
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16)
+        }
+        return UInt16(~sum & 0xffff)
+    }
+
+    private func dhcpReadUInt16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
+        (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
     }
 
     private func makeTemporaryDirectory() throws -> URL {

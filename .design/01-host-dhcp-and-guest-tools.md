@@ -60,7 +60,7 @@ scripts/install-guest-tools.sh --user debian --private-dhcp devbox.local
    - Add `PrivateNetworkDHCPConfig` outside `VMConfig`.
    - Do not add DHCP fields to `PrivateNetworkConfig`.
    - Validate CIDR, lease range, lease duration, and that the range is inside the CIDR.
-   - Default remains disabled to avoid changing existing projects silently.
+   - Default is enabled for private networks: the host creates an enabled default DHCP config the first time a VM runs with a private-network identifier.
 
 3. Stabilize guest identity for leases.
    - Prefer explicitly setting a deterministic MAC address on the private `VZVirtioNetworkDeviceConfiguration`, derived from project machine identifier plus private network identifier.
@@ -156,7 +156,7 @@ UseRoutes=false
 
 4. Regression E2E.
    - Existing static private network ping test must still pass.
-   - Boot without DHCP config must behave exactly as today.
+   - Boot without an existing DHCP config must create the default host config and start DHCP for the private network.
 
 ## Acceptance Criteria
 
