@@ -332,6 +332,17 @@ detect_private_iface() {
     return
   fi
 
+  local managed_config
+  managed_config="$(guest_path /etc/systemd/network/20-okrun-private.network)"
+  if [[ -f "$managed_config" ]]; then
+    local managed_iface
+    managed_iface="$(awk -F= '$1 == "Name" && $2 != "" { print $2; exit }' "$managed_config")"
+    if [[ -n "$managed_iface" ]]; then
+      printf '%s\n' "$managed_iface"
+      return
+    fi
+  fi
+
   local candidate
   candidate="$(
     ip -o link show 2>/dev/null |
@@ -359,15 +370,6 @@ private_network_config_exists() {
     return 0
   fi
 
-  if [[ -f "$(guest_path /etc/systemd/network/20-okrun-private.network)" ]]; then
-    return 0
-  fi
-
-  if grep -RqsE "^Name=$private_iface$" "$(guest_glob /etc/systemd/network)"/*.network 2>/dev/null &&
-     grep -RqsE '^Address=' "$(guest_glob /etc/systemd/network)"/*.network 2>/dev/null; then
-    return 0
-  fi
-
   return 1
 }
 
@@ -381,6 +383,7 @@ if [[ -n "$PRIVATE_IP_CIDR" ]]; then
   else
     install -d -m 0755 "$(guest_path /etc/systemd/network)"
     cat >"$(guest_path /etc/systemd/network/20-okrun-private.network)" <<EOF
+# Managed by Okrun guest tools.
 [Match]
 Name=$private_iface
 
@@ -388,6 +391,7 @@ Name=$private_iface
 Address=$PRIVATE_IP_CIDR
 EOF
     installed_private_network_config="1"
+    echo "Okrun private network config set to $PRIVATE_IP_CIDR on $private_iface."
   fi
 fi
 

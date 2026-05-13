@@ -93,12 +93,24 @@ assert_file_contains "$GUEST_ROOT/etc/systemd/system/mnt-okrun.mount" "Type=virt
 assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Name=enp0s2"
 assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.9/24"
 
+OKRUN_GUEST_ROOT="$GUEST_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+  --private-ip 10.77.0.10/24 \
+  --health-interval 7
+
+assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Managed by Okrun guest tools"
+assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Name=enp0s2"
+assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.10/24"
+if grep -q "10.77.0.9/24" "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network"; then
+  echo "Installer should replace an existing Okrun private IP when rerun with a new one." >&2
+  exit 1
+fi
+
 MANUAL_ROOT="$WORK_DIR/manual-root"
 mkdir -p "$MANUAL_ROOT/etc/systemd/network" "$MANUAL_ROOT/etc/systemd/system" "$MANUAL_ROOT/etc" "$MANUAL_ROOT/mnt/okrun/okrun-guest-logs"
 cat >"$MANUAL_ROOT/etc/fstab" <<'EOF'
 okrun /mnt/okrun virtiofs defaults 0 0
 EOF
-cat >"$MANUAL_ROOT/etc/systemd/network/20-okrun-private.network" <<'EOF'
+cat >"$MANUAL_ROOT/etc/systemd/network/10-manual-private.network" <<'EOF'
 # manually managed
 [Match]
 Name=enp0s9
@@ -118,10 +130,11 @@ if [[ -f "$MANUAL_ROOT/etc/systemd/system/mnt-okrun.mount" ]]; then
 fi
 
 assert_file_contains "$MANUAL_ROOT/etc/fstab" "okrun /mnt/okrun virtiofs"
-assert_file_contains "$MANUAL_ROOT/etc/systemd/network/20-okrun-private.network" "manually managed"
-assert_file_contains "$MANUAL_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.44/24"
-if grep -q "10.77.0.9/24" "$MANUAL_ROOT/etc/systemd/network/20-okrun-private.network"; then
-  echo "Installer should not overwrite existing private network config." >&2
+assert_file_contains "$MANUAL_ROOT/etc/systemd/network/10-manual-private.network" "manually managed"
+assert_file_contains "$MANUAL_ROOT/etc/systemd/network/10-manual-private.network" "Address=10.77.0.44/24"
+assert_file_contains "$MANUAL_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.9/24"
+if grep -q "10.77.0.9/24" "$MANUAL_ROOT/etc/systemd/network/10-manual-private.network"; then
+  echo "Installer should not overwrite unrelated private network config." >&2
   exit 1
 fi
 
