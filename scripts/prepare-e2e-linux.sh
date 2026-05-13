@@ -12,6 +12,7 @@ E2E_SHARED_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-shared"
 E2E_SAVE_RESTORE_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-save-restore"
 E2E_PRIVATE_NETWORK_SERVER_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-server"
 E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-client"
+E2E_PRIVATE_NETWORK_DHCP_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-dhcp"
 
 mkdir -p "$FIXTURE_DIR"
 
@@ -188,9 +189,87 @@ chmod 0755 "$WORK_DIR/init"
 
 (cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS")
 
+cat > "$WORK_DIR/init" <<'EOF'
+#!/bin/sh
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+/bin/busybox mount -t proc proc /proc 2>/dev/null || true
+/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
+/sbin/modprobe virtio_net 2>/dev/null || true
+
+PRIVATE_IFACE=""
+for attempt in 1 2 3 4 5; do
+  for path in /sys/class/net/*; do
+    iface="${path##*/}"
+    [ "$iface" = "lo" ] && continue
+    PRIVATE_IFACE="$iface"
+  done
+  [ -n "$PRIVATE_IFACE" ] && break
+  /bin/busybox sleep 1
+done
+
+echo "OKRUN_E2E_PRIVATE_NETWORK_DHCP_IFACE=${PRIVATE_IFACE}" >/dev/console
+echo "OKRUN_E2E_PRIVATE_NETWORK_DHCP_IFACE=${PRIVATE_IFACE}" >/dev/hvc0 2>/dev/null || true
+
+if [ -z "$PRIVATE_IFACE" ]; then
+  echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_FAILED_NO_IFACE >/dev/console
+  echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_FAILED_NO_IFACE >/dev/hvc0 2>/dev/null || true
+  /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+  while true; do :; done
+fi
+
+/bin/busybox ip link set "$PRIVATE_IFACE" up
+/bin/busybox cat >/udhcpc-okrun.script <<'SCRIPT'
+#!/bin/sh
+case "$1" in
+  bound|renew)
+    /bin/busybox ip addr flush dev "$interface" 2>/dev/null || true
+    /bin/busybox ip addr add "$ip/24" dev "$interface"
+    ;;
+esac
+SCRIPT
+/bin/busybox chmod 0755 /udhcpc-okrun.script
+if ! /bin/busybox udhcpc -i "$PRIVATE_IFACE" -n -q -s /udhcpc-okrun.script >/dev/console 2>&1; then
+  echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_FAILED_UDHCPC >/dev/console
+  echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_FAILED_UDHCPC >/dev/hvc0 2>/dev/null || true
+  /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+  while true; do :; done
+fi
+
+PRIVATE_IP="$(/bin/busybox ip -4 -o addr show dev "$PRIVATE_IFACE" | /bin/busybox awk '{ print $4 }' | /bin/busybox cut -d/ -f1 | /bin/busybox head -1)"
+echo "OKRUN_E2E_PRIVATE_NETWORK_DHCP_IP=${PRIVATE_IP}" >/dev/console
+echo "OKRUN_E2E_PRIVATE_NETWORK_DHCP_IP=${PRIVATE_IP}" >/dev/hvc0 2>/dev/null || true
+
+case "$PRIVATE_IP" in
+  10.77.0.*)
+    ;;
+  *)
+    echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_FAILED_IP >/dev/console
+    echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_FAILED_IP >/dev/hvc0 2>/dev/null || true
+    /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+    while true; do :; done
+    ;;
+esac
+
+if /bin/busybox ip route | /bin/busybox grep -q "default.*$PRIVATE_IFACE"; then
+  echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_FAILED_DEFAULT_ROUTE >/dev/console
+  echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_FAILED_DEFAULT_ROUTE >/dev/hvc0 2>/dev/null || true
+  /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+  while true; do :; done
+fi
+
+echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_PASSED >/dev/console
+echo OKRUN_E2E_PRIVATE_NETWORK_DHCP_PASSED >/dev/hvc0 2>/dev/null || true
+/bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+while true; do :; done
+EOF
+chmod 0755 "$WORK_DIR/init"
+
+(cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_PRIVATE_NETWORK_DHCP_INITRAMFS")
+
 echo "$BOOT_IMAGE"
 echo "$E2E_INITRAMFS"
 echo "$E2E_SHARED_INITRAMFS"
 echo "$E2E_SAVE_RESTORE_INITRAMFS"
 echo "$E2E_PRIVATE_NETWORK_SERVER_INITRAMFS"
 echo "$E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS"
+echo "$E2E_PRIVATE_NETWORK_DHCP_INITRAMFS"

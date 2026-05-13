@@ -146,7 +146,8 @@ extension AppDelegate {
                     memoryGB: memory,
                     diskGB: disk,
                     installerISOPath: isoURL.path,
-                    diskFormat: diskFormat
+                    diskFormat: diskFormat,
+                    privateNetwork: PrivateNetworkConfig(enabled: true)
                   ).validated() else {
                 NSSound.beep()
                 return

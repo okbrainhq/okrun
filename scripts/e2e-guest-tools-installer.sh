@@ -35,6 +35,7 @@ OKRUN_E2E_LOG="$LOG_FILE" PATH="$BIN_DIR:$PATH" "$ROOT/scripts/install-guest-too
   --user tester \
   --port 2222 \
   --identity "$WORK_DIR/id_ed25519" \
+  --private-dhcp \
   --private-ip 10.77.0.9/24 \
   --health-interval 5 \
   --resize-root \
@@ -46,7 +47,7 @@ if ! grep -q 'scp.*install-okrun-guest-tools.sh.*okrun-guest-health.sh.*tester@e
   exit 1
 fi
 
-if ! grep -q 'sudo.*install-okrun-guest-tools.sh.*--health-interval.*5.*--log-share.*okrun-guest-logs.*--resize-root.*--private-ip.*10.77.0.9/24.*--private-iface.*auto' "$LOG_FILE"; then
+if ! grep -q 'sudo.*install-okrun-guest-tools.sh.*--health-interval.*5.*--log-share.*okrun-guest-logs.*--resize-root.*--private-dhcp.*--private-ip.*10.77.0.9/24.*--private-iface.*auto' "$LOG_FILE"; then
   echo "Expected remote install command was not recorded." >&2
   cat "$LOG_FILE" >&2
   exit 1
@@ -92,6 +93,10 @@ assert_file_contains "$GUEST_ROOT/etc/systemd/system/mnt-okrun.mount" "Where=/mn
 assert_file_contains "$GUEST_ROOT/etc/systemd/system/mnt-okrun.mount" "Type=virtiofs"
 assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Name=enp0s2"
 assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.9/24"
+if grep -q "DHCP=ipv4" "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network"; then
+  echo "Static --private-ip should win when --private-dhcp is also supplied." >&2
+  exit 1
+fi
 
 OKRUN_GUEST_ROOT="$GUEST_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --private-ip 10.77.0.10/24 \
@@ -102,6 +107,55 @@ assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" 
 assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.10/24"
 if grep -q "10.77.0.9/24" "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network"; then
   echo "Installer should replace an existing Okrun private IP when rerun with a new one." >&2
+  exit 1
+fi
+
+DHCP_ROOT="$WORK_DIR/dhcp-root"
+mkdir -p "$DHCP_ROOT/mnt/okrun/okrun-guest-logs"
+OKRUN_GUEST_ROOT="$DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+  --private-iface enp0s2 \
+  --health-interval 7
+
+assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "Managed by Okrun guest tools"
+assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "Name=enp0s2"
+assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "DHCP=ipv4"
+assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "LinkLocalAddressing=no"
+assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "IPv6AcceptRA=no"
+assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "UseDNS=false"
+assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "UseRoutes=false"
+if grep -q "^Address=" "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network"; then
+  echo "DHCP private network config should not include a static Address line." >&2
+  exit 1
+fi
+
+STATIC_TO_DHCP_ROOT="$WORK_DIR/static-to-dhcp-root"
+mkdir -p "$STATIC_TO_DHCP_ROOT/etc/systemd/network" "$STATIC_TO_DHCP_ROOT/mnt/okrun/okrun-guest-logs"
+cat >"$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" <<'EOF'
+# Managed by Okrun guest tools.
+[Match]
+Name=enp0s2
+
+[Network]
+Address=10.77.0.55/24
+EOF
+
+OKRUN_GUEST_ROOT="$STATIC_TO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+  --health-interval 7
+
+assert_file_contains "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.55/24"
+if grep -q "DHCP=ipv4" "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network"; then
+  echo "Default installer run should preserve existing Okrun-managed static private config." >&2
+  exit 1
+fi
+
+OKRUN_GUEST_ROOT="$STATIC_TO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+  --private-dhcp \
+  --health-interval 7
+
+assert_file_contains "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "DHCP=ipv4"
+assert_file_contains "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "UseRoutes=false"
+if grep -q "^Address=" "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network"; then
+  echo "--private-dhcp should replace an existing Okrun-managed static Address line." >&2
   exit 1
 fi
 

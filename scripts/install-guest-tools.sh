@@ -9,6 +9,7 @@ SSH_PORT="${OKRUN_GUEST_PORT:-22}"
 SSH_IDENTITY="${OKRUN_GUEST_IDENTITY:-}"
 PRIVATE_IP_CIDR=""
 PRIVATE_IFACE="auto"
+PRIVATE_DHCP_EXPLICIT="0"
 ENABLE_VIRTIOFS_MOUNT="1"
 RESIZE_ROOT="0"
 HEALTH_INTERVAL="60"
@@ -24,8 +25,10 @@ Options:
   --user USER              SSH user. Defaults to current local user or OKRUN_GUEST_USER.
   --port PORT              SSH port. Defaults to 22 or OKRUN_GUEST_PORT.
   --identity PATH          SSH identity file. Defaults to OKRUN_GUEST_IDENTITY.
+  --private-dhcp           Configure the private-network interface with DHCP, replacing
+                           an existing Okrun-managed static private config.
   --private-ip CIDR        Persist a private-network address, for example 10.77.0.3/24.
-  --private-iface IFACE    Interface for --private-ip. Defaults to auto-detect in the guest.
+  --private-iface IFACE    Interface for private networking. Defaults to auto-detect in the guest.
   --no-virtiofs-mount      Do not install the /mnt/okrun VirtioFS mount unit.
   --log-share NAME         Required writable share below /mnt/okrun. Default: okrun-guest-logs.
   --resize-root            Try to grow the guest root partition/filesystem.
@@ -34,6 +37,7 @@ Options:
 
 Examples:
   scripts/install-guest-tools.sh 192.168.64.16
+  scripts/install-guest-tools.sh --user arunoda --private-dhcp devbox-sandbox.local
   scripts/install-guest-tools.sh --user arunoda --private-ip 10.77.0.3/24 devbox-sandbox.local
 EOF
 }
@@ -59,6 +63,10 @@ while [[ $# -gt 0 ]]; do
       PRIVATE_IP_CIDR="${2:-}"
       [[ -n "$PRIVATE_IP_CIDR" ]] || { echo "Missing --private-ip value" >&2; exit 64; }
       shift 2
+      ;;
+    --private-dhcp)
+      PRIVATE_DHCP_EXPLICIT="1"
+      shift
       ;;
     --private-iface)
       PRIVATE_IFACE="${2:-}"
@@ -131,8 +139,13 @@ fi
 if [[ "$RESIZE_ROOT" == "1" ]]; then
   INSTALL_ARGS+=(--resize-root)
 fi
+if [[ "$PRIVATE_DHCP_EXPLICIT" == "1" ]]; then
+  INSTALL_ARGS+=(--private-dhcp)
+fi
 if [[ -n "$PRIVATE_IP_CIDR" ]]; then
   INSTALL_ARGS+=(--private-ip "$PRIVATE_IP_CIDR" --private-iface "$PRIVATE_IFACE")
+elif [[ "$PRIVATE_IFACE" != "auto" ]]; then
+  INSTALL_ARGS+=(--private-iface "$PRIVATE_IFACE")
 fi
 
 echo "Installing Okrun guest tools on $SSH_TARGET..."

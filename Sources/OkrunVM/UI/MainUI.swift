@@ -842,6 +842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             try FileManager.default.createDirectory(at: request.projectURL, withIntermediateDirectories: true)
             let paths = VMPaths.project(at: request.projectURL)
             try request.config.save(to: paths.config)
+            try provisionPrivateNetworkDHCPIfNeeded(for: request.config)
             _ = try prepareStorage(paths: paths, config: request.config)
             AppLog.lifecycle.info(
                 "Created project path=\(paths.root.path, privacy: .public) cpu=\(request.config.cpuCount) memoryGB=\(request.config.memoryGB) diskGB=\(request.config.diskGB)"
@@ -1608,11 +1609,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         session.privateNetworkRuntimes.removeAll()
     }
 
+    private func provisionPrivateNetworkDHCPIfNeeded(for config: VMConfig) throws {
+        guard config.privateNetwork.enabled else { return }
+        _ = try HostNetworkConfigStore().dhcpConfigForPrivateNetwork(identifier: config.privateNetwork.identifier)
+    }
+
     private func makeConfiguration(paths: VMPaths, config: VMConfig, mode: VMMode, session: VMTabSession) throws -> VZVirtualMachineConfiguration {
         let configuration = VZVirtualMachineConfiguration()
 
+        let machineIdentifierData = try Data(contentsOf: paths.machineIdentifier)
+        guard let machineIdentifier = VZGenericMachineIdentifier(dataRepresentation: machineIdentifierData) else {
+            throw AppError("Invalid machine identifier at \(paths.machineIdentifier.path)")
+        }
         let platform = VZGenericPlatformConfiguration()
-        platform.machineIdentifier = try loadMachineIdentifier(from: paths.machineIdentifier)
+        platform.machineIdentifier = machineIdentifier
         configuration.platform = platform
 
         let bootLoader = VZEFIBootLoader()
@@ -1625,7 +1635,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         configuration.graphicsDevices = [makeGraphicsDevice()]
         configuration.keyboards = [VZUSBKeyboardConfiguration()]
         configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork) { runtime in
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(
+            privateNetwork: config.privateNetwork,
+            machineIdentifierData: machineIdentifierData
+        ) { runtime in
             session.privateNetworkRuntimes.append(runtime)
         }
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]

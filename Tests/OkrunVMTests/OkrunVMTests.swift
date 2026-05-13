@@ -291,12 +291,201 @@ struct OkrunVMTests {
         #expect(natOnlyDevices.count == 1)
         #expect((natOnlyDevices.first as? VZVirtioNetworkDeviceConfiguration)?.attachment is VZNATNetworkDeviceAttachment)
 
+        let home = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(home) }
+        let hostNetworkConfigURL = home.appendingPathComponent("private-networks.json")
         let privateDevices = try NetworkDeviceFactory.makeDevices(
-            privateNetwork: PrivateNetworkConfig(enabled: true, identifier: "test")
+            privateNetwork: PrivateNetworkConfig(enabled: true, identifier: "test"),
+            hostNetworkConfigStore: HostNetworkConfigStore(url: hostNetworkConfigURL)
         )
         #expect(privateDevices.count == 2)
         #expect((privateDevices.first as? VZVirtioNetworkDeviceConfiguration)?.attachment is VZNATNetworkDeviceAttachment)
         #expect((privateDevices.last as? VZVirtioNetworkDeviceConfiguration)?.attachment is VZFileHandleNetworkDeviceAttachment)
+        #expect(FileManager.default.fileExists(atPath: hostNetworkConfigURL.path))
+        let hostConfig = try HostNetworkConfigStore(url: hostNetworkConfigURL).load()
+        #expect(hostConfig.privateNetworks["test"]?.dhcp?.enabled == true)
+    }
+
+    @Test
+    func projectStoreMigratesLegacyDefaultRegistryFile() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let legacyURL = root.appendingPathComponent(".okrun")
+        let registry = ProjectRegistry(selectedProject: "/tmp/a", projects: ["/tmp/a"])
+        let encoder = JSONEncoder()
+        try encoder.encode(registry).write(to: legacyURL)
+
+        let store = ProjectStore(url: root.appendingPathComponent(".okrun/registry.json"), legacyURL: legacyURL)
+        let loaded = try store.load(defaultProject: nil)
+
+        #expect(loaded == registry)
+    }
+
+    @Test
+    func hostNetworkConfigStoreValidatesDHCPRanges() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
+
+        let validConfig = HostNetworkConfig(version: 1, privateNetworks: [
+            "team-a": HostPrivateNetworkConfig(dhcp: PrivateNetworkDHCPConfig(
+                enabled: true,
+                mode: .range,
+                cidr: "10.77.0.0/24",
+                rangeStart: "10.77.0.20",
+                rangeEnd: "10.77.0.200",
+                leaseSeconds: 3600
+            ))
+        ])
+        try store.save(validConfig)
+        #expect(try store.load() == validConfig)
+
+        let invalidConfig = HostNetworkConfig(version: 1, privateNetworks: [
+            "team-a": HostPrivateNetworkConfig(dhcp: PrivateNetworkDHCPConfig(
+                enabled: true,
+                mode: .range,
+                cidr: "10.77.0.0/24",
+                rangeStart: "10.78.0.20",
+                rangeEnd: "10.77.0.200",
+                leaseSeconds: 3600
+            ))
+        ])
+        #expect(throws: (any Error).self) {
+            try store.save(invalidConfig)
+        }
+    }
+
+    @Test
+    func hostNetworkConfigStoreAutoCreatesDHCPConfig() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let configURL = root.appendingPathComponent("private-networks.json")
+        let store = HostNetworkConfigStore(url: configURL)
+
+        let defaultDHCP = try #require(try store.dhcpConfigForPrivateNetwork(identifier: "okrun"))
+        #expect(defaultDHCP.enabled)
+        #expect(defaultDHCP.cidr == "10.77.0.0/24")
+        #expect(defaultDHCP.rangeStart == "10.77.0.20")
+        #expect(defaultDHCP.rangeEnd == "10.77.0.200")
+        #expect(FileManager.default.fileExists(atPath: configURL.path))
+
+        let teamDHCP = try #require(try store.dhcpConfigForPrivateNetwork(identifier: "team-a"))
+        #expect(teamDHCP.enabled)
+        #expect(teamDHCP.cidr != defaultDHCP.cidr)
+
+        let persisted = try store.load()
+        #expect(persisted.privateNetworks["okrun"]?.dhcp == defaultDHCP)
+        #expect(persisted.privateNetworks["team-a"]?.dhcp == teamDHCP)
+    }
+
+    @Test
+    func hostNetworkConfigStoreRespectsDisabledDHCPConfig() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
+        let disabledDHCP = PrivateNetworkDHCPConfig(
+            enabled: false,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.200",
+            leaseSeconds: 3600
+        )
+        try store.save(HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(dhcp: disabledDHCP)
+        ]))
+
+        #expect(try store.dhcpConfigForPrivateNetwork(identifier: "okrun") == nil)
+        #expect(try store.load().privateNetworks["okrun"]?.dhcp == disabledDHCP)
+    }
+
+    @Test
+    func dhcpLeaseAllocatorReusesIdentityAndExhaustsRange() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let config = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.21",
+            leaseSeconds: 3600
+        )
+        let store = DHCPLeaseStore(stateDirectory: root)
+        let allocator = try DHCPLeaseAllocator(config: config, store: store)
+
+        let first = try allocator.lease(for: "client-a", requestedIP: try IPv4Address("10.77.0.21"))
+        let renewed = try allocator.lease(for: "client-a", requestedIP: nil)
+        let second = try allocator.lease(for: "client-b", requestedIP: nil)
+        let expectedFirstAddress = try IPv4Address("10.77.0.21")
+        let expectedSecondAddress = try IPv4Address("10.77.0.20")
+
+        #expect(first.ipAddress == expectedFirstAddress)
+        #expect(renewed.ipAddress == first.ipAddress)
+        #expect(second.ipAddress == expectedSecondAddress)
+        #expect(throws: (any Error).self) {
+            _ = try allocator.lease(for: "client-c", requestedIP: nil)
+        }
+    }
+
+    @Test
+    func dhcpPacketParserAndEncoderRoundTrip() throws {
+        let clientMAC = EthernetAddress([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+        let discover = DHCPMessage(
+            messageType: .discover,
+            transactionID: 0x1234_5678,
+            flags: 0x8000,
+            clientHardwareAddress: clientMAC,
+            clientIPAddress: IPv4Address(value: 0),
+            yourIPAddress: IPv4Address(value: 0),
+            requestedIPAddress: nil,
+            serverIdentifier: nil,
+            clientIdentifier: Data([1, 2, 3, 4]),
+            options: [
+                .messageType(.discover)
+            ]
+        ).ethernetFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: .broadcast,
+            sourceIP: IPv4Address(value: 0),
+            destinationIP: IPv4Address(value: 0xffff_ffff),
+            sourcePort: 68,
+            destinationPort: 67,
+            bootpOperation: 1
+        )
+
+        let parsed = try #require(DHCPMessage.parse(fromEthernetFrame: discover))
+        #expect(parsed.messageType == .discover)
+        #expect(parsed.transactionID == 0x1234_5678)
+        #expect(parsed.clientHardwareAddress == clientMAC)
+
+        let offer = DHCPMessage(
+            messageType: .offer,
+            transactionID: parsed.transactionID,
+            flags: parsed.flags,
+            clientHardwareAddress: parsed.clientHardwareAddress,
+            clientIPAddress: IPv4Address(value: 0),
+            yourIPAddress: try IPv4Address("10.77.0.20"),
+            requestedIPAddress: nil,
+            serverIdentifier: try IPv4Address("10.77.0.1"),
+            clientIdentifier: parsed.clientIdentifier,
+            options: [
+                .messageType(.offer),
+                .serverIdentifier(try IPv4Address("10.77.0.1")),
+                .subnetMask(try IPv4Address("255.255.255.0")),
+                .leaseTime(3600)
+            ]
+        ).ethernetFrame(
+            sourceMAC: EthernetAddress([0x02, 0x6f, 0x6b, 0x72, 0x75, 0x6e]),
+            destinationMAC: .broadcast,
+            sourceIP: try IPv4Address("10.77.0.1"),
+            destinationIP: IPv4Address(value: 0xffff_ffff)
+        )
+
+        #expect(offer.count > discover.count - 32)
+        #expect(offer[12] == 0x08)
+        #expect(offer[13] == 0x00)
     }
 
     @Test
