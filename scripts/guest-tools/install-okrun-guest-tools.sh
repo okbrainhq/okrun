@@ -3,6 +3,7 @@ set -euo pipefail
 
 PRIVATE_IP_CIDR=""
 PRIVATE_IFACE="auto"
+PRIVATE_DHCP_EXPLICIT="0"
 ENABLE_VIRTIOFS_MOUNT="1"
 RESIZE_ROOT="0"
 HEALTH_INTERVAL="60"
@@ -30,8 +31,10 @@ Usage: sudo install-okrun-guest-tools.sh [options]
 Installs generic Okrun guest support inside a Linux VM.
 
 Options:
+  --private-dhcp           Configure the private-network interface with DHCP, replacing
+                           an existing Okrun-managed static private config.
   --private-ip CIDR        Persist a private-network address, for example 10.77.0.3/24.
-  --private-iface IFACE    Interface for --private-ip. Defaults to auto-detect.
+  --private-iface IFACE    Interface for private networking. Defaults to auto-detect.
   --no-virtiofs-mount      Do not install the /mnt/okrun VirtioFS mount unit.
   --log-share NAME         Required writable share below /mnt/okrun. Default: okrun-guest-logs.
   --resize-root            Try to grow the root partition/filesystem if free disk space is adjacent.
@@ -48,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       PRIVATE_IP_CIDR="${2:-}"
       [[ -n "$PRIVATE_IP_CIDR" ]] || { echo "Missing --private-ip value" >&2; exit 64; }
       shift 2
+      ;;
+    --private-dhcp)
+      PRIVATE_DHCP_EXPLICIT="1"
+      shift
       ;;
     --private-iface)
       PRIVATE_IFACE="${2:-}"
@@ -373,8 +380,46 @@ private_network_config_exists() {
   return 1
 }
 
+private_managed_network_config() {
+  guest_path /etc/systemd/network/20-okrun-private.network
+}
+
+private_managed_network_config_exists() {
+  local config_file
+  config_file="$(private_managed_network_config)"
+  [[ -f "$config_file" ]] && grep -qs '^# Managed by Okrun guest tools\.$' "$config_file"
+}
+
+private_managed_network_config_is_dhcp() {
+  local config_file
+  config_file="$(private_managed_network_config)"
+  [[ -f "$config_file" ]] && grep -qs '^DHCP=ipv4$' "$config_file"
+}
+
+install_private_network_dhcp_config() {
+  local private_iface="$1"
+  install -d -m 0755 "$(guest_path /etc/systemd/network)"
+  cat >"$(private_managed_network_config)" <<EOF
+# Managed by Okrun guest tools.
+[Match]
+Name=$private_iface
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPv4]
+UseDNS=false
+UseRoutes=false
+EOF
+}
+
 installed_private_network_config="0"
 if [[ -n "$PRIVATE_IP_CIDR" ]]; then
+  if [[ "$PRIVATE_DHCP_EXPLICIT" == "1" ]]; then
+    echo "--private-ip was supplied; skipping DHCP private network config."
+  fi
   private_iface="$(detect_private_iface)"
   if [[ -z "$private_iface" ]]; then
     echo "No Okrun private network interface detected; leaving network config unchanged. Enable privateNetwork for this VM, reboot it, then rerun with --private-ip."
@@ -392,6 +437,19 @@ Address=$PRIVATE_IP_CIDR
 EOF
     installed_private_network_config="1"
     echo "Okrun private network config set to $PRIVATE_IP_CIDR on $private_iface."
+  fi
+else
+  private_iface="$(detect_private_iface)"
+  if [[ -z "$private_iface" ]]; then
+    echo "No Okrun private network interface detected; leaving network config unchanged. Enable privateNetwork for this VM, reboot it, then rerun this installer."
+  elif private_managed_network_config_is_dhcp; then
+    echo "Okrun DHCP private network config already exists; leaving it unchanged."
+  elif private_managed_network_config_exists && [[ "$PRIVATE_DHCP_EXPLICIT" != "1" ]]; then
+    echo "Okrun static private network config already exists; leaving it unchanged. Rerun with --private-dhcp to replace it with DHCP."
+  else
+    install_private_network_dhcp_config "$private_iface"
+    installed_private_network_config="1"
+    echo "Okrun private network DHCP config installed on $private_iface."
   fi
 fi
 

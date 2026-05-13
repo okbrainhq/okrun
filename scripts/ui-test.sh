@@ -469,6 +469,12 @@ run_project_lifecycle_smoke() {
   click_button "Create" "okrun.add.create"
   wait_for_file "$project_path/okrun-vm.json"
   wait_for_any_file "$project_path/vm/linux.raw" "$project_path/vm/linux.asif"
+  grep -Fq '"enabled" : true' "$project_path/okrun-vm.json"
+  grep -Fq '"identifier" : "okrun"' "$project_path/okrun-vm.json"
+  wait_for_file "$test_dir/empty-default-project/private-networks.json"
+  grep -Fq '"okrun"' "$test_dir/empty-default-project/private-networks.json"
+  grep -Fq '"enabled" : true' "$test_dir/empty-default-project/private-networks.json"
+  grep -Fq '"cidr" : "10.77.0.0/24"' "$test_dir/empty-default-project/private-networks.json"
   registry_contains_project "$registry_path" "$project_path"
   capture "02-lifecycle-after-add"
 

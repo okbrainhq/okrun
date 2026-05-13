@@ -9,7 +9,11 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     private let sharedDirectory: SharedDirectoryConfig?
     private let managedGuestLogsDirectory: URL?
     private let privateNetwork: PrivateNetworkConfig
+    private let privateNetworkDHCP: Bool
     private var expectedOutput: String {
+        if privateNetworkDHCP {
+            return "OKRUN_E2E_PRIVATE_NETWORK_DHCP_PASSED"
+        }
         if sharedDirectory != nil {
             return "OKRUN_E2E_SHARED_DIRS_PASSED"
         }
@@ -29,7 +33,8 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         timeout: TimeInterval,
         sharedDirectory: SharedDirectoryConfig?,
         managedGuestLogsDirectory: URL?,
-        privateNetwork: PrivateNetworkConfig
+        privateNetwork: PrivateNetworkConfig,
+        privateNetworkDHCP: Bool = false
     ) {
         self.kernelURL = kernelURL
         self.initialRamdiskURL = initialRamdiskURL
@@ -37,6 +42,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         self.sharedDirectory = sharedDirectory
         self.managedGuestLogsDirectory = managedGuestLogsDirectory
         self.privateNetwork = privateNetwork
+        self.privateNetworkDHCP = privateNetworkDHCP
     }
 
     static func runIfRequested(arguments: [String] = CommandLine.arguments) -> Int32? {
@@ -100,7 +106,8 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                 timeout: options.timeout,
                 sharedDirectory: options.sharedDirectory,
                 managedGuestLogsDirectory: options.managedGuestLogsDirectory,
-                privateNetwork: options.privateNetwork
+                privateNetwork: options.privateNetwork,
+                privateNetworkDHCP: options.privateNetworkDHCP
             )
             try test.run()
             print("Headless boot E2E passed: \(test.expectedOutput)")
@@ -132,7 +139,8 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         privateNetworkServerInitialRamdisk: URL?,
         privateNetworkClientInitialRamdisk: URL?,
         managedGuestLogsDirectory: URL?,
-        projectRoot: URL?
+        projectRoot: URL?,
+        privateNetworkDHCP: Bool
     ) {
         var kernelPath: String?
         var initialRamdiskPath: String?
@@ -143,6 +151,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         var managedGuestLogsDirectoryPath: String?
         var privateNetwork = PrivateNetworkConfig.disabled
         var projectRootPath: String?
+        var privateNetworkDHCP = false
         var iterator = arguments.dropFirst().makeIterator()
 
         while let argument = iterator.next() {
@@ -166,6 +175,9 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                 managedGuestLogsDirectoryPath = iterator.next()
             case "--private-network":
                 privateNetwork = PrivateNetworkConfig(enabled: true)
+            case "--private-network-dhcp":
+                privateNetwork = PrivateNetworkConfig(enabled: true)
+                privateNetworkDHCP = true
             case "--private-network-id":
                 guard let value = iterator.next() else {
                     throw AppError("Missing --private-network-id value.")
@@ -228,7 +240,8 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             privateNetworkServerInitialRamdisk,
             privateNetworkClientInitialRamdisk,
             managedGuestLogsDirectory,
-            projectRoot
+            projectRoot,
+            privateNetworkDHCP
         )
     }
 
@@ -273,8 +286,9 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     private func makeConfiguration(serialOutput: FileHandle) throws -> VZVirtualMachineConfiguration {
         let configuration = VZVirtualMachineConfiguration()
 
+        let machineIdentifier = VZGenericMachineIdentifier()
         let platform = VZGenericPlatformConfiguration()
-        platform.machineIdentifier = VZGenericMachineIdentifier()
+        platform.machineIdentifier = machineIdentifier
         configuration.platform = platform
 
         let bootLoader = VZLinuxBootLoader(kernelURL: kernelURL)
@@ -284,7 +298,10 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
 
         configuration.cpuCount = 1
         configuration.memorySize = 1024 * 1024 * 1024
-        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: privateNetwork)
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(
+            privateNetwork: privateNetwork,
+            machineIdentifierData: machineIdentifier.dataRepresentation
+        )
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
         let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -332,7 +349,8 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     }
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-        finish(.failure(AppError("VM stopped before emitting \(expectedOutput).")))
+        let output = String(decoding: serialOutput, as: UTF8.self)
+        finish(.failure(AppError("VM stopped before emitting \(expectedOutput). Serial output:\n\(output)")))
     }
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
@@ -423,8 +441,9 @@ final class HeadlessPrivateNetworkTest: NSObject, VZVirtualMachineDelegate {
     private func makeConfiguration(initialRamdiskURL: URL, serialOutput: FileHandle) throws -> VZVirtualMachineConfiguration {
         let configuration = VZVirtualMachineConfiguration()
 
+        let machineIdentifier = VZGenericMachineIdentifier()
         let platform = VZGenericPlatformConfiguration()
-        platform.machineIdentifier = VZGenericMachineIdentifier()
+        platform.machineIdentifier = machineIdentifier
         configuration.platform = platform
 
         let bootLoader = VZLinuxBootLoader(kernelURL: kernelURL)
@@ -434,7 +453,10 @@ final class HeadlessPrivateNetworkTest: NSObject, VZVirtualMachineDelegate {
 
         configuration.cpuCount = 1
         configuration.memorySize = 1024 * 1024 * 1024
-        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: privateNetwork)
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(
+            privateNetwork: privateNetwork,
+            machineIdentifierData: machineIdentifier.dataRepresentation
+        )
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
         let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -628,7 +650,10 @@ final class HeadlessSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
 
         configuration.cpuCount = 1
         configuration.memorySize = 1024 * 1024 * 1024
-        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: privateNetwork)
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(
+            privateNetwork: privateNetwork,
+            machineIdentifierData: machineIdentifier.dataRepresentation
+        )
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
         let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -893,7 +918,10 @@ final class HeadlessProjectSaveRestoreTest: NSObject, VZVirtualMachineDelegate {
         configuration.graphicsDevices = [makeGraphicsDevice()]
         configuration.keyboards = [VZUSBKeyboardConfiguration()]
         configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(privateNetwork: config.privateNetwork)
+        configuration.networkDevices = try NetworkDeviceFactory.makeDevices(
+            privateNetwork: config.privateNetwork,
+            machineIdentifierData: machineData
+        )
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.storageDevices = [try makeStorageDevice()]
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(

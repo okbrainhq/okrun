@@ -121,16 +121,50 @@ struct ProjectRegistry: Codable, Equatable {
     static let empty = ProjectRegistry(selectedProject: nil, projects: [])
 }
 
+struct OkrunHome {
+    let root: URL
+
+    init(root: URL? = nil) {
+        if let root {
+            self.root = root
+        } else if let environmentRoot = ProcessInfo.processInfo.environment["OKRUN_HOME"], !environmentRoot.isEmpty {
+            self.root = URL(fileURLWithPath: environmentRoot, isDirectory: true)
+        } else {
+            self.root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".okrun", isDirectory: true)
+        }
+    }
+
+    var registryURL: URL {
+        root.appendingPathComponent("registry.json")
+    }
+
+    var privateNetworksURL: URL {
+        root.appendingPathComponent("private-networks.json")
+    }
+
+    func privateNetworkStateDirectory(identifier: String) -> URL {
+        root
+            .appendingPathComponent("state", isDirectory: true)
+            .appendingPathComponent("private-networks", isDirectory: true)
+            .appendingPathComponent(identifier, isDirectory: true)
+    }
+}
+
 final class ProjectStore {
     private let url: URL
+    private let legacyURL: URL?
 
-    init(url: URL? = nil) {
+    init(url: URL? = nil, legacyURL explicitLegacyURL: URL? = nil) {
         if let url {
             self.url = url
+            legacyURL = explicitLegacyURL
         } else if let registryPath = ProcessInfo.processInfo.environment["OKRUN_REGISTRY_PATH"], !registryPath.isEmpty {
             self.url = URL(fileURLWithPath: registryPath)
+            legacyURL = nil
         } else {
-            self.url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".okrun")
+            let home = OkrunHome()
+            self.url = home.registryURL
+            legacyURL = home.root
         }
     }
 
@@ -138,6 +172,7 @@ final class ProjectStore {
         let fileManager = FileManager.default
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try migrateLegacyRegistryIfNeeded(fileManager: fileManager)
 
         if !fileManager.fileExists(atPath: url.path) {
             var registry = ProjectRegistry.empty
@@ -145,6 +180,7 @@ final class ProjectStore {
                 registry.projects = [standardPath(defaultProject)]
                 registry.selectedProject = registry.projects.first
             }
+            try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try encoder.encode(registry)
             try data.write(to: url, options: .atomic)
             return registry
@@ -169,6 +205,7 @@ final class ProjectStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(registry)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
     }
 
@@ -192,6 +229,26 @@ final class ProjectStore {
         }
 
         return result
+    }
+
+    private func migrateLegacyRegistryIfNeeded(fileManager: FileManager) throws {
+        guard let legacyURL,
+              legacyURL.path != url.path,
+              fileManager.fileExists(atPath: legacyURL.path),
+              !fileManager.fileExists(atPath: url.path) else {
+            return
+        }
+
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: legacyURL.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            return
+        }
+
+        let data = try Data(contentsOf: legacyURL)
+        _ = try JSONDecoder().decode(ProjectRegistry.self, from: data)
+        try fileManager.removeItem(at: legacyURL)
+        try fileManager.createDirectory(at: legacyURL, withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
     }
 
     static func defaultProjectRoot() -> URL? {
@@ -501,6 +558,8 @@ struct SharedDirectoryConfig: Codable, Equatable {
 enum NetworkDeviceFactory {
     static func makeDevices(
         privateNetwork: PrivateNetworkConfig,
+        machineIdentifierData: Data? = nil,
+        hostNetworkConfigStore: HostNetworkConfigStore = HostNetworkConfigStore(),
         onRetainPrivateNetworkRuntime: ((PrivateNetworkRuntime) -> Void)? = nil
     ) throws -> [VZNetworkDeviceConfiguration] {
         var devices: [VZNetworkDeviceConfiguration] = [makeNATDevice()]
@@ -508,6 +567,8 @@ enum NetworkDeviceFactory {
         if privateNetwork.enabled {
             devices.append(try makePrivateNetworkDevice(
                 identifier: privateNetwork.identifier,
+                machineIdentifierData: machineIdentifierData,
+                hostNetworkConfigStore: hostNetworkConfigStore,
                 onRetainPrivateNetworkRuntime: onRetainPrivateNetworkRuntime
             ))
         }
@@ -523,14 +584,47 @@ enum NetworkDeviceFactory {
 
     private static func makePrivateNetworkDevice(
         identifier: String,
+        machineIdentifierData: Data?,
+        hostNetworkConfigStore: HostNetworkConfigStore,
         onRetainPrivateNetworkRuntime: ((PrivateNetworkRuntime) -> Void)?
     ) throws -> VZNetworkDeviceConfiguration {
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
+        if let macAddress = deterministicMACAddress(machineIdentifierData: machineIdentifierData, privateNetworkIdentifier: identifier) {
+            networkDevice.macAddress = macAddress
+        }
         let runtime = try PrivateNetworkRuntime(identifier: identifier)
+        if let dhcpConfig = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier) {
+            let server = try HostDHCPServer(
+                privateNetworkIdentifier: identifier,
+                config: dhcpConfig,
+                runtime: runtime,
+                leaseStore: DHCPLeaseStore(stateDirectory: hostNetworkConfigStore.home.privateNetworkStateDirectory(identifier: identifier))
+            )
+            runtime.retainHostService(server)
+        }
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
         PrivateNetworkRuntimeRegistry.shared.retain(runtime)
         onRetainPrivateNetworkRuntime?(runtime)
         return networkDevice
+    }
+
+    static func deterministicMACAddress(machineIdentifierData: Data?, privateNetworkIdentifier: String) -> VZMACAddress? {
+        var bytes = [UInt8]("okrun-private-network:".utf8)
+        if let machineIdentifierData {
+            bytes.append(contentsOf: machineIdentifierData)
+        }
+        bytes.append(contentsOf: privateNetworkIdentifier.utf8)
+        let digest = FNV1a64.hash(bytes)
+        let macBytes: [UInt8] = [
+            0x02,
+            UInt8((digest >> 32) & 0xff),
+            UInt8((digest >> 24) & 0xff),
+            UInt8((digest >> 16) & 0xff),
+            UInt8((digest >> 8) & 0xff),
+            UInt8(digest & 0xff)
+        ]
+        let string = macBytes.map { String(format: "%02x", $0) }.joined(separator: ":")
+        return VZMACAddress(string: string)
     }
 }
 
@@ -567,6 +661,9 @@ final class PrivateNetworkRuntime {
     private let bridgeSource: DispatchSourceRead
     private let peerSource: DispatchSourceRead
     private let queue: DispatchQueue
+    private let observerLock = NSLock()
+    private var frameObservers: [(PrivateNetworkFrameDirection, Data) -> Void] = []
+    private var hostServices: [AnyObject] = []
 
     init(identifier: String) throws {
         var descriptors: [Int32] = [0, 0]
@@ -630,6 +727,7 @@ final class PrivateNetworkRuntime {
         while true {
             let count = recv(bridgeDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
             if count > 0 {
+                notifyObservers(direction: .fromGuest, frame: Data(buffer.prefix(count)))
                 broadcastFrame(buffer, count: count)
                 continue
             }
@@ -646,6 +744,7 @@ final class PrivateNetworkRuntime {
         while true {
             let count = recv(peerDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
             if count > 0 {
+                notifyObservers(direction: .fromPeer, frame: Data(buffer.prefix(count)))
                 _ = buffer.withUnsafeBufferPointer { pointer in
                     write(bridgeDescriptor, pointer.baseAddress, count)
                 }
@@ -672,6 +771,32 @@ final class PrivateNetworkRuntime {
                     to: peer.path
                 )
             }
+        }
+    }
+
+    func addFrameObserver(_ observer: @escaping (PrivateNetworkFrameDirection, Data) -> Void) {
+        observerLock.lock()
+        frameObservers.append(observer)
+        observerLock.unlock()
+    }
+
+    func injectFrameToGuest(_ frame: Data) {
+        frame.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            _ = write(bridgeDescriptor, baseAddress, frame.count)
+        }
+    }
+
+    func retainHostService(_ service: AnyObject) {
+        hostServices.append(service)
+    }
+
+    private func notifyObservers(direction: PrivateNetworkFrameDirection, frame: Data) {
+        observerLock.lock()
+        let observers = frameObservers
+        observerLock.unlock()
+        for observer in observers {
+            observer(direction, frame)
         }
     }
 
@@ -737,6 +862,22 @@ final class PrivateNetworkRuntime {
                 sendto(descriptor, buffer, count, MSG_DONTWAIT, $0, length)
             }
         }
+    }
+}
+
+enum PrivateNetworkFrameDirection {
+    case fromGuest
+    case fromPeer
+}
+
+enum FNV1a64 {
+    static func hash(_ bytes: [UInt8]) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in bytes {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return hash
     }
 }
 

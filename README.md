@@ -152,6 +152,7 @@ SSH to install:
   and recent kernel alert snapshots to a writable project-mounted share.
 - `okrun-guest-diagnose`, a one-shot guest diagnostic command.
 - `/mnt/okrun` VirtioFS mount support via `mnt-okrun.mount`.
+- DHCP configuration for the Okrun private network interface when one is present.
 
 Guest health logs are intentionally written to the Mac side instead of only the
 guest disk. On every VM start, Okrun creates `vm/guest-logs` inside the project
@@ -167,9 +168,49 @@ The health log rotates in place at 10 MB and keeps 5 old files by default:
 `guest-health.log`, `guest-health.log.1`, and so on. Override this with
 `OKRUN_LOG_MAX_BYTES` and `OKRUN_LOG_KEEP` in `/etc/okrun/guest-tools.env`.
 
-To also persist a private-network IP on the guest, pass a CIDR address. The
-installer auto-detects an interface without IPv4, or you can pass
-`--private-iface`:
+When a VM has `privateNetwork.enabled` in `okrun-vm.json`, the installer
+auto-detects the private interface and configures it for IPv4 DHCP. The private
+NIC intentionally does not install DNS or routes, so internet access keeps using
+the NAT interface.
+
+Okrun creates host DHCP config automatically the first time a VM starts with a
+private-network identifier. For `okrun`, the generated default is written to
+`~/.okrun/private-networks.json` like this:
+
+```json
+{
+  "version": 1,
+  "privateNetworks": {
+    "okrun": {
+      "dhcp": {
+        "enabled": true,
+        "mode": "range",
+        "cidr": "10.77.0.0/24",
+        "rangeStart": "10.77.0.20",
+        "rangeEnd": "10.77.0.200",
+        "leaseSeconds": 3600
+      }
+    }
+  }
+}
+```
+
+Okrun stores DHCP leases under `~/.okrun/state/private-networks/<identifier>/`.
+`OKRUN_HOME` can point Okrun at a different state directory, and
+`OKRUN_REGISTRY_PATH` still overrides only the project registry path.
+Set `"enabled": false` for an identifier's DHCP config to opt out.
+
+If a guest already has an Okrun-managed static private-network file, the default
+installer run leaves it unchanged. Pass `--private-dhcp` to replace that
+Okrun-managed static file with DHCP:
+
+```sh
+./scripts/install-guest-tools.sh --private-dhcp <hostname-or-ip>
+./scripts/install-guest-tools.sh --private-dhcp --private-iface enp0s2 <hostname-or-ip>
+```
+
+For advanced static setups, pass a CIDR address. Static config wins if both
+`--private-ip` and `--private-dhcp` are supplied:
 
 ```sh
 ./scripts/install-guest-tools.sh --private-ip 10.77.0.3/24 <hostname-or-ip>
