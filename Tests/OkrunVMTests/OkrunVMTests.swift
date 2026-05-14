@@ -454,6 +454,18 @@ struct OkrunVMTests {
         #expect(try store.bridgeConfigForPrivateNetwork(identifier: "okrun") == validBridge)
         #expect(try store.load() == validConfig)
 
+        let clientOnlyBridge = PrivateNetworkBridgeConfig(
+            bind: nil,
+            peers: [
+                PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: 41000)
+            ]
+        )
+        let clientOnlyConfig = HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(dhcp: nil, bridge: clientOnlyBridge)
+        ])
+        try store.save(clientOnlyConfig)
+        #expect(try store.bridgeConfigForPrivateNetwork(identifier: "okrun") == clientOnlyBridge)
+
         let invalidPort = HostNetworkConfig(version: 1, privateNetworks: [
             "okrun": HostPrivateNetworkConfig(
                 dhcp: nil,
@@ -478,6 +490,16 @@ struct OkrunVMTests {
         ])
         #expect(throws: (any Error).self) {
             try store.save(invalidHost)
+        }
+
+        let emptyBridge = HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(
+                dhcp: nil,
+                bridge: PrivateNetworkBridgeConfig(bind: nil, peers: [])
+            )
+        ])
+        #expect(throws: (any Error).self) {
+            try store.save(emptyBridge)
         }
     }
 
@@ -508,20 +530,16 @@ struct OkrunVMTests {
     func privateNetworkBridgeTransfersFramesBetweenHostBridges() throws {
         let network = "bridge-\(UUID().uuidString)"
         let portA = try unusedLoopbackPort()
-        let portB = try unusedLoopbackPort()
         let runtimeA = try PrivateNetworkRuntime(identifier: "\(network)-a")
         let runtimeB = try PrivateNetworkRuntime(identifier: "\(network)-b")
         let bridgeA = try PrivateNetworkBridge(
             identifier: network,
-            config: PrivateNetworkBridgeConfig(
-                bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA),
-                peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portB)]
-            )
+            config: PrivateNetworkBridgeConfig(bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA), peers: [])
         )
         let bridgeB = try PrivateNetworkBridge(
             identifier: network,
             config: PrivateNetworkBridgeConfig(
-                bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portB),
+                bind: nil,
                 peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA)]
             )
         )
@@ -535,32 +553,29 @@ struct OkrunVMTests {
         )
 
         try sendFrame(frame, from: runtimeA.fileHandle, untilReceivedOn: runtimeB.fileHandle.fileDescriptor, timeout: 5)
+        try sendFrame(frame, from: runtimeB.fileHandle, untilReceivedOn: runtimeA.fileHandle.fileDescriptor, timeout: 5)
         withExtendedLifetime((bridgeA, bridgeB, runtimeA, runtimeB)) {}
     }
 
     @Test
     func privateNetworkBridgeDoesNotRelayRemoteFramesToOtherHosts() throws {
         let network = "bridge-\(UUID().uuidString)"
-        let portA = try unusedLoopbackPort()
         let portB = try unusedLoopbackPort()
-        let portC = try unusedLoopbackPort()
         let runtimeA = try PrivateNetworkRuntime(identifier: "\(network)-a")
         let runtimeB = try PrivateNetworkRuntime(identifier: "\(network)-b")
         let runtimeC = try PrivateNetworkRuntime(identifier: "\(network)-c")
-        let endpointA = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA)
         let endpointB = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portB)
-        let endpointC = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portC)
         let bridgeA = try PrivateNetworkBridge(
             identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: endpointA, peers: [endpointB])
+            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpointB])
         )
         let bridgeB = try PrivateNetworkBridge(
             identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: endpointB, peers: [endpointA, endpointC])
+            config: PrivateNetworkBridgeConfig(bind: endpointB, peers: [])
         )
         let bridgeC = try PrivateNetworkBridge(
             identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: endpointC, peers: [endpointB])
+            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpointB])
         )
         bridgeA.addRuntime(runtimeA)
         bridgeB.addRuntime(runtimeB)

@@ -262,8 +262,9 @@ Fully stop and restart the VMs after changing the config.
 ### Bridge Multiple Hosts
 
 To extend the `okrun` bus across Macs on the same LAN, add a `bridge` section to
-the global config on each host. Each host listens on its own LAN IP and connects
-to one or more peer hosts.
+the global config. `bind` is optional: use it on hosts that should accept
+incoming peers, and use `peers` on hosts that should connect out. Once connected,
+the bridge connection carries traffic both ways.
 
 Host A, listening on `192.168.1.10:7777`:
 
@@ -297,10 +298,30 @@ Host A, listening on `192.168.1.10:7777`:
 }
 ```
 
-Host B uses its own IP in `bind` and Host A's IP in `peers`. Local guest traffic
-still reaches guests on the same Mac directly. Okrun forwards local guest frames
-to connected hosts and injects remote frames into local guests, but it does not
-relay remote frames onward to other hosts.
+Host B can either bind on its own IP or omit `bind` and only list Host A in
+`peers`. Local guest traffic still reaches guests on the same Mac directly.
+Okrun forwards local guest frames to connected hosts and injects remote frames
+into local guests, but it does not relay remote frames onward to other hosts.
+
+For a client-only host, omit `bind`:
+
+```json
+{
+  "version": 1,
+  "privateNetworks": {
+    "okrun": {
+      "bridge": {
+        "peers": [
+          {
+            "host": "192.168.1.10",
+            "port": 7777
+          }
+        ]
+      }
+    }
+  }
+}
+```
 
 ### Find the Private Interface
 

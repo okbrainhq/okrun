@@ -14,11 +14,14 @@ struct HostPrivateNetworkConfig: Codable, Equatable {
 }
 
 struct PrivateNetworkBridgeConfig: Codable, Equatable {
-    var bind: PrivateNetworkBridgeEndpoint
+    var bind: PrivateNetworkBridgeEndpoint?
     var peers: [PrivateNetworkBridgeEndpoint]
 
     func validated() throws -> PrivateNetworkBridgeConfig {
-        _ = try bind.validated(context: "private network bridge bind")
+        _ = try bind?.validated(context: "private network bridge bind")
+        guard bind != nil || !peers.isEmpty else {
+            throw AppError("private network bridge must configure bind, peers, or both.")
+        }
         var seen = Set<PrivateNetworkBridgeEndpoint>()
         for peer in peers {
             let validatedPeer = try peer.validated(context: "private network bridge peer")

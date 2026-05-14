@@ -10,8 +10,8 @@ final class PrivateNetworkBridge {
     private let config: PrivateNetworkBridgeConfig
     fileprivate let nodeID = UUID()
     private let queue: DispatchQueue
-    private let listenerDescriptor: Int32
-    private let listenerSource: DispatchSourceRead
+    private var listenerDescriptor: Int32?
+    private var listenerSource: DispatchSourceRead?
     private var runtimes: [WeakRuntime] = []
     private var connections: [UUID: PrivateNetworkBridgeConnection] = [:]
     private var connectionsByRemoteNode: [UUID: UUID] = [:]
@@ -23,23 +23,33 @@ final class PrivateNetworkBridge {
         self.identifier = identifier
         self.config = try config.validated()
         queue = DispatchQueue(label: "okrun.private-network-bridge.\(identifier).\(UUID().uuidString)")
-        listenerDescriptor = try Self.makeIPv4Socket()
-        try Self.bind(listenerDescriptor, to: self.config.bind)
-        guard listen(listenerDescriptor, SOMAXCONN) == 0 else {
-            close(listenerDescriptor)
-            throw AppError("Failed to listen for private network bridge peers on \(self.config.bind.description): \(String(cString: strerror(errno))).")
-        }
-        try Self.setNonBlocking(listenerDescriptor)
 
-        listenerSource = DispatchSource.makeReadSource(fileDescriptor: listenerDescriptor, queue: queue)
-        listenerSource.setEventHandler { [weak self] in
-            self?.acceptConnections()
-        }
-        listenerSource.resume()
+        if let bind = self.config.bind {
+            let descriptor = try Self.makeIPv4Socket()
+            try Self.bind(descriptor, to: bind)
+            guard listen(descriptor, SOMAXCONN) == 0 else {
+                close(descriptor)
+                throw AppError("Failed to listen for private network bridge peers on \(bind.description): \(String(cString: strerror(errno))).")
+            }
+            try Self.setNonBlocking(descriptor)
 
-        AppLog.virtualMachine.info(
-            "Private network bridge listening privateNetwork=\(identifier, privacy: .public) endpoint=\(self.config.bind.description, privacy: .public)"
-        )
+            let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
+            source.setEventHandler { [weak self] in
+                self?.acceptConnections()
+            }
+            source.resume()
+
+            self.listenerDescriptor = descriptor
+            self.listenerSource = source
+
+            AppLog.virtualMachine.info(
+                "Private network bridge listening privateNetwork=\(identifier, privacy: .public) endpoint=\(bind.description, privacy: .public)"
+            )
+        } else {
+            AppLog.virtualMachine.info(
+                "Private network bridge running without listener privateNetwork=\(identifier, privacy: .public)"
+            )
+        }
 
         for peer in self.config.peers where peer != self.config.bind {
             scheduleOutboundConnection(to: peer, retryDelay: 0.1)
@@ -76,8 +86,10 @@ final class PrivateNetworkBridge {
         guard !isStopped else { return }
         isStopped = true
 
-        listenerSource.cancel()
-        close(listenerDescriptor)
+        listenerSource?.cancel()
+        if let listenerDescriptor {
+            close(listenerDescriptor)
+        }
 
         for (_, pending) in pendingConnects {
             pending.source.cancel()
@@ -93,6 +105,7 @@ final class PrivateNetworkBridge {
     }
 
     private func acceptConnections() {
+        guard let listenerDescriptor else { return }
         while true {
             var address = sockaddr_storage()
             var addressLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
