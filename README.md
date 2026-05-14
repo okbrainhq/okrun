@@ -40,10 +40,11 @@ Run the critical GUI smoke suite without booting a VM:
 
 This builds the app, launches it with an isolated registry at
 `.e2e/ui-add-delete`, drives the Add VM, validation, multi-VM selection,
-settings, delete, and fake running shutdown flows with macOS Accessibility
-automation, and saves screenshots under `.e2e/ui-add-delete/screenshots`. If
-macOS blocks the script, allow the current terminal or Codex app in System
-Settings > Privacy & Security > Accessibility and rerun it.
+private network config, settings, delete, and fake running shutdown flows with
+macOS Accessibility automation, and saves screenshots under
+`.e2e/ui-add-delete/screenshots`. If macOS blocks the script, allow the current
+terminal or Codex app in System Settings > Privacy & Security > Accessibility
+and rerun it.
 
 ## Projects
 

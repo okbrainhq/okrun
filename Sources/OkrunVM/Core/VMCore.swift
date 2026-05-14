@@ -615,9 +615,11 @@ enum NetworkDeviceFactory {
             )
             runtime.retainHostService(server)
         }
+        let dhcpRange = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier)
+            .map { try PrivateNetworkDHCPLeaseRange(config: $0) }
         let bridgeConfig = try hostNetworkConfigStore.bridgeConfigForPrivateNetwork(identifier: identifier)
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
-        try PrivateNetworkRuntimeRegistry.shared.retain(runtime, bridgeConfig: bridgeConfig)
+        try PrivateNetworkRuntimeRegistry.shared.retain(runtime, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
         onRetainPrivateNetworkRuntime?(runtime)
         return networkDevice
     }
@@ -647,10 +649,15 @@ final class PrivateNetworkRuntimeRegistry {
 
     private var runtimes: [PrivateNetworkRuntime] = []
     private var bridges: [String: PrivateNetworkBridge] = [:]
+    private var bridgeFailures: [String: PrivateNetworkBridgeStatus] = [:]
 
     private init() {}
 
-    func retain(_ runtime: PrivateNetworkRuntime, bridgeConfig: PrivateNetworkBridgeConfig? = nil) throws {
+    func retain(
+        _ runtime: PrivateNetworkRuntime,
+        bridgeConfig: PrivateNetworkBridgeConfig? = nil,
+        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
+    ) throws {
         runtimes.append(runtime)
         if let bridge = bridges[runtime.identifier] {
             bridge.addRuntime(runtime)
@@ -658,9 +665,41 @@ final class PrivateNetworkRuntimeRegistry {
         }
 
         guard let bridgeConfig else { return }
-        let bridge = try PrivateNetworkBridge(identifier: runtime.identifier, config: bridgeConfig)
+        let bridge = try PrivateNetworkBridge(identifier: runtime.identifier, config: bridgeConfig, dhcpRange: dhcpRange)
         bridge.addRuntime(runtime)
         bridges[runtime.identifier] = bridge
+        bridgeFailures[runtime.identifier] = nil
+    }
+
+    func configureBridge(
+        identifier: String,
+        bridgeConfig: PrivateNetworkBridgeConfig?,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) -> PrivateNetworkBridgeStatus {
+        bridges[identifier] = nil
+        guard let bridgeConfig else {
+            bridgeFailures[identifier] = nil
+            return .disabled(identifier: identifier)
+        }
+        do {
+            let bridge = try PrivateNetworkBridge(identifier: identifier, config: bridgeConfig, dhcpRange: dhcpRange)
+            bridges[identifier] = bridge
+            bridgeFailures[identifier] = nil
+            for runtime in runtimes where runtime.identifier == identifier {
+                bridge.addRuntime(runtime)
+            }
+            return bridge.statusSnapshot()
+        } catch {
+            let status = PrivateNetworkBridgeStatus.failed(identifier: identifier, error: error.localizedDescription)
+            bridgeFailures[identifier] = status
+            return status
+        }
+    }
+
+    func bridgeStatus(identifier: String) -> PrivateNetworkBridgeStatus {
+        bridges[identifier]?.statusSnapshot()
+            ?? bridgeFailures[identifier]
+            ?? .disabled(identifier: identifier)
     }
 
     func releaseAll() {

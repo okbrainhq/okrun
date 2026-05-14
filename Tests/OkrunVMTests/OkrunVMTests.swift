@@ -507,14 +507,23 @@ struct OkrunVMTests {
     func privateNetworkBridgeMessageRoundTripsFramedMessages() throws {
         let nodeID = UUID()
         let frame = Data([0xde, 0xad, 0xbe, 0xef])
+        let dhcpRange = PrivateNetworkDHCPLeaseRange(
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.109"
+        )
         var buffer = Data()
-        buffer.append(PrivateNetworkBridgeMessage.encodeHello(nodeID: nodeID, networkIdentifier: "okrun"))
+        buffer.append(PrivateNetworkBridgeMessage.encodeHello(
+            nodeID: nodeID,
+            networkIdentifier: "okrun",
+            dhcpRange: dhcpRange
+        ))
         buffer.append(PrivateNetworkBridgeMessage.encodeFrame(frame))
 
         let messages = try PrivateNetworkBridgeMessage.decodeMessages(from: &buffer)
 
         #expect(messages == [
-            .hello(nodeID: nodeID, networkIdentifier: "okrun"),
+            .hello(nodeID: nodeID, networkIdentifier: "okrun", dhcpRange: dhcpRange),
             .frame(frame)
         ])
         #expect(buffer.isEmpty)
@@ -555,6 +564,63 @@ struct OkrunVMTests {
         try sendFrame(frame, from: runtimeA.fileHandle, untilReceivedOn: runtimeB.fileHandle.fileDescriptor, timeout: 5)
         try sendFrame(frame, from: runtimeB.fileHandle, untilReceivedOn: runtimeA.fileHandle.fileDescriptor, timeout: 5)
         withExtendedLifetime((bridgeA, bridgeB, runtimeA, runtimeB)) {}
+    }
+
+    @Test
+    func privateNetworkBridgeRejectsOverlappingDHCPRanges() throws {
+        let network = "bridge-\(UUID().uuidString)"
+        let portA = try unusedLoopbackPort()
+        let endpointA = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA)
+        let bridgeA = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(bind: endpointA, peers: []),
+            dhcpRange: PrivateNetworkDHCPLeaseRange(
+                cidr: "10.77.0.0/24",
+                rangeStart: "10.77.0.20",
+                rangeEnd: "10.77.0.120"
+            )
+        )
+        let bridgeB = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpointA]),
+            dhcpRange: PrivateNetworkDHCPLeaseRange(
+                cidr: "10.77.0.0/24",
+                rangeStart: "10.77.0.110",
+                rangeEnd: "10.77.0.200"
+            )
+        )
+
+        let status = try waitForPeerState(
+            bridgeB,
+            endpoint: endpointA,
+            state: .rejected,
+            timeout: 5
+        )
+
+        #expect(status.message.localizedCaseInsensitiveContains("overlaps"))
+        withExtendedLifetime((bridgeA, bridgeB)) {}
+    }
+
+    @Test
+    func privateNetworkBridgeReportsPeerConnectionFailureDetails() throws {
+        let network = "bridge-\(UUID().uuidString)"
+        let endpoint = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: try unusedLoopbackPort())
+        let bridge = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpoint])
+        )
+
+        let status = try waitForPeerState(
+            bridge,
+            endpoint: endpoint,
+            state: .failed,
+            timeout: 5
+        )
+
+        #expect(status.message.contains("Failed to connect to \(endpoint.description)"))
+        #expect(status.message.contains("Retrying"))
+        #expect(status.message.contains("Bridge and Bind"))
+        withExtendedLifetime(bridge) {}
     }
 
     @Test
@@ -1105,6 +1171,23 @@ struct OkrunVMTests {
             }
         }
         throw AppError("Timed out sending private network bridge frame.")
+    }
+
+    private func waitForPeerState(
+        _ bridge: PrivateNetworkBridge,
+        endpoint: PrivateNetworkBridgeEndpoint,
+        state: PrivateNetworkBridgePeerState,
+        timeout: TimeInterval
+    ) throws -> PrivateNetworkBridgePeerStatus {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let status = bridge.statusSnapshot().peers.first(where: { $0.endpoint == endpoint }),
+               status.state == state {
+                return status
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        throw AppError("Timed out waiting for private network bridge peer state.")
     }
 
     private func waitForNoFrame(on descriptor: Int32, duration: TimeInterval) -> Bool {

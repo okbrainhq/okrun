@@ -1,6 +1,54 @@
 import Darwin
 import Foundation
 
+enum PrivateNetworkBridgePeerState: String, Equatable {
+    case connecting
+    case connected
+    case failed
+    case rejected
+}
+
+struct PrivateNetworkBridgePeerStatus: Equatable {
+    var endpoint: PrivateNetworkBridgeEndpoint
+    var state: PrivateNetworkBridgePeerState
+    var message: String
+
+    var isConnected: Bool {
+        state == .connected
+    }
+}
+
+struct PrivateNetworkBridgeStatus: Equatable {
+    var identifier: String
+    var bind: PrivateNetworkBridgeEndpoint?
+    var isListening: Bool
+    var bindMessage: String
+    var peers: [PrivateNetworkBridgePeerStatus]
+    var errorMessage: String?
+
+    static func disabled(identifier: String) -> PrivateNetworkBridgeStatus {
+        PrivateNetworkBridgeStatus(
+            identifier: identifier,
+            bind: nil,
+            isListening: false,
+            bindMessage: "Bridge disabled",
+            peers: [],
+            errorMessage: nil
+        )
+    }
+
+    static func failed(identifier: String, error: String) -> PrivateNetworkBridgeStatus {
+        PrivateNetworkBridgeStatus(
+            identifier: identifier,
+            bind: nil,
+            isListening: false,
+            bindMessage: "Bridge failed",
+            peers: [],
+            errorMessage: error
+        )
+    }
+}
+
 final class PrivateNetworkBridge {
     private struct WeakRuntime {
         weak var runtime: PrivateNetworkRuntime?
@@ -8,6 +56,7 @@ final class PrivateNetworkBridge {
 
     fileprivate let identifier: String
     private let config: PrivateNetworkBridgeConfig
+    fileprivate let dhcpRange: PrivateNetworkDHCPLeaseRange?
     fileprivate let nodeID = UUID()
     private let queue: DispatchQueue
     private var listenerDescriptor: Int32?
@@ -16,12 +65,18 @@ final class PrivateNetworkBridge {
     private var connections: [UUID: PrivateNetworkBridgeConnection] = [:]
     private var connectionsByRemoteNode: [UUID: UUID] = [:]
     private var pendingConnects: [UUID: (descriptor: Int32, source: DispatchSourceWrite)] = [:]
+    private var peerStatuses: [PrivateNetworkBridgeEndpoint: PrivateNetworkBridgePeerStatus] = [:]
     private var localMACs = Set<EthernetAddress>()
     private var isStopped = false
 
-    init(identifier: String, config: PrivateNetworkBridgeConfig) throws {
+    init(
+        identifier: String,
+        config: PrivateNetworkBridgeConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
+    ) throws {
         self.identifier = identifier
         self.config = try config.validated()
+        self.dhcpRange = dhcpRange
         queue = DispatchQueue(label: "okrun.private-network-bridge.\(identifier).\(UUID().uuidString)")
 
         if let bind = self.config.bind {
@@ -52,6 +107,11 @@ final class PrivateNetworkBridge {
         }
 
         for peer in self.config.peers where peer != self.config.bind {
+            peerStatuses[peer] = PrivateNetworkBridgePeerStatus(
+                endpoint: peer,
+                state: .connecting,
+                message: "Connecting"
+            )
             scheduleOutboundConnection(to: peer, retryDelay: 0.1)
         }
     }
@@ -79,6 +139,19 @@ final class PrivateNetworkBridge {
         queue.async { [weak self, weak runtime] in
             guard let self, let runtime else { return }
             self.runtimes.removeAll { $0.runtime == nil || $0.runtime === runtime }
+        }
+    }
+
+    func statusSnapshot() -> PrivateNetworkBridgeStatus {
+        queue.sync {
+            PrivateNetworkBridgeStatus(
+                identifier: identifier,
+                bind: config.bind,
+                isListening: listenerDescriptor != nil,
+                bindMessage: config.bind.map { "Listening on \($0.description)" } ?? "Not listening",
+                peers: config.peers.compactMap { peerStatuses[$0] },
+                errorMessage: nil
+            )
         }
     }
 
@@ -119,7 +192,7 @@ final class PrivateNetworkBridge {
                 do {
                     try Self.configureConnectedSocket(acceptedDescriptor)
                     try Self.setNonBlocking(acceptedDescriptor)
-                    addConnection(descriptor: acceptedDescriptor, isOutbound: false)
+                    addConnection(descriptor: acceptedDescriptor, isOutbound: false, configuredPeer: nil)
                 } catch {
                     close(acceptedDescriptor)
                     AppLog.virtualMachine.error(
@@ -148,6 +221,7 @@ final class PrivateNetworkBridge {
 
     private func startOutboundConnection(to peer: PrivateNetworkBridgeEndpoint, retryDelay: TimeInterval) {
         guard !isStopped else { return }
+        updatePeerStatus(peer, state: .connecting, message: connectingMessage(for: peer))
 
         do {
             let descriptor = try Self.makeIPv4Socket()
@@ -155,7 +229,7 @@ final class PrivateNetworkBridge {
 
             let connectResult = try Self.connect(descriptor, to: peer)
             if connectResult == 0 {
-                addConnection(descriptor: descriptor, isOutbound: true)
+                addConnection(descriptor: descriptor, isOutbound: true, configuredPeer: peer)
                 AppLog.virtualMachine.info(
                     "Private network bridge connected privateNetwork=\(self.identifier, privacy: .public) peer=\(peer.description, privacy: .public)"
                 )
@@ -165,6 +239,7 @@ final class PrivateNetworkBridge {
             guard errno == EINPROGRESS else {
                 let message = String(cString: strerror(errno))
                 close(descriptor)
+                updatePeerStatus(peer, state: .failed, message: connectionFailureMessage(peer: peer, error: message, retryDelay: retryDelay))
                 AppLog.virtualMachine.error(
                     "Private network bridge peer connect failed privateNetwork=\(self.identifier, privacy: .public) peer=\(peer.description, privacy: .public) error=\(message, privacy: .public)"
                 )
@@ -180,6 +255,7 @@ final class PrivateNetworkBridge {
             }
             source.resume()
         } catch {
+            updatePeerStatus(peer, state: .failed, message: connectionFailureMessage(peer: peer, error: error.localizedDescription, retryDelay: retryDelay))
             AppLog.virtualMachine.error(
                 "Private network bridge peer connect setup failed privateNetwork=\(self.identifier, privacy: .public) peer=\(peer.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
             )
@@ -209,6 +285,7 @@ final class PrivateNetworkBridge {
             let errorCode = result == 0 ? socketError : errno
             let message = String(cString: strerror(errorCode))
             close(pending.descriptor)
+            updatePeerStatus(peer, state: .failed, message: connectionFailureMessage(peer: peer, error: message, retryDelay: retryDelay))
             AppLog.virtualMachine.error(
                 "Private network bridge peer connect failed privateNetwork=\(self.identifier, privacy: .public) peer=\(peer.description, privacy: .public) error=\(message, privacy: .public)"
             )
@@ -216,32 +293,59 @@ final class PrivateNetworkBridge {
             return
         }
 
-        addConnection(descriptor: pending.descriptor, isOutbound: true)
+        addConnection(descriptor: pending.descriptor, isOutbound: true, configuredPeer: peer)
         AppLog.virtualMachine.info(
             "Private network bridge connected privateNetwork=\(self.identifier, privacy: .public) peer=\(peer.description, privacy: .public)"
         )
     }
 
-    private func addConnection(descriptor: Int32, isOutbound: Bool) {
+    private func addConnection(
+        descriptor: Int32,
+        isOutbound: Bool,
+        configuredPeer: PrivateNetworkBridgeEndpoint?
+    ) {
         let connection = PrivateNetworkBridgeConnection(
             descriptor: descriptor,
             isOutbound: isOutbound,
+            configuredPeer: configuredPeer,
             bridge: self,
             queue: queue
         )
         connections[connection.id] = connection
     }
 
-    fileprivate func receiveHello(from connection: PrivateNetworkBridgeConnection, remoteNodeID: UUID, networkIdentifier: String) {
+    fileprivate func receiveHello(
+        from connection: PrivateNetworkBridgeConnection,
+        remoteNodeID: UUID,
+        networkIdentifier: String,
+        remoteDHCPRange: PrivateNetworkDHCPLeaseRange?
+    ) {
         guard networkIdentifier == identifier else {
             AppLog.virtualMachine.error(
                 "Closing private network bridge connection with mismatched network local=\(self.identifier, privacy: .public) remote=\(networkIdentifier, privacy: .public)"
             )
+            connection.disableReconnect()
+            updatePeerStatus(for: connection, state: .rejected, message: "Network mismatch: \(networkIdentifier)")
             connection.close()
             return
         }
 
         guard remoteNodeID != nodeID else {
+            connection.disableReconnect()
+            updatePeerStatus(for: connection, state: .rejected, message: "Self connection")
+            connection.close()
+            return
+        }
+
+        if let localDHCPRange = dhcpRange,
+           let remoteDHCPRange,
+           (try? localDHCPRange.overlaps(remoteDHCPRange)) == true {
+            let message = "DHCP range overlaps peer: \(remoteDHCPRange.description)"
+            connection.disableReconnect()
+            updatePeerStatus(for: connection, state: .rejected, message: message)
+            AppLog.virtualMachine.error(
+                "Closing private network bridge connection due to overlapping DHCP ranges privateNetwork=\(self.identifier, privacy: .public) local=\(localDHCPRange.description, privacy: .public) remote=\(remoteDHCPRange.description, privacy: .public)"
+            )
             connection.close()
             return
         }
@@ -251,14 +355,17 @@ final class PrivateNetworkBridge {
            existing !== connection {
             let preferOutbound = nodeID.uuidString < remoteNodeID.uuidString
             if connection.isOutbound == preferOutbound {
+                existing.disableReconnect()
                 existing.close()
             } else {
+                connection.disableReconnect()
                 connection.close()
                 return
             }
         }
 
         connection.activate(remoteNodeID: remoteNodeID)
+        updatePeerStatus(for: connection, state: .connected, message: "Connected")
         connectionsByRemoteNode[remoteNodeID] = connection.id
     }
 
@@ -273,6 +380,48 @@ final class PrivateNetworkBridge {
            connectionsByRemoteNode[remoteNodeID] == connection.id {
             connectionsByRemoteNode.removeValue(forKey: remoteNodeID)
         }
+        if let peer = connection.configuredPeer, connection.shouldReconnect {
+            updatePeerStatus(
+                peer,
+                state: .failed,
+                message: "Disconnected from \(peer.description). Retrying in 1s."
+            )
+            scheduleOutboundConnection(to: peer, retryDelay: 1)
+        }
+    }
+
+    private func connectingMessage(for peer: PrivateNetworkBridgeEndpoint) -> String {
+        if let previous = peerStatuses[peer],
+           previous.state == .failed {
+            return "Connecting to \(peer.description). Last error: \(previous.message)"
+        }
+        return "Connecting to \(peer.description)."
+    }
+
+    private func connectionFailureMessage(
+        peer: PrivateNetworkBridgeEndpoint,
+        error: String,
+        retryDelay: TimeInterval
+    ) -> String {
+        let retrySeconds = max(1, Int(retryDelay.rounded()))
+        return "Failed to connect to \(peer.description): \(error). Retrying in \(retrySeconds)s. Check that the other host has Bridge and Bind enabled on this IP/port, and that macOS firewall allows the connection."
+    }
+
+    private func updatePeerStatus(
+        _ peer: PrivateNetworkBridgeEndpoint,
+        state: PrivateNetworkBridgePeerState,
+        message: String
+    ) {
+        peerStatuses[peer] = PrivateNetworkBridgePeerStatus(endpoint: peer, state: state, message: message)
+    }
+
+    private func updatePeerStatus(
+        for connection: PrivateNetworkBridgeConnection,
+        state: PrivateNetworkBridgePeerState,
+        message: String
+    ) {
+        guard let peer = connection.configuredPeer else { return }
+        updatePeerStatus(peer, state: state, message: message)
     }
 
     private func handleLocalFrame(_ frame: Data) {
@@ -372,7 +521,9 @@ fileprivate final class PrivateNetworkBridgeConnection {
 
     let id = UUID()
     let isOutbound: Bool
+    let configuredPeer: PrivateNetworkBridgeEndpoint?
     private(set) var state: State = .awaitingHello
+    private(set) var shouldReconnect: Bool
 
     var remoteNodeID: UUID? {
         if case .active(let remoteNodeID) = state {
@@ -397,11 +548,14 @@ fileprivate final class PrivateNetworkBridgeConnection {
     init(
         descriptor: Int32,
         isOutbound: Bool,
+        configuredPeer: PrivateNetworkBridgeEndpoint?,
         bridge: PrivateNetworkBridge,
         queue: DispatchQueue
     ) {
         self.descriptor = descriptor
         self.isOutbound = isOutbound
+        self.configuredPeer = configuredPeer
+        shouldReconnect = configuredPeer != nil
         self.bridge = bridge
         self.queue = queue
 
@@ -413,7 +567,8 @@ fileprivate final class PrivateNetworkBridgeConnection {
 
         enqueue(PrivateNetworkBridgeMessage.encodeHello(
             nodeID: bridge.nodeID,
-            networkIdentifier: bridge.identifier
+            networkIdentifier: bridge.identifier,
+            dhcpRange: bridge.dhcpRange
         ))
     }
 
@@ -424,6 +579,10 @@ fileprivate final class PrivateNetworkBridgeConnection {
     func sendFrame(_ frame: Data) {
         guard isActive else { return }
         enqueue(PrivateNetworkBridgeMessage.encodeFrame(frame))
+    }
+
+    func disableReconnect() {
+        shouldReconnect = false
     }
 
     func close() {
@@ -516,8 +675,13 @@ fileprivate final class PrivateNetworkBridgeConnection {
 
     private func handle(_ message: PrivateNetworkBridgeMessage) {
         switch message {
-        case .hello(let remoteNodeID, let networkIdentifier):
-            bridge?.receiveHello(from: self, remoteNodeID: remoteNodeID, networkIdentifier: networkIdentifier)
+        case .hello(let remoteNodeID, let networkIdentifier, let dhcpRange):
+            bridge?.receiveHello(
+                from: self,
+                remoteNodeID: remoteNodeID,
+                networkIdentifier: networkIdentifier,
+                remoteDHCPRange: dhcpRange
+            )
         case .frame(let frame):
             bridge?.receiveFrame(frame, from: self)
         }
@@ -525,19 +689,29 @@ fileprivate final class PrivateNetworkBridgeConnection {
 }
 
 enum PrivateNetworkBridgeMessage: Equatable {
-    case hello(nodeID: UUID, networkIdentifier: String)
+    case hello(nodeID: UUID, networkIdentifier: String, dhcpRange: PrivateNetworkDHCPLeaseRange?)
     case frame(Data)
 
     private static let helloType: UInt8 = 1
     private static let frameType: UInt8 = 2
     private static let maxPayloadLength = 70_000
 
-    static func encodeHello(nodeID: UUID, networkIdentifier: String) -> Data {
+    static func encodeHello(
+        nodeID: UUID,
+        networkIdentifier: String,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) -> Data {
         var payload = Data([helloType])
         payload.append(contentsOf: uuidBytes(nodeID))
-        let identifierBytes = Array(networkIdentifier.utf8)
-        appendUInt16(UInt16(identifierBytes.count), to: &payload)
-        payload.append(contentsOf: identifierBytes)
+        appendString(networkIdentifier, to: &payload)
+        if let dhcpRange {
+            payload.append(1)
+            appendString(dhcpRange.cidr, to: &payload)
+            appendString(dhcpRange.rangeStart, to: &payload)
+            appendString(dhcpRange.rangeEnd, to: &payload)
+        } else {
+            payload.append(0)
+        }
         return encodePayload(payload)
     }
 
@@ -592,17 +766,42 @@ enum PrivateNetworkBridgeMessage: Equatable {
                 throw AppError("Invalid private network bridge hello message.")
             }
             let nodeID = uuid(from: Array(payload[1..<17]))
-            let identifierLength = Int(readUInt16(payload, 17))
-            guard payload.count == 19 + identifierLength else {
+            var offset = 17
+            let networkIdentifier = try readString(payload, offset: &offset)
+            guard offset <= payload.count else {
                 throw AppError("Invalid private network bridge hello identifier length.")
             }
-            guard let networkIdentifier = String(
-                data: Data(payload[19..<(19 + identifierLength)]),
-                encoding: .utf8
-            ) else {
-                throw AppError("Invalid private network bridge hello identifier.")
+            if offset == payload.count {
+                return .hello(nodeID: nodeID, networkIdentifier: networkIdentifier, dhcpRange: nil)
             }
-            return .hello(nodeID: nodeID, networkIdentifier: networkIdentifier)
+
+            guard offset + 1 <= payload.count else {
+                throw AppError("Invalid private network bridge hello DHCP range flag.")
+            }
+            let dhcpRangeFlag = payload[offset]
+            offset += 1
+            guard dhcpRangeFlag == 0 || dhcpRangeFlag == 1 else {
+                throw AppError("Invalid private network bridge hello DHCP range flag.")
+            }
+            let hasDHCPRange = dhcpRangeFlag == 1
+            guard hasDHCPRange else {
+                guard offset == payload.count else {
+                    throw AppError("Invalid private network bridge hello payload length.")
+                }
+                return .hello(nodeID: nodeID, networkIdentifier: networkIdentifier, dhcpRange: nil)
+            }
+
+            let cidr = try readString(payload, offset: &offset)
+            let rangeStart = try readString(payload, offset: &offset)
+            let rangeEnd = try readString(payload, offset: &offset)
+            guard offset == payload.count else {
+                throw AppError("Invalid private network bridge hello DHCP range length.")
+            }
+            return .hello(
+                nodeID: nodeID,
+                networkIdentifier: networkIdentifier,
+                dhcpRange: PrivateNetworkDHCPLeaseRange(cidr: cidr, rangeStart: rangeStart, rangeEnd: rangeEnd)
+            )
         case frameType:
             return .frame(Data(payload.dropFirst()))
         default:
@@ -634,6 +833,12 @@ enum PrivateNetworkBridgeMessage: Equatable {
         data.append(UInt8(value & 0xff))
     }
 
+    private static func appendString(_ string: String, to data: inout Data) {
+        let bytes = Array(string.utf8)
+        appendUInt16(UInt16(bytes.count), to: &data)
+        data.append(contentsOf: bytes)
+    }
+
     private static func appendUInt32(_ value: UInt32, to data: inout Data) {
         data.append(UInt8((value >> 24) & 0xff))
         data.append(UInt8((value >> 16) & 0xff))
@@ -643,6 +848,20 @@ enum PrivateNetworkBridgeMessage: Equatable {
 
     private static func readUInt16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
         (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
+    }
+
+    private static func readString(_ bytes: [UInt8], offset: inout Int) throws -> String {
+        guard offset + 2 <= bytes.count else {
+            throw AppError("Invalid private network bridge string length.")
+        }
+        let length = Int(readUInt16(bytes, offset))
+        offset += 2
+        guard offset + length <= bytes.count,
+              let string = String(data: Data(bytes[offset..<(offset + length)]), encoding: .utf8) else {
+            throw AppError("Invalid private network bridge string value.")
+        }
+        offset += length
+        return string
     }
 
     private static func readUInt32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {

@@ -97,6 +97,37 @@ struct PrivateNetworkDHCPConfig: Codable, Equatable {
     }
 }
 
+struct PrivateNetworkDHCPLeaseRange: Codable, Equatable {
+    var cidr: String
+    var rangeStart: String
+    var rangeEnd: String
+
+    init(config: PrivateNetworkDHCPConfig) throws {
+        let validated = try config.validated()
+        cidr = validated.cidr
+        rangeStart = validated.rangeStart
+        rangeEnd = validated.rangeEnd
+    }
+
+    init(cidr: String, rangeStart: String, rangeEnd: String) {
+        self.cidr = cidr
+        self.rangeStart = rangeStart
+        self.rangeEnd = rangeEnd
+    }
+
+    var description: String {
+        "\(rangeStart)-\(rangeEnd) in \(cidr)"
+    }
+
+    func overlaps(_ other: PrivateNetworkDHCPLeaseRange) throws -> Bool {
+        let localStart = try IPv4Address(rangeStart)
+        let localEnd = try IPv4Address(rangeEnd)
+        let remoteStart = try IPv4Address(other.rangeStart)
+        let remoteEnd = try IPv4Address(other.rangeEnd)
+        return localStart.value <= remoteEnd.value && remoteStart.value <= localEnd.value
+    }
+}
+
 final class HostNetworkConfigStore {
     let home: OkrunHome
     private let url: URL
