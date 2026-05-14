@@ -10,6 +10,54 @@ struct HostNetworkConfig: Codable, Equatable {
 
 struct HostPrivateNetworkConfig: Codable, Equatable {
     var dhcp: PrivateNetworkDHCPConfig?
+    var bridge: PrivateNetworkBridgeConfig?
+}
+
+struct PrivateNetworkBridgeConfig: Codable, Equatable {
+    var bind: PrivateNetworkBridgeEndpoint?
+    var peers: [PrivateNetworkBridgeEndpoint]
+
+    func validated() throws -> PrivateNetworkBridgeConfig {
+        _ = try bind?.validated(context: "private network bridge bind")
+        guard bind != nil || !peers.isEmpty else {
+            throw AppError("private network bridge must configure bind, peers, or both.")
+        }
+        var seen = Set<PrivateNetworkBridgeEndpoint>()
+        for peer in peers {
+            let validatedPeer = try peer.validated(context: "private network bridge peer")
+            guard seen.insert(validatedPeer).inserted else {
+                throw AppError("private network bridge peers contains duplicate endpoint \(validatedPeer.description).")
+            }
+        }
+        return self
+    }
+}
+
+struct PrivateNetworkBridgeEndpoint: Codable, Equatable, Hashable {
+    var host: String
+    var port: Int
+
+    var description: String {
+        "\(host):\(port)"
+    }
+
+    func validated(context: String) throws -> PrivateNetworkBridgeEndpoint {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty else {
+            throw AppError("\(context) host must not be empty.")
+        }
+        guard trimmedHost.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
+            throw AppError("\(context) host must not contain NUL.")
+        }
+        var address = in_addr()
+        guard trimmedHost.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else {
+            throw AppError("\(context) host must be an IPv4 address.")
+        }
+        guard (1...65_535).contains(port) else {
+            throw AppError("\(context) port must be between 1 and 65535.")
+        }
+        return PrivateNetworkBridgeEndpoint(host: trimmedHost, port: port)
+    }
 }
 
 struct PrivateNetworkDHCPConfig: Codable, Equatable {
@@ -49,6 +97,37 @@ struct PrivateNetworkDHCPConfig: Codable, Equatable {
     }
 }
 
+struct PrivateNetworkDHCPLeaseRange: Codable, Equatable {
+    var cidr: String
+    var rangeStart: String
+    var rangeEnd: String
+
+    init(config: PrivateNetworkDHCPConfig) throws {
+        let validated = try config.validated()
+        cidr = validated.cidr
+        rangeStart = validated.rangeStart
+        rangeEnd = validated.rangeEnd
+    }
+
+    init(cidr: String, rangeStart: String, rangeEnd: String) {
+        self.cidr = cidr
+        self.rangeStart = rangeStart
+        self.rangeEnd = rangeEnd
+    }
+
+    var description: String {
+        "\(rangeStart)-\(rangeEnd) in \(cidr)"
+    }
+
+    func overlaps(_ other: PrivateNetworkDHCPLeaseRange) throws -> Bool {
+        let localStart = try IPv4Address(rangeStart)
+        let localEnd = try IPv4Address(rangeEnd)
+        let remoteStart = try IPv4Address(other.rangeStart)
+        let remoteEnd = try IPv4Address(other.rangeEnd)
+        return localStart.value <= remoteEnd.value && remoteStart.value <= localEnd.value
+    }
+}
+
 final class HostNetworkConfigStore {
     let home: OkrunHome
     private let url: URL
@@ -71,6 +150,7 @@ final class HostNetworkConfigStore {
         let config = try JSONDecoder().decode(HostNetworkConfig.self, from: data)
         for (_, privateNetwork) in config.privateNetworks {
             _ = try privateNetwork.dhcp?.validated()
+            _ = try privateNetwork.bridge?.validated()
         }
         return config
     }
@@ -90,9 +170,17 @@ final class HostNetworkConfigStore {
         return dhcp
     }
 
+    func bridgeConfigForPrivateNetwork(identifier: String) throws -> PrivateNetworkBridgeConfig? {
+        guard let bridge = try load().privateNetworks[identifier]?.bridge else {
+            return nil
+        }
+        return try bridge.validated()
+    }
+
     func save(_ config: HostNetworkConfig) throws {
         for (_, privateNetwork) in config.privateNetworks {
             _ = try privateNetwork.dhcp?.validated()
+            _ = try privateNetwork.bridge?.validated()
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -304,7 +392,7 @@ final class DHCPLeaseAllocator {
 
     func lease(for identity: String, requestedIP: IPv4Address?, now: Date = Date()) throws -> DHCPLease {
         try store.update { leases in
-            pruneExpired(&leases, now: now)
+            pruneUnavailableLeases(&leases, now: now)
             if let existing = leases.first(where: { $0.identity == identity }) {
                 let renewed = DHCPLease(
                     identity: identity,
@@ -336,7 +424,7 @@ final class DHCPLeaseAllocator {
 
     func requestedLease(for identity: String, requestedIP: IPv4Address?, now: Date = Date()) throws -> DHCPLease {
         try store.update { leases in
-            pruneExpired(&leases, now: now)
+            pruneUnavailableLeases(&leases, now: now)
             if let requestedIP {
                 guard isInRange(requestedIP) else {
                     throw AppError("Requested DHCP address \(requestedIP.description) is outside the configured range.")
@@ -397,7 +485,7 @@ final class DHCPLeaseAllocator {
     func decline(identity: String, address: IPv4Address, now: Date = Date()) throws {
         guard isInRange(address) else { return }
         try store.update { leases in
-            pruneExpired(&leases, now: now)
+            pruneUnavailableLeases(&leases, now: now)
             leases.removeAll { $0.identity == identity || $0.ipAddress == address }
             leases.append(DHCPLease(
                 identity: "declined:\(address.description)",
@@ -407,8 +495,8 @@ final class DHCPLeaseAllocator {
         }
     }
 
-    private func pruneExpired(_ leases: inout [DHCPLease], now: Date) {
-        leases.removeAll { $0.expiresAt <= now }
+    private func pruneUnavailableLeases(_ leases: inout [DHCPLease], now: Date) {
+        leases.removeAll { $0.expiresAt <= now || !isInRange($0.ipAddress) }
     }
 
     private func replace(_ lease: DHCPLease, in leases: inout [DHCPLease]) {

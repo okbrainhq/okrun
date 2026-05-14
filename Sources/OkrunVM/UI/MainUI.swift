@@ -350,6 +350,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private var installerButton: NSButton!
     private var startButton: NSButton!
     private var shutdownButton: NSButton!
+    private var networkButton: NSButton!
     private let projectStore = ProjectStore()
     private var registry = ProjectRegistry.empty
     private var sessions: [VMTabSession] = []
@@ -537,6 +538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         mainPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
         mainPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        networkButton = makeSidebarNetworkButton()
         let sidebarNewButton = makeSidebarNewVMButton()
         let sidebarHeader = NSView()
         sidebarHeader.translatesAutoresizingMaskIntoConstraints = false
@@ -546,6 +548,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         tabStack.alignment = .leading
         tabStack.spacing = 0
         tabStack.translatesAutoresizingMaskIntoConstraints = false
+        sidebarHeader.addSubview(networkButton)
         sidebarHeader.addSubview(sidebarNewButton)
         tabPanel.addSubview(sidebarHeader)
         tabPanel.addSubview(tabStack)
@@ -597,7 +600,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             sidebarHeader.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
             sidebarHeader.topAnchor.constraint(equalTo: tabPanel.topAnchor),
             sidebarHeader.heightAnchor.constraint(equalToConstant: 46),
-            sidebarNewButton.trailingAnchor.constraint(equalTo: sidebarHeader.trailingAnchor, constant: -12),
+            networkButton.trailingAnchor.constraint(equalTo: sidebarHeader.trailingAnchor, constant: -12),
+            networkButton.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor),
+            sidebarNewButton.trailingAnchor.constraint(equalTo: networkButton.leadingAnchor, constant: -8),
             sidebarNewButton.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor),
             tabStack.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
             tabStack.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
@@ -665,6 +670,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private func makeSidebarNewVMButton() -> NSButton {
         let button = HoverIconButton(symbolName: "plus", label: "New VM", target: self, action: #selector(createProject))
         button.setAccessibilityIdentifier("okrun.new-vm")
+        button.normalTint = .labelColor
+        button.disabledTint = NSColor.labelColor.withAlphaComponent(0.35)
+        button.hoverBackground = NSColor.white.withAlphaComponent(0.12)
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        return button
+    }
+
+    private func makeSidebarNetworkButton() -> NSButton {
+        let button = HoverIconButton(symbolName: "network", label: "Private Network", target: self, action: #selector(openNetworkConfig))
+        button.setAccessibilityIdentifier("okrun.network-config")
         button.normalTint = .labelColor
         button.disabledTint = NSColor.labelColor.withAlphaComponent(0.35)
         button.hoverBackground = NSColor.white.withAlphaComponent(0.12)

@@ -40,10 +40,11 @@ Run the critical GUI smoke suite without booting a VM:
 
 This builds the app, launches it with an isolated registry at
 `.e2e/ui-add-delete`, drives the Add VM, validation, multi-VM selection,
-settings, delete, and fake running shutdown flows with macOS Accessibility
-automation, and saves screenshots under `.e2e/ui-add-delete/screenshots`. If
-macOS blocks the script, allow the current terminal or Codex app in System
-Settings > Privacy & Security > Accessibility and rerun it.
+private network config, settings, delete, and fake running shutdown flows with
+macOS Accessibility automation, and saves screenshots under
+`.e2e/ui-add-delete/screenshots`. If macOS blocks the script, allow the current
+terminal or Codex app in System Settings > Privacy & Security > Accessibility
+and rerun it.
 
 ## Projects
 
@@ -97,8 +98,7 @@ filesystem before booting it for normal use again.
   },
   "installerISOPath": "/path/to/linux.iso",
   "privateNetwork": {
-    "enabled": false,
-    "identifier": "okrun"
+    "enabled": true
   },
   "sharedDirectories": [
     {
@@ -168,13 +168,14 @@ The health log rotates in place at 10 MB and keeps 5 old files by default:
 `guest-health.log`, `guest-health.log.1`, and so on. Override this with
 `OKRUN_LOG_MAX_BYTES` and `OKRUN_LOG_KEEP` in `/etc/okrun/guest-tools.env`.
 
-When a VM has `privateNetwork.enabled` in `okrun-vm.json`, the installer
-auto-detects the private interface and configures it for IPv4 DHCP. The private
-NIC intentionally does not install DNS or routes, so internet access keeps using
-the NAT interface.
+The private network is enabled by default. When a VM has
+`privateNetwork.enabled` in `okrun-vm.json`, the installer auto-detects the
+private interface and configures it for IPv4 DHCP. The private NIC intentionally
+does not install DNS or routes, so internet access keeps using the NAT
+interface.
 
-Okrun creates host DHCP config automatically the first time a VM starts with a
-private-network identifier. For `okrun`, the generated default is written to
+Okrun creates host DHCP config automatically the first time a VM starts with the
+`okrun` private network. The generated default is written to
 `~/.okrun/private-networks.json` like this:
 
 ```json
@@ -195,10 +196,10 @@ private-network identifier. For `okrun`, the generated default is written to
 }
 ```
 
-Okrun stores DHCP leases under `~/.okrun/state/private-networks/<identifier>/`.
+Okrun stores DHCP leases under `~/.okrun/state/private-networks/okrun/`.
 `OKRUN_HOME` can point Okrun at a different state directory, and
 `OKRUN_REGISTRY_PATH` still overrides only the project registry path.
-Set `"enabled": false` for an identifier's DHCP config to opt out.
+Set `"enabled": false` for the DHCP config to opt out.
 
 If a guest already has an Okrun-managed static private-network file, the default
 installer run leaves it unchanged. Pass `--private-dhcp` to replace that
@@ -235,27 +236,93 @@ systemctl status okrun-guest-health.service
 
 ## Private VM Network
 
-`privateNetwork` adds a second virtual NIC backed by an OkRUn-local Ethernet
-bus. Keep the regular NAT NIC for internet access, and use this private NIC for
-VM-to-VM traffic with static IPs configured inside Linux. This network is local
-to OkRUn on the Mac; it does not depend on your Wi-Fi, router, or bridged
-networking support.
+`privateNetwork` adds a second virtual NIC backed by the `okrun` Ethernet bus.
+Keep the regular NAT NIC for internet access, and use this private NIC for
+VM-to-VM traffic. By default, the bus is local to one Mac. You can optionally
+bridge it to other Macs on the same LAN through `~/.okrun/private-networks.json`.
 
 ### Enable the Network
 
-Enable it in each VM's `okrun-vm.json`. VMs with the same `identifier` share one
-private network:
+The private network is enabled by default. To be explicit, set this in each VM's
+`okrun-vm.json`:
 
 ```json
 {
   "privateNetwork": {
-    "enabled": true,
-    "identifier": "okrun"
+    "enabled": true
   }
 }
 ```
 
+Set `"enabled": false` to remove the private NIC from a VM. Older configs with a
+`privateNetwork.identifier` field are still accepted, but Okrun now uses the
+single `okrun` network for normal VM config.
+
 Fully stop and restart the VMs after changing the config.
+
+### Bridge Multiple Hosts
+
+To extend the `okrun` bus across Macs on the same LAN, add a `bridge` section to
+the global config. `bind` is optional: use it on hosts that should accept
+incoming peers, and use `peers` on hosts that should connect out. Once connected,
+the bridge connection carries traffic both ways.
+
+Host A, listening on `192.168.1.10:7777`:
+
+```json
+{
+  "version": 1,
+  "privateNetworks": {
+    "okrun": {
+      "dhcp": {
+        "enabled": true,
+        "mode": "range",
+        "cidr": "10.77.0.0/24",
+        "rangeStart": "10.77.0.20",
+        "rangeEnd": "10.77.0.200",
+        "leaseSeconds": 3600
+      },
+      "bridge": {
+        "bind": {
+          "host": "192.168.1.10",
+          "port": 7777
+        },
+        "peers": [
+          {
+            "host": "192.168.1.11",
+            "port": 7777
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Host B can either bind on its own IP or omit `bind` and only list Host A in
+`peers`. Local guest traffic still reaches guests on the same Mac directly.
+Okrun forwards local guest frames to connected hosts and injects remote frames
+into local guests, but it does not relay remote frames onward to other hosts.
+
+For a client-only host, omit `bind`:
+
+```json
+{
+  "version": 1,
+  "privateNetworks": {
+    "okrun": {
+      "bridge": {
+        "peers": [
+          {
+            "host": "192.168.1.10",
+            "port": 7777
+          }
+        ]
+      }
+    }
+  }
+}
+```
 
 ### Find the Private Interface
 

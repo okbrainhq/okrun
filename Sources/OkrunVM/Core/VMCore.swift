@@ -389,7 +389,8 @@ struct VMConfig: Codable, Equatable {
             memoryGB: 4,
             diskGB: 64,
             installerISOPath: nil,
-            diskFormat: .defaultForNewProjects
+            diskFormat: .defaultForNewProjects,
+            privateNetwork: .enabled
         )
     }
 
@@ -419,7 +420,7 @@ struct VMConfig: Codable, Equatable {
         diskGB: Int,
         installerISOPath: String?,
         diskFormat: DiskImageFormat = .raw,
-        privateNetwork: PrivateNetworkConfig = .disabled,
+        privateNetwork: PrivateNetworkConfig = .enabled,
         sharedDirectories: [SharedDirectoryConfig] = [],
         diskIO: DiskIOConfig = .defaults
     ) {
@@ -440,7 +441,7 @@ struct VMConfig: Codable, Equatable {
         diskGB = try container.decode(Int.self, forKey: .diskGB)
         diskFormat = try container.decodeIfPresent(DiskImageFormat.self, forKey: .diskFormat) ?? .raw
         installerISOPath = try container.decodeIfPresent(String.self, forKey: .installerISOPath)
-        privateNetwork = try container.decodeIfPresent(PrivateNetworkConfig.self, forKey: .privateNetwork) ?? .disabled
+        privateNetwork = try container.decodeIfPresent(PrivateNetworkConfig.self, forKey: .privateNetwork) ?? .enabled
         sharedDirectories = try container.decodeIfPresent([SharedDirectoryConfig].self, forKey: .sharedDirectories) ?? []
         diskIO = try container.decodeIfPresent(DiskIOConfig.self, forKey: .diskIO) ?? .defaults
     }
@@ -458,7 +459,9 @@ struct VMConfig: Codable, Equatable {
 
         let data = try Data(contentsOf: url)
         let config = try JSONDecoder().decode(VMConfig.self, from: data).validated()
-        if !Self.configDataContainsDiskFormat(data) || !Self.configDataContainsDiskIO(data) {
+        if !Self.configDataContainsDiskFormat(data)
+            || !Self.configDataContainsDiskIO(data)
+            || !Self.configDataContainsPrivateNetwork(data) {
             try config.save(to: url)
         }
         return config
@@ -497,6 +500,10 @@ struct VMConfig: Codable, Equatable {
         configData(data, contains: CodingKeys.diskIO.rawValue)
     }
 
+    private static func configDataContainsPrivateNetwork(_ data: Data) -> Bool {
+        configData(data, contains: CodingKeys.privateNetwork.rawValue)
+    }
+
     private static func configData(_ data: Data, contains key: String) -> Bool {
         guard let object = try? JSONSerialization.jsonObject(with: data),
               let dictionary = object as? [String: Any] else {
@@ -508,6 +515,7 @@ struct VMConfig: Codable, Equatable {
 
 struct PrivateNetworkConfig: Codable, Equatable {
     static let disabled = PrivateNetworkConfig(enabled: false)
+    static let enabled = PrivateNetworkConfig(enabled: true)
     static let defaultIdentifier = "okrun"
 
     let enabled: Bool
@@ -526,7 +534,12 @@ struct PrivateNetworkConfig: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try container.decode(Bool.self, forKey: .enabled)
-        identifier = try container.decodeIfPresent(String.self, forKey: .identifier) ?? Self.defaultIdentifier
+        identifier = Self.defaultIdentifier
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(enabled, forKey: .enabled)
     }
 
     func validated() throws -> PrivateNetworkConfig {
@@ -602,8 +615,11 @@ enum NetworkDeviceFactory {
             )
             runtime.retainHostService(server)
         }
+        let dhcpRange = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier)
+            .map { try PrivateNetworkDHCPLeaseRange(config: $0) }
+        let bridgeConfig = try hostNetworkConfigStore.bridgeConfigForPrivateNetwork(identifier: identifier)
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
-        PrivateNetworkRuntimeRegistry.shared.retain(runtime)
+        try PrivateNetworkRuntimeRegistry.shared.retain(runtime, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
         onRetainPrivateNetworkRuntime?(runtime)
         return networkDevice
     }
@@ -632,26 +648,93 @@ final class PrivateNetworkRuntimeRegistry {
     static let shared = PrivateNetworkRuntimeRegistry()
 
     private var runtimes: [PrivateNetworkRuntime] = []
+    private var bridges: [String: PrivateNetworkBridge] = [:]
+    private var bridgeFailures: [String: PrivateNetworkBridgeStatus] = [:]
 
     private init() {}
 
-    func retain(_ runtime: PrivateNetworkRuntime) {
+    func retain(
+        _ runtime: PrivateNetworkRuntime,
+        bridgeConfig: PrivateNetworkBridgeConfig? = nil,
+        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
+    ) throws {
         runtimes.append(runtime)
+        if let bridge = bridges[runtime.identifier] {
+            bridge.addRuntime(runtime)
+            return
+        }
+
+        guard let bridgeConfig else { return }
+        let bridge = try PrivateNetworkBridge(identifier: runtime.identifier, config: bridgeConfig, dhcpRange: dhcpRange)
+        bridge.addRuntime(runtime)
+        bridges[runtime.identifier] = bridge
+        bridgeFailures[runtime.identifier] = nil
+    }
+
+    func configureBridge(
+        identifier: String,
+        bridgeConfig: PrivateNetworkBridgeConfig?,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) -> PrivateNetworkBridgeStatus {
+        guard let bridgeConfig else {
+            bridges[identifier] = nil
+            bridgeFailures[identifier] = nil
+            return .disabled(identifier: identifier)
+        }
+        if let existingBridge = bridges[identifier],
+           existingBridge.matches(config: bridgeConfig, dhcpRange: dhcpRange) {
+            return existingBridge.statusSnapshot()
+        }
+        bridges[identifier] = nil
+        do {
+            let bridge = try PrivateNetworkBridge(identifier: identifier, config: bridgeConfig, dhcpRange: dhcpRange)
+            bridges[identifier] = bridge
+            bridgeFailures[identifier] = nil
+            for runtime in runtimes where runtime.identifier == identifier {
+                bridge.addRuntime(runtime)
+            }
+            return bridge.statusSnapshot()
+        } catch {
+            let status = PrivateNetworkBridgeStatus.failed(identifier: identifier, error: error.localizedDescription)
+            bridgeFailures[identifier] = status
+            return status
+        }
+    }
+
+    func hasBridge(identifier: String) -> Bool {
+        bridges[identifier] != nil
+    }
+
+    func bridgeStatus(identifier: String) -> PrivateNetworkBridgeStatus {
+        bridges[identifier]?.statusSnapshot()
+            ?? bridgeFailures[identifier]
+            ?? .disabled(identifier: identifier)
     }
 
     func releaseAll() {
+        for runtime in runtimes {
+            bridges[runtime.identifier]?.removeRuntime(runtime)
+        }
         runtimes.removeAll()
+        bridges.removeAll()
     }
 
     func release(_ ownedRuntimes: [PrivateNetworkRuntime]) {
         guard !ownedRuntimes.isEmpty else { return }
+        for runtime in ownedRuntimes {
+            bridges[runtime.identifier]?.removeRuntime(runtime)
+        }
         runtimes.removeAll { runtime in
             ownedRuntimes.contains { $0 === runtime }
+        }
+        for identifier in Array(bridges.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
+            bridges[identifier] = nil
         }
     }
 }
 
 final class PrivateNetworkRuntime {
+    let identifier: String
     let fileHandle: FileHandle
 
     private let bridgeDescriptor: Int32
@@ -666,6 +749,7 @@ final class PrivateNetworkRuntime {
     private var hostServices: [AnyObject] = []
 
     init(identifier: String) throws {
+        self.identifier = identifier
         var descriptors: [Int32] = [0, 0]
         guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &descriptors) == 0 else {
             throw AppError("Failed to create private network socket pair: \(String(cString: strerror(errno))).")

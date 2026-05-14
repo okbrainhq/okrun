@@ -87,6 +87,106 @@ clickButton("$label", "$identifier")
 APPLESCRIPT
 }
 
+click_checkbox() {
+  local identifier="$1"
+  osascript <<APPLESCRIPT
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        try
+          click (first UI element of entire contents of window 1 whose role is "AXCheckBox" and identifier is "$identifier")
+          return true
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for checkbox: $identifier"
+APPLESCRIPT
+}
+
+set_accessibility_value() {
+  local identifier="$1"
+  local text="$2"
+  osascript <<APPLESCRIPT
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        try
+          set targetElement to first UI element of entire contents of window 1 whose identifier is "$identifier"
+          set value of targetElement to "$text"
+          return true
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for editable element: $identifier"
+APPLESCRIPT
+}
+
+wait_for_accessibility_value() {
+  local identifier="$1"
+  local expected="$2"
+  osascript <<APPLESCRIPT
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        try
+          set targetElement to first UI element of entire contents of window 1 whose identifier is "$identifier"
+          set targetValue to ""
+          try
+            set targetValue to value of targetElement as text
+          end try
+          if targetValue contains "$expected" then return true
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for $identifier to contain: $expected"
+APPLESCRIPT
+}
+
 click_window_offset() {
   local x_offset="$1"
   local y_offset="$2"
@@ -517,6 +617,49 @@ run_add_dialog_validation() {
   cleanup
 }
 
+run_network_config_smoke() {
+  printf 'Running network config smoke...\n'
+  local test_dir="$ARTIFACT_DIR/network-config"
+  local registry_path="$test_dir/.okrun"
+  local home_path="$test_dir/home"
+  local bind_port=$((20000 + $$ % 20000))
+  local peer_port=$((bind_port + 1))
+
+  rm -rf "$test_dir"
+  mkdir -p "$test_dir"
+  write_empty_registry "$registry_path"
+
+  launch_app "$registry_path" "$home_path"
+  click_button "Private Network" "okrun.network-config"
+  wait_for_file "$home_path/private-networks.json"
+  capture "08-network-config-open"
+
+  click_checkbox "okrun.network.bridge.enabled"
+  click_checkbox "okrun.network.bridge.bind-enabled"
+  set_accessibility_value "okrun.network.bridge.bind-host" "127.0.0.1"
+  set_accessibility_value "okrun.network.bridge.bind-port" "$bind_port"
+  set_accessibility_value "okrun.network.bridge.peer-host" "127.0.0.1"
+  set_accessibility_value "okrun.network.bridge.peer-port" "$peer_port"
+  click_button "Add Peer" "okrun.network.bridge.peer-add"
+  click_button "Apply & Connect" "okrun.network.apply"
+
+  grep -Fq '"bridge"' "$home_path/private-networks.json"
+  grep -Fq '"host" : "127.0.0.1"' "$home_path/private-networks.json"
+  grep -Fq "\"port\" : $bind_port" "$home_path/private-networks.json"
+  grep -Fq "\"port\" : $peer_port" "$home_path/private-networks.json"
+  wait_for_accessibility_value "okrun.network.status.bind" "Listening on 127.0.0.1:$bind_port"
+
+  click_button "Remove Peer" "okrun.network.bridge.peer-remove"
+  click_button "Apply & Connect" "okrun.network.apply"
+  if grep -Fq "\"port\" : $peer_port" "$home_path/private-networks.json"; then
+    printf 'Peer was not removed from private network config.\n' >&2
+    exit 1
+  fi
+  capture "09-network-config-bound"
+  click_button "Close" "okrun.network.close"
+  cleanup
+}
+
 run_registry_restore_and_selection() {
   printf 'Running registry restore and multi-VM selection...\n'
   local test_dir="$ARTIFACT_DIR/registry-selection"
@@ -615,6 +758,7 @@ mkdir -p "$SCREENSHOT_DIR"
 
 run_project_lifecycle_smoke
 run_add_dialog_validation
+run_network_config_smoke
 run_registry_restore_and_selection
 run_titlebar_zoom_keeps_sidebar_visible
 run_fake_running_close_flow
