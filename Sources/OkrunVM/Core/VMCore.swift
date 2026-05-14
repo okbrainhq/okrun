@@ -676,11 +676,16 @@ final class PrivateNetworkRuntimeRegistry {
         bridgeConfig: PrivateNetworkBridgeConfig?,
         dhcpRange: PrivateNetworkDHCPLeaseRange?
     ) -> PrivateNetworkBridgeStatus {
-        bridges[identifier] = nil
         guard let bridgeConfig else {
+            bridges[identifier] = nil
             bridgeFailures[identifier] = nil
             return .disabled(identifier: identifier)
         }
+        if let existingBridge = bridges[identifier],
+           existingBridge.matches(config: bridgeConfig, dhcpRange: dhcpRange) {
+            return existingBridge.statusSnapshot()
+        }
+        bridges[identifier] = nil
         do {
             let bridge = try PrivateNetworkBridge(identifier: identifier, config: bridgeConfig, dhcpRange: dhcpRange)
             bridges[identifier] = bridge
@@ -694,6 +699,10 @@ final class PrivateNetworkRuntimeRegistry {
             bridgeFailures[identifier] = status
             return status
         }
+    }
+
+    func hasBridge(identifier: String) -> Bool {
+        bridges[identifier] != nil
     }
 
     func bridgeStatus(identifier: String) -> PrivateNetworkBridgeStatus {

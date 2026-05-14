@@ -624,6 +624,34 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkBridgeReportsConfiguredPeerConnectedViaInboundConnection() throws {
+        let network = "bridge-\(UUID().uuidString)"
+        let endpointA = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: try unusedLoopbackPort())
+        let endpointB = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: try unusedLoopbackPort())
+        let bridgeA = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(bind: endpointA, peers: [endpointB])
+        )
+        let bridgeB = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpointA])
+        )
+
+        let status = try waitForPeerState(
+            bridgeA,
+            endpoint: endpointB,
+            state: .connected,
+            timeout: 5
+        )
+        #expect(status.message.contains("inbound bridge connection"))
+
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1.2))
+        let statusAfterRetryWindow = bridgeA.statusSnapshot().peers.first { $0.endpoint == endpointB }
+        #expect(statusAfterRetryWindow?.state == .connected)
+        withExtendedLifetime((bridgeA, bridgeB)) {}
+    }
+
+    @Test
     func privateNetworkBridgeDoesNotRelayRemoteFramesToOtherHosts() throws {
         let network = "bridge-\(UUID().uuidString)"
         let portB = try unusedLoopbackPort()

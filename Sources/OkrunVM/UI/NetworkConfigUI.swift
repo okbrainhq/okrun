@@ -28,39 +28,149 @@ private final class NetworkConfigPanelActions: NSObject {
     }
 }
 
-private final class NetworkPeerTableDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
-    var peers: [PrivateNetworkBridgeEndpoint] = []
-
-    func numberOfRows(in tableView: NSTableView) -> Int {
-        peers.count
+private final class NetworkPeerRowView: NSView {
+    let index: Int?
+    var onSelect: ((Int) -> Void)?
+    var isSelected = false {
+        didSet {
+            layer?.backgroundColor = isSelected
+                ? NSColor.controlAccentColor.withAlphaComponent(0.25).cgColor
+                : backgroundColor.cgColor
+        }
     }
 
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < peers.count else { return nil }
-        let peer = peers[row]
-        let value: String
-        switch tableColumn?.identifier.rawValue {
-        case "host":
-            value = peer.host
-        case "port":
-            value = "\(peer.port)"
-        default:
-            value = peer.description
+    private let backgroundColor: NSColor
+
+    init(host: String, port: String, index: Int?, isHeader: Bool = false) {
+        self.index = index
+        backgroundColor = isHeader ? NSColor(calibratedWhite: 0.12, alpha: 1) : NSColor(calibratedWhite: 0.16, alpha: 1)
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.backgroundColor = backgroundColor.cgColor
+
+        let hostLabel = NSTextField(labelWithString: host)
+        hostLabel.translatesAutoresizingMaskIntoConstraints = false
+        hostLabel.font = isHeader ? .systemFont(ofSize: 12, weight: .semibold) : .monospacedSystemFont(ofSize: 12, weight: .regular)
+        hostLabel.textColor = .labelColor
+        hostLabel.lineBreakMode = .byTruncatingMiddle
+
+        let portLabel = NSTextField(labelWithString: port)
+        portLabel.translatesAutoresizingMaskIntoConstraints = false
+        portLabel.font = hostLabel.font
+        portLabel.textColor = .labelColor
+        portLabel.alignment = .center
+
+        addSubview(hostLabel)
+        addSubview(portLabel)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 26),
+            hostLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            hostLabel.trailingAnchor.constraint(equalTo: portLabel.leadingAnchor, constant: -12),
+            hostLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            portLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            portLabel.widthAnchor.constraint(equalToConstant: 96),
+            portLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let index else { return }
+        onSelect?(index)
+    }
+}
+
+private final class NetworkPeerListView: NSView {
+    private let rows = NSStackView()
+    private var selectedIndex: Int?
+
+    var peers: [PrivateNetworkBridgeEndpoint] {
+        get { peerStorage }
+        set {
+            peerStorage = newValue
+            if let selectedIndex, selectedIndex >= newValue.count {
+                self.selectedIndex = nil
+            }
+            rebuildRows()
+        }
+    }
+    private var peerStorage: [PrivateNetworkBridgeEndpoint] = []
+
+    var selectedRow: Int {
+        selectedIndex ?? -1
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        wantsLayer = true
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.13).cgColor
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1).cgColor
+        layer?.masksToBounds = true
+
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        rows.orientation = .vertical
+        rows.alignment = .width
+        rows.spacing = 1
+
+        setAccessibilityIdentifier("okrun.network.bridge.peer-list")
+        addSubview(rows)
+        NSLayoutConstraint.activate([
+            rows.leadingAnchor.constraint(equalTo: leadingAnchor),
+            rows.trailingAnchor.constraint(equalTo: trailingAnchor),
+            rows.topAnchor.constraint(equalTo: topAnchor),
+            rows.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor),
+            rows.widthAnchor.constraint(equalTo: widthAnchor)
+        ])
+        rebuildRows()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func selectRowIndexes(_ indexes: IndexSet, byExtendingSelection: Bool) {
+        selectedIndex = indexes.first
+        updateSelection()
+    }
+
+    private func rebuildRows() {
+        rows.arrangedSubviews.forEach { view in
+            rows.removeArrangedSubview(view)
+            view.removeFromSuperview()
         }
 
-        let cell = NSTableCellView()
-        let text = NSTextField(labelWithString: value)
-        text.translatesAutoresizingMaskIntoConstraints = false
-        text.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        text.lineBreakMode = .byTruncatingMiddle
-        cell.addSubview(text)
-        cell.textField = text
-        NSLayoutConstraint.activate([
-            text.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
-            text.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
-            text.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
-        ])
-        return cell
+        rows.addArrangedSubview(NetworkPeerRowView(host: "Host", port: "Port", index: nil, isHeader: true))
+        if peerStorage.isEmpty {
+            let empty = NetworkPeerRowView(host: "No peers configured", port: "", index: nil)
+            empty.alphaValue = 0.65
+            rows.addArrangedSubview(empty)
+        } else {
+            for (index, peer) in peerStorage.enumerated() {
+                let row = NetworkPeerRowView(host: peer.host, port: "\(peer.port)", index: index)
+                row.onSelect = { [weak self] selected in
+                    self?.selectedIndex = selected
+                    self?.updateSelection()
+                }
+                rows.addArrangedSubview(row)
+            }
+        }
+        updateSelection()
+    }
+
+    private func updateSelection() {
+        for view in rows.arrangedSubviews {
+            guard let row = view as? NetworkPeerRowView else { continue }
+            row.isSelected = row.index == selectedIndex
+        }
     }
 }
 
@@ -68,10 +178,10 @@ extension AppDelegate {
     @objc func openNetworkConfig() {
         let identifier = PrivateNetworkConfig.defaultIdentifier
         let store = HostNetworkConfigStore()
-        var timer: Timer?
+        var timer: DispatchSourceTimer?
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 740),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 780),
             styleMask: [.titled],
             backing: .buffered,
             defer: false
@@ -127,35 +237,14 @@ extension AppDelegate {
         addPeerButton.widthAnchor.constraint(equalToConstant: 96).isActive = true
         removePeerButton.widthAnchor.constraint(equalToConstant: 116).isActive = true
 
-        let peerDataSource = NetworkPeerTableDataSource()
-        let peersTable = NSTableView()
-        peersTable.setAccessibilityIdentifier("okrun.network.bridge.peer-list")
-        peersTable.delegate = peerDataSource
-        peersTable.dataSource = peerDataSource
-        peersTable.usesAlternatingRowBackgroundColors = true
-        peersTable.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1)
-        peersTable.rowHeight = 24
-        let hostColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("host"))
-        hostColumn.title = "Host"
-        hostColumn.width = 360
-        let portColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("port"))
-        portColumn.title = "Port"
-        portColumn.width = 112
-        peersTable.addTableColumn(hostColumn)
-        peersTable.addTableColumn(portColumn)
-
-        let peersScroll = NSScrollView()
-        peersScroll.translatesAutoresizingMaskIntoConstraints = false
-        peersScroll.borderType = .bezelBorder
-        peersScroll.hasVerticalScroller = true
-        peersScroll.documentView = peersTable
-        peersScroll.heightAnchor.constraint(equalToConstant: 96).isActive = true
+        let peersTable = NetworkPeerListView()
+        peersTable.heightAnchor.constraint(equalToConstant: 112).isActive = true
 
         let bindStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.bind")
         let peerStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.peers")
         let messageLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.message")
         messageLabel.lineBreakMode = .byWordWrapping
-        messageLabel.maximumNumberOfLines = 6
+        messageLabel.maximumNumberOfLines = 2
 
         let applyButton = NSButton(title: "Apply & Connect", target: nil, action: nil)
         applyButton.setAccessibilityIdentifier("okrun.network.apply")
@@ -202,7 +291,7 @@ extension AppDelegate {
             [makeNetworkLabel("Bind Host"), bindHostField],
             [makeNetworkLabel("Bind Port"), bindPortField],
             [makeNetworkLabel("Add Peer"), peerControls],
-            [makeNetworkLabel("Peers"), peersScroll]
+            [makeNetworkLabel("Peers"), peersTable]
         ])
         configureNetworkGrid(bridgeGrid)
 
@@ -258,6 +347,7 @@ extension AppDelegate {
             statusGrid.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             statusGrid.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             statusGrid.topAnchor.constraint(equalTo: statusSectionTitle.bottomAnchor, constant: 8),
+            statusGrid.bottomAnchor.constraint(lessThanOrEqualTo: buttonRow.topAnchor, constant: -24),
             buttonRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
             buttonRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
             refreshButton.widthAnchor.constraint(equalToConstant: 100),
@@ -288,15 +378,13 @@ extension AppDelegate {
                         bindHostField.stringValue = ""
                         bindPortField.stringValue = "7777"
                     }
-                    peerDataSource.peers = bridge.peers
-                    peersTable.reloadData()
+                    peersTable.peers = bridge.peers
                 } else {
                     bridgeEnabled.state = .off
                     bindEnabled.state = .off
                     bindHostField.stringValue = ""
                     bindPortField.stringValue = "7777"
-                    peerDataSource.peers = []
-                    peersTable.reloadData()
+                    peersTable.peers = []
                 }
                 messageLabel.stringValue = "Loaded network config."
                 messageLabel.textColor = .secondaryLabelColor
@@ -317,7 +405,7 @@ extension AppDelegate {
         }
 
         func parsePeers() throws -> [PrivateNetworkBridgeEndpoint] {
-            peerDataSource.peers
+            peersTable.peers
         }
 
         func readForm() throws -> HostPrivateNetworkConfig {
@@ -417,12 +505,13 @@ extension AppDelegate {
                     port: peerPortField.stringValue,
                     context: "private network bridge peer"
                 )
-                guard !peerDataSource.peers.contains(peer) else {
+                guard !peersTable.peers.contains(peer) else {
                     throw AppError("private network bridge peers contains duplicate endpoint \(peer.description).")
                 }
-                peerDataSource.peers.append(peer)
-                peersTable.reloadData()
-                peersTable.selectRowIndexes(IndexSet(integer: peerDataSource.peers.count - 1), byExtendingSelection: false)
+                var peers = peersTable.peers
+                peers.append(peer)
+                peersTable.peers = peers
+                peersTable.selectRowIndexes(IndexSet(integer: peers.count - 1), byExtendingSelection: false)
                 peerHostField.stringValue = ""
                 peerPortField.stringValue = "7777"
                 messageLabel.stringValue = "Added peer \(peer.description)."
@@ -433,16 +522,17 @@ extension AppDelegate {
             }
         }
         actions.onRemovePeer = {
-            guard !peerDataSource.peers.isEmpty else {
+            guard !peersTable.peers.isEmpty else {
                 messageLabel.stringValue = "No peer selected."
                 messageLabel.textColor = .secondaryLabelColor
                 return
             }
             let selectedRow = peersTable.selectedRow
-            let index = selectedRow >= 0 ? selectedRow : peerDataSource.peers.count - 1
-            guard index < peerDataSource.peers.count else { return }
-            let removedPeer = peerDataSource.peers.remove(at: index)
-            peersTable.reloadData()
+            var peers = peersTable.peers
+            let index = selectedRow >= 0 ? selectedRow : peers.count - 1
+            guard index < peers.count else { return }
+            let removedPeer = peers.remove(at: index)
+            peersTable.peers = peers
             messageLabel.stringValue = "Removed peer \(removedPeer.description)."
             messageLabel.textColor = .secondaryLabelColor
         }
@@ -462,7 +552,8 @@ extension AppDelegate {
         removePeerButton.action = #selector(NetworkConfigPanelActions.removePeer)
 
         loadFields()
-        if let bridge = (try? store.load().privateNetworks[identifier]?.bridge),
+        if !PrivateNetworkRuntimeRegistry.shared.hasBridge(identifier: identifier),
+           let bridge = (try? store.load().privateNetworks[identifier]?.bridge),
            let privateNetwork = try? readForm() {
             let dhcpRange = try? privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                 dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
@@ -476,9 +567,13 @@ extension AppDelegate {
             updateStatus()
         }
 
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+        let statusTimer = DispatchSource.makeTimerSource(queue: .main)
+        statusTimer.schedule(deadline: .now() + 0.25, repeating: .milliseconds(500))
+        statusTimer.setEventHandler {
             updateStatus()
         }
+        statusTimer.resume()
+        timer = statusTimer
 
         if let parent = NSApp.keyWindow {
             panel.setFrameOrigin(NSPoint(
@@ -490,7 +585,7 @@ extension AppDelegate {
         }
 
         NSApp.runModal(for: panel)
-        timer?.invalidate()
+        timer?.cancel()
         _ = actions
     }
 
