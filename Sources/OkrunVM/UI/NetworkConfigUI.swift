@@ -46,6 +46,8 @@ private final class NetworkPeerRowView: NSView {
         backgroundColor = isHeader ? NSColor(calibratedWhite: 0.12, alpha: 1) : NSColor(calibratedWhite: 0.16, alpha: 1)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         wantsLayer = true
         layer?.backgroundColor = backgroundColor.cgColor
 
@@ -59,7 +61,7 @@ private final class NetworkPeerRowView: NSView {
         portLabel.translatesAutoresizingMaskIntoConstraints = false
         portLabel.font = hostLabel.font
         portLabel.textColor = .labelColor
-        portLabel.alignment = .center
+        portLabel.alignment = .left
 
         addSubview(hostLabel)
         addSubview(portLabel)
@@ -148,11 +150,11 @@ private final class NetworkPeerListView: NSView {
             view.removeFromSuperview()
         }
 
-        rows.addArrangedSubview(NetworkPeerRowView(host: "Host", port: "Port", index: nil, isHeader: true))
+        appendRow(NetworkPeerRowView(host: "Host", port: "Port", index: nil, isHeader: true))
         if peerStorage.isEmpty {
             let empty = NetworkPeerRowView(host: "No peers configured", port: "", index: nil)
             empty.alphaValue = 0.65
-            rows.addArrangedSubview(empty)
+            appendRow(empty)
         } else {
             for (index, peer) in peerStorage.enumerated() {
                 let row = NetworkPeerRowView(host: peer.host, port: "\(peer.port)", index: index)
@@ -160,10 +162,15 @@ private final class NetworkPeerListView: NSView {
                     self?.selectedIndex = selected
                     self?.updateSelection()
                 }
-                rows.addArrangedSubview(row)
+                appendRow(row)
             }
         }
         updateSelection()
+    }
+
+    private func appendRow(_ row: NetworkPeerRowView) {
+        rows.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
     }
 
     private func updateSelection() {
@@ -643,6 +650,7 @@ extension AppDelegate {
     private func configureNetworkGrid(_ grid: NSGridView) {
         grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 0).width = 116
+        grid.column(at: 1).xPlacement = .fill
         grid.column(at: 1).width = 500
         grid.rowSpacing = 10
         grid.columnSpacing = 12
