@@ -631,6 +631,35 @@ struct OkrunVMTests {
     }
 
     @Test
+    func dhcpLeaseAllocatorDropsLeasesOutsideCurrentRange() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let config = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.110",
+            rangeEnd: "10.77.0.200",
+            leaseSeconds: 3600
+        )
+        let store = DHCPLeaseStore(stateDirectory: root)
+        try store.save([
+            DHCPLease(
+                identity: "client-a",
+                ipAddress: try IPv4Address("10.77.0.20"),
+                expiresAt: Date().addingTimeInterval(3600)
+            )
+        ])
+        let allocator = try DHCPLeaseAllocator(config: config, store: store)
+
+        let lease = try allocator.lease(for: "client-a", requestedIP: nil)
+
+        let expectedAddress = try IPv4Address("10.77.0.110")
+        #expect(lease.ipAddress == expectedAddress)
+        #expect(try store.load().map(\.ipAddress) == [expectedAddress])
+    }
+
+    @Test
     func dhcpLeaseAllocatorCoordinatesAcrossInstances() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }

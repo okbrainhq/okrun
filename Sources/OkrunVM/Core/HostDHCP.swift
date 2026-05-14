@@ -361,7 +361,7 @@ final class DHCPLeaseAllocator {
 
     func lease(for identity: String, requestedIP: IPv4Address?, now: Date = Date()) throws -> DHCPLease {
         try store.update { leases in
-            pruneExpired(&leases, now: now)
+            pruneUnavailableLeases(&leases, now: now)
             if let existing = leases.first(where: { $0.identity == identity }) {
                 let renewed = DHCPLease(
                     identity: identity,
@@ -393,7 +393,7 @@ final class DHCPLeaseAllocator {
 
     func requestedLease(for identity: String, requestedIP: IPv4Address?, now: Date = Date()) throws -> DHCPLease {
         try store.update { leases in
-            pruneExpired(&leases, now: now)
+            pruneUnavailableLeases(&leases, now: now)
             if let requestedIP {
                 guard isInRange(requestedIP) else {
                     throw AppError("Requested DHCP address \(requestedIP.description) is outside the configured range.")
@@ -454,7 +454,7 @@ final class DHCPLeaseAllocator {
     func decline(identity: String, address: IPv4Address, now: Date = Date()) throws {
         guard isInRange(address) else { return }
         try store.update { leases in
-            pruneExpired(&leases, now: now)
+            pruneUnavailableLeases(&leases, now: now)
             leases.removeAll { $0.identity == identity || $0.ipAddress == address }
             leases.append(DHCPLease(
                 identity: "declined:\(address.description)",
@@ -464,8 +464,8 @@ final class DHCPLeaseAllocator {
         }
     }
 
-    private func pruneExpired(_ leases: inout [DHCPLease], now: Date) {
-        leases.removeAll { $0.expiresAt <= now }
+    private func pruneUnavailableLeases(_ leases: inout [DHCPLease], now: Date) {
+        leases.removeAll { $0.expiresAt <= now || !isInRange($0.ipAddress) }
     }
 
     private func replace(_ lease: DHCPLease, in leases: inout [DHCPLease]) {
