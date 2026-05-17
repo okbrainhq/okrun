@@ -49,11 +49,17 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         guard arguments.contains("--headless-boot-test")
             || arguments.contains("--headless-save-restore-test")
             || arguments.contains("--headless-private-network-test")
-            || arguments.contains("--headless-project-save-restore-test") else {
+            || arguments.contains("--headless-project-save-restore-test")
+            || arguments.contains("--headless-import-asif") else {
             return nil
         }
 
         do {
+            if arguments.contains("--headless-import-asif") {
+                try runHeadlessASIFImport(arguments: arguments)
+                return 0
+            }
+
             let options = try parseOptions(arguments: arguments)
             if arguments.contains("--headless-project-save-restore-test") {
                 guard let projectRoot = options.projectRoot else {
@@ -116,6 +122,53 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             fputs("Headless boot E2E failed: \(describeError(error))\n", stderr)
             return 1
         }
+    }
+
+    private static func runHeadlessASIFImport(arguments: [String]) throws {
+        var sourcePath: String?
+        var projectRootPath: String?
+        var registryPath: String?
+        var iterator = arguments.dropFirst().makeIterator()
+
+        while let argument = iterator.next() {
+            switch argument {
+            case "--source-asif":
+                sourcePath = iterator.next()
+            case "--project-root":
+                projectRootPath = iterator.next()
+            case "--registry-path":
+                registryPath = iterator.next()
+            default:
+                continue
+            }
+        }
+
+        guard let sourcePath, !sourcePath.isEmpty else {
+            throw AppError("Missing --source-asif path.")
+        }
+        guard let projectRootPath, !projectRootPath.isEmpty else {
+            throw AppError("Missing --project-root path.")
+        }
+
+        let sourceURL = URL(fileURLWithPath: sourcePath)
+        let projectRoot = URL(fileURLWithPath: projectRootPath, isDirectory: true)
+        let result = try ASIFImporter.importDisk(request: ASIFImportRequest(
+            sourceURL: sourceURL,
+            destinationURL: projectRoot
+        ))
+
+        if let registryPath, !registryPath.isEmpty {
+            let store = ProjectStore(url: URL(fileURLWithPath: registryPath))
+            var registry = try store.load(defaultProject: nil)
+            let path = store.standardPath(projectRoot)
+            if !registry.projects.contains(path) {
+                registry.projects.append(path)
+            }
+            registry.selectedProject = path
+            try store.save(registry)
+        }
+
+        print("Headless ASIF import E2E passed: source=\(result.sourceURL.path) project=\(result.projectURL.path) diskGB=\(result.diskGB)")
     }
 
     fileprivate static func describeError(_ error: Error) -> String {

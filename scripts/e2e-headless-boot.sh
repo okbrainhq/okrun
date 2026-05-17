@@ -9,12 +9,14 @@ STATIC_PRIVATE_HOME=""
 DHCP_HOME=""
 SHARED_DIR=""
 GUEST_LOGS_DIR=""
+ASIF_IMPORT_DIR=""
 cleanup() {
   rm -rf "$STEP_LOG_DIR"
   rm -rf "${STATIC_PRIVATE_HOME:-}"
   rm -rf "${DHCP_HOME:-}"
   rm -rf "${SHARED_DIR:-}"
   rm -rf "${GUEST_LOGS_DIR:-}"
+  rm -rf "${ASIF_IMPORT_DIR:-}"
 }
 trap cleanup EXIT
 
@@ -56,6 +58,43 @@ PRIVATE_NETWORK_DHCP_SERVER_INITRAMFS="$(sed -n '8p' /tmp/okrun-e2e-linux-paths.
 PRIVATE_NETWORK_DHCP_CLIENT_INITRAMFS="$(sed -n '9p' /tmp/okrun-e2e-linux-paths.txt)"
 
 run_step "Build production app" "$ROOT/scripts/build.sh"
+
+run_asif_import_smoke() {
+  if [[ ! -x /usr/sbin/diskutil ]]; then
+    printf '  SKIP Headless ASIF import: diskutil is unavailable\n'
+    return 0
+  fi
+
+  ASIF_IMPORT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/okrun-e2e-asif-import.XXXXXX")"
+  local source_asif="$ASIF_IMPORT_DIR/source.asif"
+  local project_root="$ASIF_IMPORT_DIR/imported-vm"
+  local registry_path="$ASIF_IMPORT_DIR/registry.json"
+  local create_log="$ASIF_IMPORT_DIR/create-asif.log"
+
+  if ! /usr/sbin/diskutil image create blank --fs none --format ASIF --size 1537m "$source_asif" >"$create_log" 2>&1; then
+    printf '  SKIP Headless ASIF import: ASIF disk creation is unavailable\n'
+    sed -n '1,80p' "$create_log"
+    return 0
+  fi
+
+  run_step "Headless ASIF import" \
+    "$ROOT/OkrunVM.app/Contents/MacOS/OkrunVM" \
+    --headless-import-asif \
+    --source-asif "$source_asif" \
+    --project-root "$project_root" \
+    --registry-path "$registry_path"
+
+  [[ -f "$project_root/okrun-vm.json" ]]
+  [[ -f "$project_root/vm/linux.asif" ]]
+  [[ -f "$project_root/vm/efi.variables" ]]
+  [[ -f "$project_root/vm/machine.identifier" ]]
+  grep -Fq '"diskFormat" : "asif"' "$project_root/okrun-vm.json"
+  grep -Fq '"diskGB" : 2' "$project_root/okrun-vm.json"
+  grep -Fq 'imported-vm' "$registry_path"
+  grep -Fq '"selectedProject"' "$registry_path"
+}
+
+run_asif_import_smoke
 
 STATIC_PRIVATE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/okrun-e2e-static-private-home.XXXXXX")"
 DHCP_HOME="$(mktemp -d "${TMPDIR:-/tmp}/okrun-e2e-dhcp-home.XXXXXX")"

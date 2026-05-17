@@ -170,6 +170,111 @@ struct OkrunVMTests {
     }
 
     @Test
+    func asifImporterRoundsVirtualSizeUpToGiB() throws {
+        #expect(try ASIFImporter.diskGB(forVirtualSizeBytes: 1_073_741_824) == 1)
+        #expect(try ASIFImporter.diskGB(forVirtualSizeBytes: 1_073_741_825) == 2)
+        #expect(try ASIFImporter.diskGB(forVirtualSizeBytes: 2_147_483_648) == 2)
+        #expect(throws: (any Error).self) {
+            try ASIFImporter.diskGB(forVirtualSizeBytes: 0)
+        }
+    }
+
+    @Test
+    func asifImporterGeneratedConfigUsesImportDefaults() throws {
+        if #available(macOS 26.0, *) {
+            let config = try ASIFImporter.importedConfig(diskGB: 9)
+
+            #expect(config.cpuCount == 4)
+            #expect(config.memoryGB == 4)
+            #expect(config.diskGB == 9)
+            #expect(config.diskFormat == .asif)
+            #expect(config.diskIO == .defaults)
+            #expect(config.installerISOPath == nil)
+            #expect(config.privateNetwork == .enabled)
+            #expect(config.sharedDirectories == [])
+        }
+    }
+
+    @Test
+    func asifImporterRejectsNonASIFSource() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let source = root.appendingPathComponent("linux.raw")
+        try Data("not-asif".utf8).write(to: source)
+        let destination = root.appendingPathComponent("imported", isDirectory: true)
+
+        #expect(throws: (any Error).self) {
+            try ASIFImporter.importDisk(
+                request: ASIFImportRequest(sourceURL: source, destinationURL: destination),
+                virtualSizeProvider: { _ in 1_073_741_824 },
+                createMachineIdentifier: { url in try Data("machine".utf8).write(to: url) },
+                createEFIVariableStore: { url in try Data("efi".utf8).write(to: url) },
+                copyDisk: { source, destination in try FileManager.default.copyItem(at: source, to: destination) }
+            )
+        }
+    }
+
+    @Test
+    func asifImporterCreatesStagedProjectAndGeneratedMetadata() throws {
+        guard #available(macOS 26.0, *) else { return }
+
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let source = root.appendingPathComponent("source.asif")
+        try Data("asif fixture".utf8).write(to: source)
+        let destination = root.appendingPathComponent("imported-vm", isDirectory: true)
+        let config = try ASIFImporter.importedConfig(diskGB: 2, cpuCount: 6, memoryGB: 8)
+
+        let result = try ASIFImporter.importDisk(
+            request: ASIFImportRequest(sourceURL: source, destinationURL: destination, config: config),
+            virtualSizeProvider: { _ in 1_073_741_825 },
+            createMachineIdentifier: { url in try Data("machine".utf8).write(to: url) },
+            createEFIVariableStore: { url in try Data("efi".utf8).write(to: url) },
+            copyDisk: { source, destination in try FileManager.default.copyItem(at: source, to: destination) }
+        )
+
+        let paths = VMPaths.project(at: destination)
+        #expect(result.diskGB == 2)
+        #expect(result.config.cpuCount == 6)
+        #expect(result.config.memoryGB == 8)
+        #expect(result.roundedDiskSizeUp)
+        #expect(try Data(contentsOf: paths.asifDisk) == Data("asif fixture".utf8))
+        #expect(try Data(contentsOf: paths.machineIdentifier) == Data("machine".utf8))
+        #expect(try Data(contentsOf: paths.efiStore) == Data("efi".utf8))
+        #expect(try VMConfig.load(from: paths.config) == result.config)
+        #expect(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    @Test
+    func asifImporterCleansStagingDirectoryOnFailure() throws {
+        guard #available(macOS 26.0, *) else { return }
+
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let source = root.appendingPathComponent("source.asif")
+        try Data("asif fixture".utf8).write(to: source)
+        let destination = root.appendingPathComponent("failed-import", isDirectory: true)
+
+        #expect(throws: (any Error).self) {
+            try ASIFImporter.importDisk(
+                request: ASIFImportRequest(sourceURL: source, destinationURL: destination),
+                virtualSizeProvider: { _ in 1_073_741_824 },
+                createMachineIdentifier: { url in try Data("machine".utf8).write(to: url) },
+                createEFIVariableStore: { url in try Data("efi".utf8).write(to: url) },
+                copyDisk: { _, _ in throw AppError("copy failed") }
+            )
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .filter { $0.contains(".failed-import.importing-") }
+        #expect(leftovers.isEmpty)
+    }
+
+    @Test
     func vmConfigRejectsInvalidValues() {
         #expect(throws: (any Error).self) {
             try VMConfig(cpuCount: 0, memoryGB: 4, diskGB: 64, installerISOPath: nil).validated()

@@ -51,13 +51,16 @@ private class HoverIconButton: NSButton {
         bezelStyle = .regularSquare
         isBordered = false
         image = NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
+        image?.isTemplate = true
+        symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
         imagePosition = .imageOnly
+        imageScaling = .scaleProportionallyDown
         toolTip = label
         wantsLayer = true
-        layer?.cornerRadius = 5
+        layer?.cornerRadius = 6
         layer?.cornerCurve = .continuous
         widthAnchor.constraint(equalToConstant: 26).isActive = true
-        heightAnchor.constraint(equalToConstant: 22).isActive = true
+        heightAnchor.constraint(equalToConstant: 26).isActive = true
         updateAppearance()
     }
 
@@ -67,6 +70,10 @@ private class HoverIconButton: NSButton {
 
     override var isEnabled: Bool {
         didSet { updateAppearance() }
+    }
+
+    override var alignmentRectInsets: NSEdgeInsets {
+        NSEdgeInsetsZero
     }
 
     override func updateTrackingAreas() {
@@ -346,7 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private var detailsLabel = NSTextField(labelWithString: "")
     private var vmContainer: RoundedContainerView!
     private var tabStack: NSStackView!
-    private var emptyStateLabel = NSTextField(labelWithString: "Add a VM to begin.")
+    private var emptyStateLabel = NSTextField(labelWithString: "Add or import a VM to begin.")
     private var installerButton: NSButton!
     private var startButton: NSButton!
     private var shutdownButton: NSButton!
@@ -373,7 +380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         NSApp.setActivationPolicy(.regular)
         installAppIcon()
         buildWindow()
-        installUITestMenuIfNeeded()
+        installMainMenu()
         AppLog.lifecycle.info(
             "Launching OkrunVM pid=\(getpid()) bundle=\(Bundle.main.bundleURL.path, privacy: .public) executable=\(Bundle.main.executableURL?.path ?? "unknown", privacy: .public)"
         )
@@ -540,16 +547,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 
         networkButton = makeSidebarNetworkButton()
         let sidebarNewButton = makeSidebarNewVMButton()
+        let sidebarImportButton = makeSidebarImportVMButton()
         let sidebarHeader = NSView()
         sidebarHeader.translatesAutoresizingMaskIntoConstraints = false
+        let sidebarActionStack = NSStackView(views: [sidebarNewButton, sidebarImportButton, networkButton])
+        sidebarActionStack.translatesAutoresizingMaskIntoConstraints = false
+        sidebarActionStack.orientation = .horizontal
+        sidebarActionStack.alignment = .centerY
+        sidebarActionStack.spacing = 8
 
         tabStack = NSStackView()
         tabStack.orientation = .vertical
         tabStack.alignment = .leading
         tabStack.spacing = 0
         tabStack.translatesAutoresizingMaskIntoConstraints = false
-        sidebarHeader.addSubview(networkButton)
-        sidebarHeader.addSubview(sidebarNewButton)
+        sidebarHeader.addSubview(sidebarActionStack)
         tabPanel.addSubview(sidebarHeader)
         tabPanel.addSubview(tabStack)
 
@@ -600,10 +612,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             sidebarHeader.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
             sidebarHeader.topAnchor.constraint(equalTo: tabPanel.topAnchor),
             sidebarHeader.heightAnchor.constraint(equalToConstant: 46),
-            networkButton.trailingAnchor.constraint(equalTo: sidebarHeader.trailingAnchor, constant: -12),
-            networkButton.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor),
-            sidebarNewButton.trailingAnchor.constraint(equalTo: networkButton.leadingAnchor, constant: -8),
-            sidebarNewButton.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor),
+            sidebarActionStack.trailingAnchor.constraint(equalTo: sidebarHeader.trailingAnchor, constant: -12),
+            sidebarActionStack.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor),
+            sidebarActionStack.heightAnchor.constraint(equalToConstant: 26),
+            sidebarNewButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
+            sidebarNewButton.bottomAnchor.constraint(equalTo: sidebarActionStack.bottomAnchor),
+            sidebarImportButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
+            sidebarImportButton.bottomAnchor.constraint(equalTo: sidebarActionStack.bottomAnchor),
+            networkButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
+            networkButton.bottomAnchor.constraint(equalTo: sidebarActionStack.bottomAnchor),
             tabStack.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
             tabStack.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
             tabStack.topAnchor.constraint(equalTo: sidebarHeader.bottomAnchor),
@@ -617,9 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func installUITestMenuIfNeeded() {
-        guard enablesUITestCommands else { return }
-
+    private func installMainMenu() {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         mainMenu.addItem(appItem)
@@ -627,6 +642,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         let appMenu = NSMenu(title: "Okrun VM")
         appMenu.addItem(NSMenuItem(title: "Quit Okrun VM", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appItem.submenu = appMenu
+
+        let fileItem = NSMenuItem()
+        mainMenu.addItem(fileItem)
+        let fileMenu = NSMenu(title: "File")
+        let addItem = NSMenuItem(title: "Add VM", action: #selector(createProject), keyEquivalent: "n")
+        addItem.target = self
+        fileMenu.addItem(addItem)
+        let importItem = NSMenuItem(title: "Import VM...", action: #selector(importProject), keyEquivalent: "i")
+        importItem.target = self
+        fileMenu.addItem(importItem)
+        fileItem.submenu = fileMenu
 
         let vmItem = NSMenuItem()
         mainMenu.addItem(vmItem)
@@ -640,19 +666,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         deleteItem.target = self
         vmMenu.addItem(deleteItem)
 
-        vmMenu.addItem(.separator())
+        if enablesUITestCommands {
+            vmMenu.addItem(.separator())
 
-        let selectFirstItem = NSMenuItem(title: "Select First VM", action: #selector(selectFirstVMForUITest), keyEquivalent: "")
-        selectFirstItem.target = self
-        vmMenu.addItem(selectFirstItem)
+            let selectFirstItem = NSMenuItem(title: "Select First VM", action: #selector(selectFirstVMForUITest), keyEquivalent: "")
+            selectFirstItem.target = self
+            vmMenu.addItem(selectFirstItem)
 
-        let selectLastItem = NSMenuItem(title: "Select Last VM", action: #selector(selectLastVMForUITest), keyEquivalent: "")
-        selectLastItem.target = self
-        vmMenu.addItem(selectLastItem)
+            let selectLastItem = NSMenuItem(title: "Select Last VM", action: #selector(selectLastVMForUITest), keyEquivalent: "")
+            selectLastItem.target = self
+            vmMenu.addItem(selectLastItem)
 
-        let zoomItem = NSMenuItem(title: "Zoom Window", action: #selector(zoomWindowForUITest), keyEquivalent: "")
-        zoomItem.target = self
-        vmMenu.addItem(zoomItem)
+            let zoomItem = NSMenuItem(title: "Zoom Window", action: #selector(zoomWindowForUITest), keyEquivalent: "")
+            zoomItem.target = self
+            vmMenu.addItem(zoomItem)
+        }
 
         vmItem.submenu = vmMenu
         NSApp.mainMenu = mainMenu
@@ -670,6 +698,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private func makeSidebarNewVMButton() -> NSButton {
         let button = HoverIconButton(symbolName: "plus", label: "New VM", target: self, action: #selector(createProject))
         button.setAccessibilityIdentifier("okrun.new-vm")
+        button.normalTint = .labelColor
+        button.disabledTint = NSColor.labelColor.withAlphaComponent(0.35)
+        button.hoverBackground = NSColor.white.withAlphaComponent(0.12)
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        return button
+    }
+
+    private func makeSidebarImportVMButton() -> NSButton {
+        let button = HoverIconButton(symbolName: "arrow.down.square", label: "Import VM", target: self, action: #selector(importProject))
+        button.setAccessibilityIdentifier("okrun.import-vm")
         button.normalTint = .labelColor
         button.disabledTint = NSColor.labelColor.withAlphaComponent(0.35)
         button.hoverBackground = NSColor.white.withAlphaComponent(0.12)
@@ -778,7 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 
         guard let session = selectedSession else {
             emptyStateLabel.isHidden = false
-            setStatus("No VM selected", detail: "Add a VM to create a new tab.")
+            setStatus("No VM selected", detail: "Add or import a VM to create a new tab.")
             window?.toolbar?.validateVisibleItems()
             updateContextControls()
             updateTabButtonState()
@@ -885,6 +924,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             setStatus("Add project failed", detail: error.localizedDescription)
             selectedSession?.status = "Add project failed"
             selectedSession?.detail = error.localizedDescription
+            window?.toolbar?.validateVisibleItems()
+        }
+    }
+
+    @objc private func importProject() {
+        guard let request = askForASIFImport() else { return }
+        setStatus("Importing VM", detail: "Copying \(request.sourceURL.path) to \(request.destinationURL.path)")
+        window?.displayIfNeeded()
+
+        let result: ASIFImportResult
+        do {
+            result = try ASIFImporter.importDisk(request: ASIFImportRequest(
+                sourceURL: request.sourceURL,
+                destinationURL: request.destinationURL,
+                config: request.config
+            ))
+            try provisionPrivateNetworkDHCPIfNeeded(for: result.config)
+        } catch {
+            setStatus("Import failed", detail: error.localizedDescription)
+            selectedSession?.status = "Import failed"
+            selectedSession?.detail = error.localizedDescription
+            window?.toolbar?.validateVisibleItems()
+            return
+        }
+
+        do {
+            let path = projectStore.standardPath(result.projectURL)
+            if !registry.projects.contains(path) {
+                registry.projects.append(path)
+            }
+            registry.selectedProject = path
+            try projectStore.save(registry)
+
+            let paths = VMPaths.project(at: result.projectURL)
+            let session = VMTabSession(projectPath: path, paths: paths, config: result.config)
+            session.status = "Ready"
+            session.detail = importStatusDetail(result: result)
+            sessions.append(session)
+            rebuildTabButtons()
+            selectSession(session)
+            AppLog.lifecycle.info(
+                "Imported ASIF project path=\(paths.root.path, privacy: .public) source=\(result.sourceURL.path, privacy: .public) diskGB=\(result.diskGB)"
+            )
+        } catch {
+            setStatus("Import saved, registry failed", detail: "Project exists at \(result.projectURL.path). \(error.localizedDescription)")
             window?.toolbar?.validateVisibleItems()
         }
     }
@@ -1101,6 +1185,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             detail += "  |  Host volume low: \(freeSpace) free."
         }
 
+        return detail
+    }
+
+    private func importStatusDetail(result: ASIFImportResult) -> String {
+        var detail = "\(result.projectURL.path)  |  Imported \(result.sourceURL.path)  |  CPU \(result.config.cpuCount)  Memory \(result.config.memoryGB) GB  Disk \(result.diskGB) GB ASIF"
+        if result.roundedDiskSizeUp {
+            detail += "  |  Disk size rounded up to the next GiB."
+        }
+        detail += "  |  Fresh EFI store generated."
         return detail
     }
 

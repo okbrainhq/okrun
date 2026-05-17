@@ -446,6 +446,22 @@ struct VMConfig: Codable, Equatable {
         diskIO = try container.decodeIfPresent(DiskIOConfig.self, forKey: .diskIO) ?? .defaults
     }
 
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(cpuCount, forKey: .cpuCount)
+        try container.encode(memoryGB, forKey: .memoryGB)
+        try container.encode(diskGB, forKey: .diskGB)
+        try container.encode(diskFormat, forKey: .diskFormat)
+        if let installerISOPath {
+            try container.encode(installerISOPath, forKey: .installerISOPath)
+        } else {
+            try container.encodeNil(forKey: .installerISOPath)
+        }
+        try container.encode(privateNetwork, forKey: .privateNetwork)
+        try container.encode(sharedDirectories, forKey: .sharedDirectories)
+        try container.encode(diskIO, forKey: .diskIO)
+    }
+
     static func load(from url: URL) throws -> VMConfig {
         let fileManager = FileManager.default
         let encoder = JSONEncoder()
@@ -1119,7 +1135,7 @@ enum DiskImageCreator {
         try handle.close()
     }
 
-    private static func validateASIFSupport() throws {
+    static func validateASIFSupport() throws {
         guard DiskImageFormat.asif.isSupported else {
             throw AppError("ASIF disk images require macOS 26 Tahoe or later.")
         }

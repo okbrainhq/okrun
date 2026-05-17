@@ -87,6 +87,44 @@ clickButton("$label", "$identifier")
 APPLESCRIPT
 }
 
+assert_button_exists() {
+  local label="$1"
+  local identifier="${2:-}"
+  osascript <<APPLESCRIPT
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        if "$identifier" is not "" then
+          try
+            first UI element of entire contents of window 1 whose role is "AXButton" and identifier is "$identifier"
+            return true
+          end try
+        end if
+        try
+          first UI element of entire contents of window 1 whose role is "AXButton" and (name is "$label" or description is "$label")
+          return true
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for button to exist: $label"
+APPLESCRIPT
+}
+
 click_checkbox() {
   local identifier="$1"
   osascript <<APPLESCRIPT
@@ -564,6 +602,7 @@ run_project_lifecycle_smoke() {
     OKRUN_UI_E2E_SKIP_AUTOSTART=1 \
     OKRUN_UI_E2E_CONFIG_OPEN_LOG="$config_open_log"
 
+  assert_button_exists "Import VM" "okrun.import-vm"
   click_button "New VM" "okrun.new-vm"
   capture "01-lifecycle-add-dialog"
   click_button "Create" "okrun.add.create"
