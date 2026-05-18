@@ -16,6 +16,29 @@ final class PrivateNetworkTransportRouter {
         weak var runtime: PrivateNetworkRuntime?
     }
 
+    private enum RemoteFrameAction {
+        case drop
+        case inject([PrivateNetworkRuntime])
+        case checkBridgeBeforeWebSwitch(source: EthernetAddress, bridge: PrivateNetworkRoutableTransport)
+    }
+
+    private enum SendMode {
+        case firstReachable
+        case allReachable
+    }
+
+    private struct LocalFrameSendPlan {
+        var mode: SendMode
+        var transports: [PrivateNetworkRoutableTransport]
+        var logsNoReachableTransport: Bool
+
+        static let none = LocalFrameSendPlan(
+            mode: .firstReachable,
+            transports: [],
+            logsNoReachableTransport: false
+        )
+    }
+
     private static let queueKey = DispatchSpecificKey<UUID>()
 
     private let identifier: String
@@ -77,84 +100,160 @@ final class PrivateNetworkTransportRouter {
     }
 
     func routeLocalFrame(_ frame: Data) {
-        runOnQueue {
-            self.routeLocalFrameOnQueue(frame)
+        let plan = runOnQueue {
+            self.localFrameSendPlanOnQueue(frame)
         }
+        sendFrame(frame, using: plan)
     }
 
     func receiveRemoteFrame(_ frame: Data, via route: PrivateNetworkTransportRoute) {
-        runOnQueue {
-            if let header = EthernetFrameHeader.parse(frame) {
-                if self.localMACs.contains(header.source) {
-                    return
-                }
+        let action = runOnQueue {
+            self.remoteFrameActionOnQueue(frame, via: route)
+        }
 
-                if route == .bridge {
-                    self.remoteRoutes[header.source] = .bridge
-                } else if self.remoteRoutes[header.source] == .bridge,
-                          self.canSendViaBridge() {
-                    return
-                } else {
-                    self.remoteRoutes[header.source] = .webSwitch
-                }
+        switch action {
+        case .drop:
+            return
+        case .inject(let runtimes):
+            injectFrame(frame, to: runtimes)
+        case .checkBridgeBeforeWebSwitch(let source, let bridge):
+            let canSendViaBridge = bridge.canSendPrivateNetworkFrames
+            let runtimes = runOnQueue {
+                self.remoteWebSwitchRuntimesOnQueue(source: source, canSendViaBridge: canSendViaBridge)
             }
-
-            self.injectFrameToLocalGuests(frame)
+            injectFrame(frame, to: runtimes)
         }
     }
 
     private func routeLocalFrame(_ frame: Data, from runtime: PrivateNetworkRuntime) {
-        runOnQueue {
-            guard self.runtimes.contains(where: { $0.runtime === runtime }) else { return }
-            self.routeLocalFrameOnQueue(frame)
+        let plan = runOnQueue {
+            guard self.runtimes.contains(where: { $0.runtime === runtime }) else {
+                return LocalFrameSendPlan.none
+            }
+            return self.localFrameSendPlanOnQueue(frame)
         }
+        sendFrame(frame, using: plan)
     }
 
-    private func routeLocalFrameOnQueue(_ frame: Data) {
+    private func localFrameSendPlanOnQueue(_ frame: Data) -> LocalFrameSendPlan {
         guard let header = EthernetFrameHeader.parse(frame) else {
-            sendDiscoveryFrame(frame)
-            return
+            return discoveryFrameSendPlanOnQueue()
         }
 
         localMACs.insert(header.source)
         if header.destination.isUnicast, localMACs.contains(header.destination) {
-            return
+            return .none
         }
 
         guard header.destination.isUnicast,
               let route = remoteRoutes[header.destination] else {
-            sendDiscoveryFrame(frame)
-            return
+            return discoveryFrameSendPlanOnQueue()
         }
 
         switch route {
         case .bridge:
-            if sendFrame(frame, via: .bridge) { return }
-            _ = sendFrame(frame, via: .webSwitch)
+            return LocalFrameSendPlan(
+                mode: .firstReachable,
+                transports: transports(for: [.bridge, .webSwitch]),
+                logsNoReachableTransport: false
+            )
         case .webSwitch:
-            if sendFrame(frame, via: .webSwitch) { return }
-            _ = sendFrame(frame, via: .bridge)
-        }
-    }
-
-    private func sendDiscoveryFrame(_ frame: Data) {
-        let sentBridge = sendFrame(frame, via: .bridge)
-        let sentSwitch = sendFrame(frame, via: .webSwitch)
-        if !sentBridge && !sentSwitch {
-            AppLog.virtualMachine.debug(
-                "Private network router has no reachable remote transport privateNetwork=\(self.identifier, privacy: .public)"
+            return LocalFrameSendPlan(
+                mode: .firstReachable,
+                transports: transports(for: [.webSwitch, .bridge]),
+                logsNoReachableTransport: false
             )
         }
     }
 
-    @discardableResult
-    private func sendFrame(_ frame: Data, via route: PrivateNetworkTransportRoute) -> Bool {
-        guard let transport = transport(for: route),
-              transport.canSendPrivateNetworkFrames else {
-            return false
+    private func remoteFrameActionOnQueue(_ frame: Data, via route: PrivateNetworkTransportRoute) -> RemoteFrameAction {
+        guard let header = EthernetFrameHeader.parse(frame) else {
+            return .inject(localGuestRuntimesOnQueue())
         }
-        transport.sendFrameToRemote(frame)
-        return true
+
+        if localMACs.contains(header.source) {
+            return .drop
+        }
+
+        if route == .bridge {
+            remoteRoutes[header.source] = .bridge
+            return .inject(localGuestRuntimesOnQueue())
+        }
+
+        if remoteRoutes[header.source] == .bridge,
+           let bridge {
+            return .checkBridgeBeforeWebSwitch(source: header.source, bridge: bridge)
+        }
+
+        remoteRoutes[header.source] = .webSwitch
+        return .inject(localGuestRuntimesOnQueue())
+    }
+
+    private func remoteWebSwitchRuntimesOnQueue(
+        source: EthernetAddress,
+        canSendViaBridge: Bool
+    ) -> [PrivateNetworkRuntime] {
+        if localMACs.contains(source) {
+            return []
+        }
+        if canSendViaBridge, remoteRoutes[source] == .bridge {
+            return []
+        }
+
+        remoteRoutes[source] = .webSwitch
+        return localGuestRuntimesOnQueue()
+    }
+
+    private func discoveryFrameSendPlanOnQueue() -> LocalFrameSendPlan {
+        LocalFrameSendPlan(
+            mode: .allReachable,
+            transports: transports(for: [.bridge, .webSwitch]),
+            logsNoReachableTransport: true
+        )
+    }
+
+    private func sendFrame(_ frame: Data, using plan: LocalFrameSendPlan) {
+        guard !plan.transports.isEmpty else {
+            if plan.logsNoReachableTransport {
+                logNoReachableTransport()
+            }
+            return
+        }
+
+        var didSend = false
+        for transport in plan.transports {
+            guard transport.canSendPrivateNetworkFrames else { continue }
+            transport.sendFrameToRemote(frame)
+            didSend = true
+            if plan.mode == .firstReachable {
+                return
+            }
+        }
+
+        if !didSend, plan.logsNoReachableTransport {
+            logNoReachableTransport()
+        }
+    }
+
+    private func logNoReachableTransport() {
+        AppLog.virtualMachine.debug(
+            "Private network router has no reachable remote transport privateNetwork=\(self.identifier, privacy: .public)"
+        )
+    }
+
+    private func transports(for routes: [PrivateNetworkTransportRoute]) -> [PrivateNetworkRoutableTransport] {
+        routes.compactMap { transport(for: $0) }
+    }
+
+    private func injectFrame(_ frame: Data, to runtimes: [PrivateNetworkRuntime]) {
+        for runtime in runtimes {
+            runtime.injectFrameToGuest(frame)
+        }
+    }
+
+    private func localGuestRuntimesOnQueue() -> [PrivateNetworkRuntime] {
+        runtimes.removeAll { $0.runtime == nil }
+        return runtimes.compactMap(\.runtime)
     }
 
     private func transport(for route: PrivateNetworkTransportRoute) -> PrivateNetworkRoutableTransport? {
@@ -163,17 +262,6 @@ final class PrivateNetworkTransportRouter {
             return bridge
         case .webSwitch:
             return webSwitch
-        }
-    }
-
-    private func canSendViaBridge() -> Bool {
-        bridge?.canSendPrivateNetworkFrames == true
-    }
-
-    private func injectFrameToLocalGuests(_ frame: Data) {
-        runtimes.removeAll { $0.runtime == nil }
-        for weakRuntime in runtimes {
-            weakRuntime.runtime?.injectFrameToGuest(frame)
         }
     }
 

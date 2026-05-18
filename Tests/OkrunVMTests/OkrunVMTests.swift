@@ -1433,6 +1433,46 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRouterDoesNotDeadlockWhenSwitchCallbackRacesWithLocalSend() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let webSwitch = BlockingRoutableTransport()
+        router.setWebSwitch(webSwitch)
+
+        let localMAC: [UInt8] = [0x02, 0xee, 0xee, 0xee, 0xee, 0x01]
+        let remoteMAC: [UInt8] = [0x02, 0xee, 0xee, 0xee, 0xee, 0x02]
+        let otherRemoteMAC: [UInt8] = [0x02, 0xee, 0xee, 0xee, 0xee, 0x03]
+        let learnedRemoteFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x01])
+        router.receiveRemoteFrame(learnedRemoteFrame, via: .webSwitch)
+
+        let switchQueueEntered = DispatchSemaphore(value: 0)
+        let releaseSwitchCallback = DispatchSemaphore(value: 0)
+        let callbackFinished = DispatchSemaphore(value: 0)
+        webSwitch.runOnTransportQueue {
+            switchQueueEntered.signal()
+            _ = releaseSwitchCallback.wait(timeout: .now() + 2)
+            router.receiveRemoteFrame(
+                ethernetFrame(destination: localMAC, source: otherRemoteMAC, payload: [0x02]),
+                via: .webSwitch
+            )
+            callbackFinished.signal()
+        }
+        #expect(switchQueueEntered.wait(timeout: .now() + 1) == .success)
+
+        let toRemote = ethernetFrame(destination: remoteMAC, source: localMAC, payload: [0x03])
+        let routeFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            router.routeLocalFrame(toRemote)
+            routeFinished.signal()
+        }
+
+        #expect(webSwitch.canSendAttempted.wait(timeout: .now() + 1) == .success)
+        releaseSwitchCallback.signal()
+        #expect(callbackFinished.wait(timeout: .now() + 2) == .success)
+        #expect(routeFinished.wait(timeout: .now() + 2) == .success)
+        #expect(webSwitch.sentFrames == [toRemote])
+    }
+
+    @Test
     func hostNetworkConfigLoadsAndValidatesSwitchConfig() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
@@ -1556,6 +1596,32 @@ struct OkrunVMTests {
 
         func sendFrameToRemote(_ frame: Data) {
             sentFrames.append(frame)
+        }
+    }
+
+    private final class BlockingRoutableTransport: PrivateNetworkRoutableTransport {
+        let canSendAttempted = DispatchSemaphore(value: 0)
+
+        private let queue = DispatchQueue(label: "okrun.tests.blocking-routable.\(UUID().uuidString)")
+        private var storedSentFrames: [Data] = []
+
+        var canSendPrivateNetworkFrames: Bool {
+            canSendAttempted.signal()
+            return queue.sync { true }
+        }
+
+        var sentFrames: [Data] {
+            queue.sync { storedSentFrames }
+        }
+
+        func sendFrameToRemote(_ frame: Data) {
+            queue.sync {
+                storedSentFrames.append(frame)
+            }
+        }
+
+        func runOnTransportQueue(_ work: @escaping () -> Void) {
+            queue.async(execute: work)
         }
     }
 
