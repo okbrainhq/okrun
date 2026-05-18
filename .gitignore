@@ -32,6 +32,7 @@ vm/
 .e2e/
 web-switch/.ca/
 web-switch/.certs/
+web-switch/.prod_certs/
 web-switch/.deploy.switch
 
 # Local project registry and config copies

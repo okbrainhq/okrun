@@ -1,0 +1,13 @@
+# Required
+HOSTNAME=switch.example.com
+REPO_URL=https://github.com/okbrainhq/okrun.git
+
+# Optional
+DEPLOY_HOST=deploy@switch.example.com
+SSH_PORT=22
+SWITCH_TLS_PORT=9443
+SWITCH_STATUS_PORT=8080
+
+# Optional cert path for --upload-certs.
+# This root should contain ca/ and server/ directories.
+# CERTS_DIR=.certs/prod

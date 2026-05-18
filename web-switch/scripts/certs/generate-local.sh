@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-exec "$(dirname "$0")/../../generate-local-certs.sh"
+exec "$(dirname "$0")/../../generate-local-certs.sh" "$@"
