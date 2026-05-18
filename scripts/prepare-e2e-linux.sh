@@ -12,6 +12,7 @@ E2E_SHARED_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-shared"
 E2E_SAVE_RESTORE_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-save-restore"
 E2E_PRIVATE_NETWORK_SERVER_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-server"
 E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-client"
+E2E_PRIVATE_NETWORK_RECONNECT_CLIENT_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-reconnect-client"
 E2E_PRIVATE_NETWORK_DHCP_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-dhcp"
 E2E_PRIVATE_NETWORK_DHCP_SERVER_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-dhcp-server"
 E2E_PRIVATE_NETWORK_DHCP_CLIENT_INITRAMFS="$FIXTURE_DIR/initramfs-okrun-e2e-private-network-dhcp-client"
@@ -133,7 +134,7 @@ fi
 /bin/busybox ip addr add 10.77.0.2/24 dev "$PRIVATE_IFACE"
 echo OKRUN_E2E_PRIVATE_NETWORK_SERVER_READY >/dev/console
 echo OKRUN_E2E_PRIVATE_NETWORK_SERVER_READY >/dev/hvc0 2>/dev/null || true
-/bin/busybox sleep 30
+/bin/busybox sleep 120
 /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
 while true; do :; done
 EOF
@@ -190,6 +191,94 @@ EOF
 chmod 0755 "$WORK_DIR/init"
 
 (cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS")
+
+cat > "$WORK_DIR/init" <<'EOF'
+#!/bin/sh
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+/bin/busybox mount -t proc proc /proc 2>/dev/null || true
+/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
+/sbin/modprobe virtio_net 2>/dev/null || true
+
+emit_marker() {
+  echo "$1" >/dev/console
+  echo "$1" >/dev/hvc0 2>/dev/null || true
+}
+
+ping_server() {
+  /bin/busybox ping -c 1 -W 1 10.77.0.2 >/dev/console 2>&1
+}
+
+PRIVATE_IFACE=""
+for attempt in 1 2 3 4 5; do
+  for path in /sys/class/net/*; do
+    iface="${path##*/}"
+    [ "$iface" = "lo" ] && continue
+    PRIVATE_IFACE="$iface"
+  done
+  [ -n "$PRIVATE_IFACE" ] && break
+  /bin/busybox sleep 1
+done
+
+echo "OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_CLIENT_IFACE=${PRIVATE_IFACE}" >/dev/console
+echo "OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_CLIENT_IFACE=${PRIVATE_IFACE}" >/dev/hvc0 2>/dev/null || true
+
+if [ -z "$PRIVATE_IFACE" ]; then
+  emit_marker OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_FAILED_NO_IFACE
+  /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+  while true; do :; done
+fi
+
+/bin/busybox ip link set "$PRIVATE_IFACE" up
+/bin/busybox ip addr add 10.77.0.3/24 dev "$PRIVATE_IFACE"
+
+initial_ok=0
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  if ping_server; then
+    initial_ok=1
+    emit_marker OKRUN_E2E_PRIVATE_NETWORK_INITIAL_PASSED
+    break
+  fi
+  /bin/busybox sleep 1
+done
+
+if [ "$initial_ok" != "1" ]; then
+  emit_marker OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_FAILED_INITIAL
+  /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+  while true; do :; done
+fi
+
+disconnected=0
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  if ! ping_server; then
+    disconnected=1
+    emit_marker OKRUN_E2E_PRIVATE_NETWORK_DISCONNECTED
+    break
+  fi
+  /bin/busybox sleep 1
+done
+
+if [ "$disconnected" != "1" ]; then
+  emit_marker OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_FAILED_NO_DISCONNECT
+  /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+  while true; do :; done
+fi
+
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45; do
+  if ping_server; then
+    emit_marker OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_PASSED
+    /bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+    while true; do :; done
+  fi
+  /bin/busybox sleep 1
+done
+
+emit_marker OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_FAILED_FINAL
+/bin/busybox poweroff -f 2>/dev/null || /bin/busybox reboot -f 2>/dev/null || true
+while true; do :; done
+EOF
+chmod 0755 "$WORK_DIR/init"
+
+(cd "$WORK_DIR" && find . | cpio -o -H newc --quiet | gzip -9 > "$E2E_PRIVATE_NETWORK_RECONNECT_CLIENT_INITRAMFS")
 
 cat > "$WORK_DIR/init" <<'EOF'
 #!/bin/sh
@@ -434,3 +523,4 @@ echo "$E2E_PRIVATE_NETWORK_CLIENT_INITRAMFS"
 echo "$E2E_PRIVATE_NETWORK_DHCP_INITRAMFS"
 echo "$E2E_PRIVATE_NETWORK_DHCP_SERVER_INITRAMFS"
 echo "$E2E_PRIVATE_NETWORK_DHCP_CLIENT_INITRAMFS"
+echo "$E2E_PRIVATE_NETWORK_RECONNECT_CLIENT_INITRAMFS"

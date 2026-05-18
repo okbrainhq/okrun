@@ -440,6 +440,7 @@ private final class VirtualSwitchSocket {
     var onFrame: ((Data) -> Void)?
     var onStatusChange: ((PrivateNetworkSwitchConnectionState, String, Int, String?) -> Void)?
 
+    private let identifier: String
     private let realSocket: RealSwitchSocket
     private var outgoingSequenceNumber: UInt32 = 0
     private let incomingDedup = SwitchDedupWindow()
@@ -451,6 +452,7 @@ private final class VirtualSwitchSocket {
         dhcpRange: PrivateNetworkDHCPLeaseRange?,
         nodeID: UUID
     ) throws {
+        self.identifier = identifier
         realSocket = try RealSwitchSocket(
             identifier: identifier,
             config: config,
@@ -471,6 +473,15 @@ private final class VirtualSwitchSocket {
                 if streams.contains(SwitchFrame.ethernetStreamID) {
                     self?.incomingDedup.reset()
                 }
+            }
+        }
+        realSocket.onInitialized = { [weak self] in
+            self?.queue.async {
+                guard let self else { return }
+                self.incomingDedup.reset()
+                AppLog.webSwitch.info(
+                    "reset incoming dedup after init network=\(self.identifier, privacy: .public)"
+                )
             }
         }
         realSocket.onStatusChange = { [weak self] state, message, connections, error in
@@ -514,6 +525,7 @@ private final class RealSwitchSocket {
 
     var onFrame: ((SwitchFrame) -> Void)?
     var onResetSeq: (([UInt32]) -> Void)?
+    var onInitialized: (() -> Void)?
     var onStatusChange: ((PrivateNetworkSwitchConnectionState, String, Int, String?) -> Void)?
 
     private let identifier: String
@@ -804,6 +816,7 @@ private final class RealSwitchSocket {
                 AppLog.webSwitch.info(
                     "init complete network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) reconnectAttempts=\(completedAttempts, privacy: .public) maxFrameSize=\(self.maxFrameSize, privacy: .public)"
                 )
+                onInitialized?()
                 flushPendingWrites()
                 report(.connected, "Connected to \(endpoint.description).", connections: 1, error: nil)
             } catch {

@@ -5,9 +5,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_DIR="$(mktemp -d "/tmp/okrun-sw.XXXXXX")"
 SWITCH_PID=""
 SERVER_HOST_PID=""
+CLIENT_HOST_PID=""
 
 cleanup() {
   local status="$?"
+  if [[ -n "${CLIENT_HOST_PID:-}" ]] && kill -0 "$CLIENT_HOST_PID" 2>/dev/null; then
+    kill "$CLIENT_HOST_PID" 2>/dev/null || true
+    wait "$CLIENT_HOST_PID" 2>/dev/null || true
+  fi
   if [[ -n "${SERVER_HOST_PID:-}" ]] && kill -0 "$SERVER_HOST_PID" 2>/dev/null; then
     kill "$SERVER_HOST_PID" 2>/dev/null || true
     wait "$SERVER_HOST_PID" 2>/dev/null || true
@@ -140,13 +145,58 @@ write_host_config() {
 EOF
 }
 
+start_web_switch() {
+  local name="$1"
+  local mode="${2:-append}"
+
+  printf '  -> %s\n' "$name"
+  if [[ "$mode" == "truncate" ]]; then
+    : >"$WORK_DIR/web-switch.log"
+  fi
+
+  OKRUN_SWITCH_DEBUG=1 node "$ROOT/web-switch/src/index.js" \
+    --host 127.0.0.1 \
+    --tls-port "$TLS_PORT" \
+    --status-port "$STATUS_PORT" \
+    --server-bundle "$CERT_DIR/server/okrun-switch-server-bundle.json" \
+    --crl "$CA_DIR/crl.txt" \
+    --keepalive-interval-ms 1000 \
+    --keepalive-timeout-ms 5000 \
+    --init-timeout-ms 10000 \
+    >>"$WORK_DIR/web-switch.log" 2>&1 &
+  SWITCH_PID="$!"
+  wait_for_http_ok "$STATUS_PORT"
+  printf '  OK %s\n' "$name"
+}
+
+stop_web_switch() {
+  local name="$1"
+
+  printf '  -> %s\n' "$name"
+  if [[ -n "${SWITCH_PID:-}" ]] && kill -0 "$SWITCH_PID" 2>/dev/null; then
+    kill "$SWITCH_PID" 2>/dev/null || true
+    wait "$SWITCH_PID" 2>/dev/null || true
+  fi
+  SWITCH_PID=""
+  printf '  OK %s\n' "$name"
+}
+
+dump_runtime_logs() {
+  printf '\n--- server host output ---\n' >&2
+  sed -n '1,260p' "$WORK_DIR/server-host.log" >&2 || true
+  printf '\n--- client host output ---\n' >&2
+  sed -n '1,260p' "$WORK_DIR/client-host.log" >&2 || true
+  printf '\n--- web-switch output ---\n' >&2
+  sed -n '1,320p' "$WORK_DIR/web-switch.log" >&2 || true
+}
+
 printf '  -> Prepare Alpine boot fixtures\n'
 "$ROOT/scripts/prepare-e2e-linux.sh" >"$WORK_DIR/e2e-linux-paths.txt"
 printf '  OK Prepare Alpine boot fixtures\n'
 
 KERNEL="$(sed -n '1p' "$WORK_DIR/e2e-linux-paths.txt")"
 PRIVATE_NETWORK_SERVER_INITRAMFS="$(sed -n '5p' "$WORK_DIR/e2e-linux-paths.txt")"
-PRIVATE_NETWORK_CLIENT_INITRAMFS="$(sed -n '6p' "$WORK_DIR/e2e-linux-paths.txt")"
+PRIVATE_NETWORK_RECONNECT_CLIENT_INITRAMFS="$(sed -n '10p' "$WORK_DIR/e2e-linux-paths.txt")"
 
 run_step "Build production app" "$ROOT/scripts/build.sh"
 
@@ -173,20 +223,7 @@ write_host_config "$HOST_A_HOME" "$CERT_DIR/host-a" "$NETWORK_ID" "$TLS_PORT"
 write_host_config "$HOST_B_HOME" "$CERT_DIR/host-b" "$NETWORK_ID" "$TLS_PORT"
 mkdir -p "$HOST_A_SOCKET_ROOT" "$HOST_B_SOCKET_ROOT"
 
-printf '  -> Start web-switch\n'
-OKRUN_SWITCH_DEBUG=1 node "$ROOT/web-switch/src/index.js" \
-  --host 127.0.0.1 \
-  --tls-port "$TLS_PORT" \
-  --status-port "$STATUS_PORT" \
-  --server-bundle "$CERT_DIR/server/okrun-switch-server-bundle.json" \
-  --crl "$CA_DIR/crl.txt" \
-  --keepalive-interval-ms 1000 \
-  --keepalive-timeout-ms 5000 \
-  --init-timeout-ms 10000 \
-  >"$WORK_DIR/web-switch.log" 2>&1 &
-SWITCH_PID="$!"
-wait_for_http_ok "$STATUS_PORT"
-printf '  OK Start web-switch\n'
+start_web_switch "Start web-switch" truncate
 
 printf '  -> Start switch server host VM\n'
 env OKRUN_HOME="$HOST_A_HOME" \
@@ -199,31 +236,68 @@ env OKRUN_HOME="$HOST_A_HOME" \
   --private-network-id "$NETWORK_ID" \
   --expect-output OKRUN_E2E_PRIVATE_NETWORK_SERVER_READY \
   --mirror-serial-output \
-  --linger-after-output 35 \
+  --linger-after-output 120 \
   --timeout 60 \
   >"$WORK_DIR/server-host.log" 2>&1 &
 SERVER_HOST_PID="$!"
-wait_for_log_marker "$WORK_DIR/server-host.log" OKRUN_E2E_PRIVATE_NETWORK_SERVER_READY 60
-wait_for_switch_hosts 1 10
+if ! wait_for_log_marker "$WORK_DIR/server-host.log" OKRUN_E2E_PRIVATE_NETWORK_SERVER_READY 60; then
+  dump_runtime_logs
+  exit 1
+fi
+if ! wait_for_switch_hosts 1 10; then
+  dump_runtime_logs
+  exit 1
+fi
 printf '  OK Start switch server host VM\n'
 
-if ! run_step "Ping across web-switch private network" \
-  env OKRUN_HOME="$HOST_B_HOME" \
+printf '  -> Start switch reconnect client VM\n'
+env OKRUN_HOME="$HOST_B_HOME" \
   OKRUN_PRIVATE_NETWORK_SOCKET_ROOT="$HOST_B_SOCKET_ROOT" \
   OKRUN_SWITCH_DEBUG=1 \
   "$ROOT/OkrunVM.app/Contents/MacOS/OkrunVM" \
   --headless-switch-host-test \
   --kernel "$KERNEL" \
-  --initramfs "$PRIVATE_NETWORK_CLIENT_INITRAMFS" \
+  --initramfs "$PRIVATE_NETWORK_RECONNECT_CLIENT_INITRAMFS" \
   --private-network-id "$NETWORK_ID" \
-  --expect-output OKRUN_E2E_PRIVATE_NETWORK_PASSED \
+  --expect-output OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_PASSED \
   --mirror-serial-output \
-  --timeout 60; then
-  printf '\n--- server host output ---\n' >&2
-  sed -n '1,240p' "$WORK_DIR/server-host.log" >&2 || true
-  printf '\n--- web-switch output ---\n' >&2
-  sed -n '1,240p' "$WORK_DIR/web-switch.log" >&2 || true
+  --timeout 150 \
+  >"$WORK_DIR/client-host.log" 2>&1 &
+CLIENT_HOST_PID="$!"
+
+if ! wait_for_log_marker "$WORK_DIR/client-host.log" OKRUN_E2E_PRIVATE_NETWORK_INITIAL_PASSED 75; then
+  dump_runtime_logs
+  exit 1
+fi
+if ! wait_for_switch_hosts 2 10; then
+  dump_runtime_logs
+  exit 1
+fi
+printf '  OK Initial ping across web-switch private network\n'
+
+stop_web_switch "Stop web-switch for reconnect"
+if ! wait_for_log_marker "$WORK_DIR/client-host.log" OKRUN_E2E_PRIVATE_NETWORK_DISCONNECTED 45; then
+  dump_runtime_logs
   exit 1
 fi
 
-printf 'Headless switch E2E passed: OKRUN_E2E_PRIVATE_NETWORK_PASSED\n'
+start_web_switch "Restart web-switch"
+if ! wait_for_switch_hosts 2 90; then
+  dump_runtime_logs
+  exit 1
+fi
+
+if ! wait_for_log_marker "$WORK_DIR/client-host.log" OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_PASSED 90; then
+  dump_runtime_logs
+  exit 1
+fi
+
+if ! wait "$CLIENT_HOST_PID"; then
+  CLIENT_HOST_PID=""
+  dump_runtime_logs
+  exit 1
+fi
+CLIENT_HOST_PID=""
+
+printf '  OK Web-switch reconnect preserved private network traffic\n'
+printf 'Headless switch E2E passed: OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_PASSED\n'

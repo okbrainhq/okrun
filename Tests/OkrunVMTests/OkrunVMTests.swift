@@ -1375,6 +1375,9 @@ struct OkrunVMTests {
         #expect(window.accept(11))
         #expect(window.accept(140))
         #expect(!window.accept(11))
+
+        window.reset()
+        #expect(window.accept(1))
     }
 
     @Test
