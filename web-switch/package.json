@@ -1,0 +1,20 @@
+{
+  "name": "okrun-web-switch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Plain Node.js mTLS layer-2 switch for OkRun private networks",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js --tls-port 9443 --status-port 8080",
+    "test": "node tests/e2e/run.js",
+    "ca": "node bin/okrun-switch-ca.js"
+  },
+  "bin": {
+    "okrun-switch-ca": "bin/okrun-switch-ca.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {}
+}
