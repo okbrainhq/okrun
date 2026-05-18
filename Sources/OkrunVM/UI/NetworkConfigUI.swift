@@ -1,11 +1,30 @@
 import AppKit
 
+private enum NetworkConfigPalette {
+    static let panelBackground = NSColor(calibratedWhite: 0.11, alpha: 1)
+    static let sectionBackground = NSColor(calibratedWhite: 0.13, alpha: 1)
+    static let rowBackground = NSColor(calibratedWhite: 0.15, alpha: 1)
+    static let fieldBackground = NSColor(calibratedWhite: 0.08, alpha: 1)
+    static let primaryText = NSColor.white.withAlphaComponent(0.92)
+    static let secondaryText = NSColor.white.withAlphaComponent(0.58)
+    static let disabledText = NSColor.white.withAlphaComponent(0.36)
+    static let border = NSColor.white.withAlphaComponent(0.13)
+    static let separator = NSColor.white.withAlphaComponent(0.11)
+    static let infoBackground = NSColor.white.withAlphaComponent(0.07)
+    static let infoBorder = NSColor.white.withAlphaComponent(0.12)
+    static let errorBackground = NSColor.systemRed.withAlphaComponent(0.11)
+    static let errorBorder = NSColor.systemRed.withAlphaComponent(0.24)
+    static let errorText = NSColor(calibratedRed: 1, green: 0.38, blue: 0.38, alpha: 1)
+}
+
 private final class NetworkConfigPanelActions: NSObject {
     var onApply: (() -> Void)?
     var onRefresh: (() -> Void)?
     var onClose: (() -> Void)?
     var onAddPeer: (() -> Void)?
     var onRemovePeer: (() -> Void)?
+    var onBridgeToggle: (() -> Void)?
+    var onSwitchToggle: (() -> Void)?
 
     @objc func apply() {
         onApply?()
@@ -26,6 +45,21 @@ private final class NetworkConfigPanelActions: NSObject {
     @objc func removePeer() {
         onRemovePeer?()
     }
+
+    @objc func bridgeToggle() {
+        onBridgeToggle?()
+    }
+
+    @objc func switchToggle() {
+        onSwitchToggle?()
+    }
+}
+
+private struct SwitchCertificateBundle: Decodable {
+    var server: String
+    var caCertPem: String
+    var clientCertPem: String
+    var clientKeyPem: String
 }
 
 private final class NetworkPeerRowView: NSView {
@@ -43,7 +77,7 @@ private final class NetworkPeerRowView: NSView {
 
     init(host: String, port: String, index: Int?, isHeader: Bool = false) {
         self.index = index
-        backgroundColor = isHeader ? NSColor(calibratedWhite: 0.12, alpha: 1) : NSColor(calibratedWhite: 0.16, alpha: 1)
+        backgroundColor = isHeader ? NetworkConfigPalette.sectionBackground : NetworkConfigPalette.rowBackground
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -54,13 +88,13 @@ private final class NetworkPeerRowView: NSView {
         let hostLabel = NSTextField(labelWithString: host)
         hostLabel.translatesAutoresizingMaskIntoConstraints = false
         hostLabel.font = isHeader ? .systemFont(ofSize: 12, weight: .semibold) : .monospacedSystemFont(ofSize: 12, weight: .regular)
-        hostLabel.textColor = .labelColor
+        hostLabel.textColor = isHeader ? NetworkConfigPalette.secondaryText : NetworkConfigPalette.primaryText
         hostLabel.lineBreakMode = .byTruncatingMiddle
 
         let portLabel = NSTextField(labelWithString: port)
         portLabel.translatesAutoresizingMaskIntoConstraints = false
         portLabel.font = hostLabel.font
-        portLabel.textColor = .labelColor
+        portLabel.textColor = hostLabel.textColor
         portLabel.alignment = .left
 
         addSubview(hostLabel)
@@ -113,8 +147,8 @@ private final class NetworkPeerListView: NSView {
 
         wantsLayer = true
         layer?.borderWidth = 1
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.13).cgColor
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1).cgColor
+        layer?.borderColor = NetworkConfigPalette.border.cgColor
+        layer?.backgroundColor = NetworkConfigPalette.rowBackground.cgColor
         layer?.masksToBounds = true
 
         rows.translatesAutoresizingMaskIntoConstraints = false
@@ -188,7 +222,7 @@ extension AppDelegate {
         var timer: DispatchSourceTimer?
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 780),
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 850),
             styleMask: [.titled],
             backing: .buffered,
             defer: false
@@ -196,21 +230,23 @@ extension AppDelegate {
         panel.title = "Private Network"
         panel.isReleasedWhenClosed = false
         panel.level = .modalPanel
-        panel.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1)
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.backgroundColor = NetworkConfigPalette.panelBackground
 
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
         content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1).cgColor
+        content.layer?.backgroundColor = NetworkConfigPalette.panelBackground.cgColor
 
         let title = NSTextField(labelWithString: "Private Network")
         title.translatesAutoresizingMaskIntoConstraints = false
         title.font = .systemFont(ofSize: 20, weight: .semibold)
+        title.textColor = NetworkConfigPalette.primaryText
 
         let pathLabel = NSTextField(labelWithString: store.home.privateNetworksURL.path)
         pathLabel.translatesAutoresizingMaskIntoConstraints = false
         pathLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        pathLabel.textColor = .secondaryLabelColor
+        pathLabel.textColor = NetworkConfigPalette.secondaryText
         pathLabel.lineBreakMode = .byTruncatingMiddle
 
         let dhcpEnabled = makeNetworkCheckbox("DHCP", identifier: "okrun.network.dhcp.enabled")
@@ -224,9 +260,9 @@ extension AppDelegate {
         let bindHostField = makeNetworkField(identifier: "okrun.network.bridge.bind-host")
         let bindPortField = makeNetworkField(identifier: "okrun.network.bridge.bind-port")
         let peerHostField = makeNetworkField(identifier: "okrun.network.bridge.peer-host")
-        peerHostField.placeholderString = "172.16.0.10"
+        setNetworkPlaceholder("172.16.0.10", on: peerHostField)
         let peerPortField = makeNetworkField(identifier: "okrun.network.bridge.peer-port")
-        peerPortField.placeholderString = "7777"
+        setNetworkPlaceholder("7777", on: peerPortField)
         peerPortField.stringValue = "7777"
         let addPeerButton = NSButton(title: "Add Peer", target: nil, action: nil)
         addPeerButton.setAccessibilityIdentifier("okrun.network.bridge.peer-add")
@@ -235,23 +271,38 @@ extension AppDelegate {
         removePeerButton.setAccessibilityIdentifier("okrun.network.bridge.peer-remove")
         removePeerButton.bezelStyle = .rounded
 
-        let peerControls = NSStackView(views: [peerHostField, peerPortField, addPeerButton, removePeerButton])
-        peerControls.translatesAutoresizingMaskIntoConstraints = false
-        peerControls.orientation = .horizontal
-        peerControls.alignment = .centerY
-        peerControls.spacing = 8
-        peerPortField.widthAnchor.constraint(equalToConstant: 88).isActive = true
+        let peerButtonRow = NSStackView(views: [addPeerButton, removePeerButton])
+        peerButtonRow.translatesAutoresizingMaskIntoConstraints = false
+        peerButtonRow.orientation = .horizontal
+        peerButtonRow.alignment = .centerY
+        peerButtonRow.spacing = 8
         addPeerButton.widthAnchor.constraint(equalToConstant: 96).isActive = true
         removePeerButton.widthAnchor.constraint(equalToConstant: 116).isActive = true
 
         let peersTable = NetworkPeerListView()
         peersTable.heightAnchor.constraint(equalToConstant: 112).isActive = true
 
+        let switchEnabled = makeNetworkCheckbox("Web Switch", identifier: "okrun.network.switch.enabled")
+        let switchMultipath = makeNetworkCheckbox("Multipath", identifier: "okrun.network.switch.multipath")
+        let switchServerField = makeNetworkField(identifier: "okrun.network.switch.server")
+        setNetworkPlaceholder("switch.example.com:9443", on: switchServerField)
+
+        let (bundleScroll, bundleTextView) = makeNetworkTextArea(
+            identifier: "okrun.network.switch.bundle",
+            height: 190
+        )
+
         let bindStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.bind")
         let peerStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.peers")
-        let messageLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.message")
-        messageLabel.lineBreakMode = .byWordWrapping
-        messageLabel.maximumNumberOfLines = 2
+        let bridgeMessageLabel = makeNetworkStatusLabel(identifier: "okrun.network.bridge.status.message")
+        bridgeMessageLabel.lineBreakMode = .byWordWrapping
+        bridgeMessageLabel.maximumNumberOfLines = 3
+        let switchStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.switch")
+        let switchServerStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.switch-server")
+        let switchMessageLabel = makeNetworkStatusLabel(identifier: "okrun.network.switch.status.message")
+        switchMessageLabel.lineBreakMode = .byWordWrapping
+        switchMessageLabel.maximumNumberOfLines = 3
+        let (messageBanner, messageLabel) = makeNetworkMessageBanner(identifier: "okrun.network.status.message")
 
         let applyButton = NSButton(title: "Apply & Connect", target: nil, action: nil)
         applyButton.setAccessibilityIdentifier("okrun.network.apply")
@@ -270,37 +321,78 @@ extension AppDelegate {
         closeButton.controlSize = .large
         closeButton.keyEquivalent = "\u{1b}"
 
-        let dhcpSectionTitle = makeNetworkSectionTitle("DHCP Settings")
-        let bridgeSectionTitle = makeNetworkSectionTitle("Bridge Settings")
-        let statusSectionTitle = makeNetworkSectionTitle("Bridge Status")
-        let dhcpSeparator = makeNetworkSeparator()
-        let bridgeSeparator = makeNetworkSeparator()
-
-        let statusGrid = NSGridView(views: [
-            [makeNetworkLabel("Bind Status"), bindStatusLabel],
-            [makeNetworkLabel("Peer Status"), peerStatusLabel],
-            [makeNetworkLabel("Message"), messageLabel]
+        let dhcpStateGrid = NSGridView(views: [
+            [makeNetworkLabel("Enabled"), dhcpEnabled]
         ])
-        configureNetworkGrid(statusGrid)
-
-        let dhcpGrid = NSGridView(views: [
-            [makeNetworkLabel("DHCP"), dhcpEnabled],
+        configureNetworkGrid(dhcpStateGrid)
+        let dhcpLeaseGrid = NSGridView(views: [
             [makeNetworkLabel("CIDR"), cidrField],
             [makeNetworkLabel("Range Start"), rangeStartField],
             [makeNetworkLabel("Range End"), rangeEndField],
             [makeNetworkLabel("Lease Seconds"), leaseField]
         ])
-        configureNetworkGrid(dhcpGrid)
+        configureNetworkGrid(dhcpLeaseGrid)
+        let dhcpStack = makeNetworkSettingsStack([
+            makeNetworkSettingsSection(title: "DHCP", contentView: dhcpStateGrid),
+            makeNetworkSettingsSection(title: "Lease Range", contentView: dhcpLeaseGrid)
+        ])
 
-        let bridgeGrid = NSGridView(views: [
-            [makeNetworkLabel("Bridge"), bridgeEnabled],
+        let bridgeConnectionGrid = NSGridView(views: [
+            [makeNetworkLabel("Enabled"), bridgeEnabled],
             [makeNetworkLabel("Bind"), bindEnabled],
             [makeNetworkLabel("Bind Host"), bindHostField],
-            [makeNetworkLabel("Bind Port"), bindPortField],
-            [makeNetworkLabel("Add Peer"), peerControls],
-            [makeNetworkLabel("Peers"), peersTable]
+            [makeNetworkLabel("Bind Port"), bindPortField]
         ])
-        configureNetworkGrid(bridgeGrid)
+        configureNetworkGrid(bridgeConnectionGrid)
+        let bridgePeersGrid = NSGridView(views: [
+            [makeNetworkLabel("Peer Host"), peerHostField],
+            [makeNetworkLabel("Peer Port"), peerPortField],
+            [makeNetworkLabel("Peer Actions"), peerButtonRow],
+            [makeNetworkLabel("Configured Peers"), peersTable]
+        ])
+        configureNetworkGrid(bridgePeersGrid)
+        let bridgeStatusGrid = NSGridView(views: [
+            [makeNetworkLabel("Bind Status"), bindStatusLabel],
+            [makeNetworkLabel("Peer Status"), peerStatusLabel],
+            [makeNetworkLabel("Message"), bridgeMessageLabel]
+        ])
+        configureNetworkGrid(bridgeStatusGrid)
+        let bridgeStack = makeNetworkSettingsStack([
+            makeNetworkSettingsSection(title: "Bridge", contentView: bridgeConnectionGrid),
+            makeNetworkSettingsSection(title: "Peers", contentView: bridgePeersGrid),
+            makeNetworkSettingsSection(title: "Status", contentView: bridgeStatusGrid)
+        ])
+
+        let switchConnectionGrid = NSGridView(views: [
+            [makeNetworkLabel("Enabled"), switchEnabled],
+            [makeNetworkLabel("Multipath"), switchMultipath],
+            [makeNetworkLabel("Server URL"), switchServerField]
+        ])
+        configureNetworkGrid(switchConnectionGrid)
+        let switchBundleGrid = NSGridView(views: [
+            [makeNetworkLabel("Host Bundle JSON"), bundleScroll]
+        ])
+        configureNetworkGrid(switchBundleGrid)
+        let switchStatusGrid = NSGridView(views: [
+            [makeNetworkLabel("Status"), switchStatusLabel],
+            [makeNetworkLabel("Server"), switchServerStatusLabel],
+            [makeNetworkLabel("Message"), switchMessageLabel]
+        ])
+        configureNetworkGrid(switchStatusGrid)
+        let switchStack = makeNetworkSettingsStack([
+            makeNetworkSettingsSection(title: "Web Switch", contentView: switchConnectionGrid),
+            makeNetworkSettingsSection(title: "Credentials", contentView: switchBundleGrid),
+            makeNetworkSettingsSection(title: "Status", contentView: switchStatusGrid)
+        ])
+
+        let tabView = NSTabView()
+        tabView.translatesAutoresizingMaskIntoConstraints = false
+        tabView.setAccessibilityIdentifier("okrun.network.tabs")
+        tabView.tabViewType = .topTabsBezelBorder
+        tabView.addTabViewItem(makeNetworkTabItem(label: "DHCP", contentView: dhcpStack))
+        tabView.addTabViewItem(makeNetworkTabItem(label: "Bridge", contentView: bridgeStack))
+        tabView.addTabViewItem(makeNetworkTabItem(label: "Web Switch", contentView: switchStack))
+        tabView.selectTabViewItem(at: 0)
 
         let buttonRow = NSStackView(views: [refreshButton, closeButton, applyButton])
         buttonRow.translatesAutoresizingMaskIntoConstraints = false
@@ -310,14 +402,8 @@ extension AppDelegate {
 
         content.addSubview(title)
         content.addSubview(pathLabel)
-        content.addSubview(dhcpSectionTitle)
-        content.addSubview(dhcpGrid)
-        content.addSubview(dhcpSeparator)
-        content.addSubview(bridgeSectionTitle)
-        content.addSubview(bridgeGrid)
-        content.addSubview(bridgeSeparator)
-        content.addSubview(statusSectionTitle)
-        content.addSubview(statusGrid)
+        content.addSubview(tabView)
+        content.addSubview(messageBanner)
         content.addSubview(buttonRow)
         panel.contentView = content
 
@@ -328,39 +414,65 @@ extension AppDelegate {
             pathLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             pathLabel.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             pathLabel.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
-            dhcpSectionTitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            dhcpSectionTitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            dhcpSectionTitle.topAnchor.constraint(equalTo: pathLabel.bottomAnchor, constant: 20),
-            dhcpGrid.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            dhcpGrid.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            dhcpGrid.topAnchor.constraint(equalTo: dhcpSectionTitle.bottomAnchor, constant: 8),
-            dhcpSeparator.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            dhcpSeparator.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            dhcpSeparator.topAnchor.constraint(equalTo: dhcpGrid.bottomAnchor, constant: 16),
-            dhcpSeparator.heightAnchor.constraint(equalToConstant: 1),
-            bridgeSectionTitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            bridgeSectionTitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            bridgeSectionTitle.topAnchor.constraint(equalTo: dhcpSeparator.bottomAnchor, constant: 14),
-            bridgeGrid.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            bridgeGrid.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            bridgeGrid.topAnchor.constraint(equalTo: bridgeSectionTitle.bottomAnchor, constant: 8),
-            bridgeSeparator.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            bridgeSeparator.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            bridgeSeparator.topAnchor.constraint(equalTo: bridgeGrid.bottomAnchor, constant: 16),
-            bridgeSeparator.heightAnchor.constraint(equalToConstant: 1),
-            statusSectionTitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            statusSectionTitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            statusSectionTitle.topAnchor.constraint(equalTo: bridgeSeparator.bottomAnchor, constant: 14),
-            statusGrid.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            statusGrid.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            statusGrid.topAnchor.constraint(equalTo: statusSectionTitle.bottomAnchor, constant: 8),
-            statusGrid.bottomAnchor.constraint(lessThanOrEqualTo: buttonRow.topAnchor, constant: -24),
+            tabView.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            tabView.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            tabView.topAnchor.constraint(equalTo: pathLabel.bottomAnchor, constant: 20),
+            tabView.heightAnchor.constraint(equalToConstant: 600),
+            tabView.bottomAnchor.constraint(lessThanOrEqualTo: messageBanner.topAnchor, constant: -14),
+            messageBanner.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            messageBanner.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            messageBanner.bottomAnchor.constraint(equalTo: buttonRow.topAnchor, constant: -12),
+            messageBanner.heightAnchor.constraint(greaterThanOrEqualToConstant: 34),
             buttonRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
             buttonRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
             refreshButton.widthAnchor.constraint(equalToConstant: 100),
             closeButton.widthAnchor.constraint(equalToConstant: 100),
             applyButton.widthAnchor.constraint(equalToConstant: 142)
         ])
+
+        func setPanelMessage(_ message: String, isError: Bool = false) {
+            messageLabel.stringValue = message
+            messageLabel.textColor = isError
+                ? NetworkConfigPalette.errorText
+                : NetworkConfigPalette.secondaryText
+            messageBanner.layer?.backgroundColor = (isError
+                ? NetworkConfigPalette.errorBackground
+                : .clear
+            ).cgColor
+            messageBanner.layer?.borderColor = (isError
+                ? NetworkConfigPalette.errorBorder
+                : .clear
+            ).cgColor
+        }
+
+        func updateTransportControls() {
+            let bridgeOn = bridgeEnabled.state == .on
+            let switchOn = switchEnabled.state == .on
+
+            switchEnabled.isEnabled = true
+            bridgeEnabled.isEnabled = true
+
+            let bridgeControlsEnabled = bridgeOn
+            bindEnabled.isEnabled = bridgeControlsEnabled
+            bindHostField.isEnabled = bridgeControlsEnabled
+            bindPortField.isEnabled = bridgeControlsEnabled
+            peerHostField.isEnabled = bridgeControlsEnabled
+            peerPortField.isEnabled = bridgeControlsEnabled
+            addPeerButton.isEnabled = bridgeControlsEnabled
+            removePeerButton.isEnabled = bridgeControlsEnabled
+            peersTable.alphaValue = bridgeControlsEnabled ? 1 : 0.55
+
+            switchMultipath.isEnabled = switchOn
+            switchServerField.isEnabled = switchOn
+            bundleTextView.isEditable = true
+            bundleTextView.isSelectable = true
+            bundleTextView.textColor = networkTextAreaTextColor(enabled: true)
+            bundleTextView.insertionPointColor = networkTextAreaInsertionPointColor()
+            bundleScroll.alphaValue = 1
+        }
+
+        var loadedSwitchServer = ""
+        var loadedSwitchBundleText = ""
 
         func loadFields() {
             do {
@@ -393,11 +505,26 @@ extension AppDelegate {
                     bindPortField.stringValue = "7777"
                     peersTable.peers = []
                 }
-                messageLabel.stringValue = "Loaded network config."
-                messageLabel.textColor = .secondaryLabelColor
+
+                if let switchConfig = privateNetwork?.switch {
+                    switchEnabled.state = switchConfig.enabled ? .on : .off
+                    switchMultipath.state = switchConfig.multipath ? .on : .off
+                    switchServerField.stringValue = switchConfig.server
+                    loadedSwitchServer = switchConfig.server
+                    bundleTextView.string = (try? readSavedSwitchBundleText()) ?? ""
+                    loadedSwitchBundleText = normalizedSwitchBundleText(bundleTextView.string)
+                } else {
+                    switchEnabled.state = .off
+                    switchMultipath.state = .off
+                    switchServerField.stringValue = ""
+                    loadedSwitchServer = ""
+                    bundleTextView.string = (try? readSavedSwitchBundleText()) ?? ""
+                    loadedSwitchBundleText = normalizedSwitchBundleText(bundleTextView.string)
+                }
+                updateTransportControls()
+                setPanelMessage("Loaded network config.")
             } catch {
-                messageLabel.stringValue = error.localizedDescription
-                messageLabel.textColor = .systemRed
+                setPanelMessage(error.localizedDescription, isError: true)
             }
         }
 
@@ -413,6 +540,188 @@ extension AppDelegate {
 
         func parsePeers() throws -> [PrivateNetworkBridgeEndpoint] {
             peersTable.peers
+        }
+
+        func normalizedSwitchServer(_ rawValue: String) throws -> String {
+            let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw AppError("Web Switch server URL must not be empty.")
+            }
+
+            let server: String
+            if trimmed.contains("://") {
+                guard let url = URL(string: trimmed),
+                      let host = url.host,
+                      let port = url.port else {
+                    throw AppError("Web Switch server URL must include a host and port.")
+                }
+                guard url.path.isEmpty || url.path == "/",
+                      url.query == nil,
+                      url.fragment == nil else {
+                    throw AppError("Web Switch server URL must not include a path, query, or fragment.")
+                }
+                server = "\(host):\(port)"
+            } else {
+                server = trimmed
+            }
+
+            _ = try PrivateNetworkSwitchConfig(server: server).endpoint()
+            return server
+        }
+
+        func switchCertDirectory() -> URL {
+            store.home.root
+                .appendingPathComponent("switch", isDirectory: true)
+                .appendingPathComponent(identifier, isDirectory: true)
+        }
+
+        func switchBundleURL() -> URL {
+            switchCertDirectory().appendingPathComponent("okrun-switch-bundle.json")
+        }
+
+        func normalizedSwitchBundleText(_ text: String) -> String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "" : trimmed + "\n"
+        }
+
+        func switchCredentialFingerprint(bundleJSON: String) -> String {
+            let hash = String(FNV1a64.hash(Array(bundleJSON.utf8)), radix: 16)
+            return String(repeating: "0", count: max(0, 16 - hash.count)) + hash
+        }
+
+        func readSavedSwitchBundleText() throws -> String? {
+            let url = switchBundleURL()
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return nil
+            }
+            return try String(contentsOf: url, encoding: .utf8)
+        }
+
+        func normalizedPEM(_ text: String, marker: String, label: String) throws -> String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.contains("-----BEGIN \(marker)-----"),
+                  trimmed.contains("-----END \(marker)-----") else {
+                throw AppError("\(label) must include a \(marker) PEM block.")
+            }
+            return trimmed + "\n"
+        }
+
+        func normalizedPrivateKeyPEM(_ text: String) throws -> String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.contains("-----BEGIN "),
+                  trimmed.contains("PRIVATE KEY-----"),
+                  trimmed.contains("-----END ") else {
+                throw AppError("Client private key must include a private key PEM block.")
+            }
+            return trimmed + "\n"
+        }
+
+        func writeSwitchCredentials(
+            bundleJSON: String,
+            ca: String,
+            cert: String,
+            key: String
+        ) throws -> (ca: String, cert: String, key: String) {
+            let directory = switchCertDirectory()
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+
+            let caURL = directory.appendingPathComponent("ca-cert.pem")
+            let certURL = directory.appendingPathComponent("client-cert.pem")
+            let keyURL = directory.appendingPathComponent("client-key.pem")
+            let bundleURL = switchBundleURL()
+
+            try Data(bundleJSON.utf8).write(to: bundleURL, options: .atomic)
+            try Data(ca.utf8).write(to: caURL, options: .atomic)
+            try Data(cert.utf8).write(to: certURL, options: .atomic)
+            try Data(key.utf8).write(to: keyURL, options: .atomic)
+
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bundleURL.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: caURL.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: certURL.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
+
+            return (caURL.path, certURL.path, keyURL.path)
+        }
+
+        func readSwitchConfig() throws -> PrivateNetworkSwitchConfig? {
+            guard switchEnabled.state == .on else { return nil }
+
+            let serverText = switchServerField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let bundleText = normalizedSwitchBundleText(bundleTextView.string)
+            if bundleText.isEmpty {
+                if let saved = try store.load().privateNetworks[identifier]?.switch, saved.enabled {
+                    let server = try normalizedSwitchServer(serverText.isEmpty ? saved.server : serverText)
+                    switchServerField.stringValue = server
+                    loadedSwitchServer = server
+                    return try PrivateNetworkSwitchConfig(
+                        enabled: true,
+                        server: server,
+                        caCert: saved.caCert,
+                        clientCert: saved.clientCert,
+                        clientKey: saved.clientKey,
+                        credentialFingerprint: saved.credentialFingerprint,
+                        multipath: switchMultipath.state == .on
+                    ).validated()
+                }
+                throw AppError("Paste a Web Switch host bundle JSON before applying.")
+            }
+
+            if bundleText == loadedSwitchBundleText,
+               let saved = try store.load().privateNetworks[identifier]?.switch,
+               saved.enabled {
+                let server = try normalizedSwitchServer(serverText.isEmpty ? saved.server : serverText)
+                switchServerField.stringValue = server
+                loadedSwitchServer = server
+                return try PrivateNetworkSwitchConfig(
+                    enabled: true,
+                    server: server,
+                    caCert: saved.caCert,
+                    clientCert: saved.clientCert,
+                    clientKey: saved.clientKey,
+                    credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText),
+                    multipath: switchMultipath.state == .on
+                ).validated()
+            }
+
+            let bundle: SwitchCertificateBundle
+            do {
+                let data = Data(bundleText.utf8)
+                bundle = try JSONDecoder().decode(SwitchCertificateBundle.self, from: data)
+            } catch {
+                throw AppError("Switch bundle JSON is invalid: \(error.localizedDescription)")
+            }
+
+            let bundleServer = bundle.server.trimmingCharacters(in: .whitespacesAndNewlines)
+            let serverSource = serverText.isEmpty || serverText == loadedSwitchServer
+                ? bundleServer
+                : serverText
+            let server = try normalizedSwitchServer(serverSource)
+            let paths = try writeSwitchCredentials(
+                bundleJSON: bundleText,
+                ca: normalizedPEM(bundle.caCertPem, marker: "CERTIFICATE", label: "CA certificate"),
+                cert: normalizedPEM(bundle.clientCertPem, marker: "CERTIFICATE", label: "Client certificate"),
+                key: normalizedPrivateKeyPEM(bundle.clientKeyPem)
+            )
+            bundleTextView.string = bundleText
+            loadedSwitchBundleText = bundleText
+            switchServerField.stringValue = server
+            loadedSwitchServer = server
+
+            let config = PrivateNetworkSwitchConfig(
+                enabled: true,
+                server: server,
+                caCert: paths.ca,
+                clientCert: paths.cert,
+                clientKey: paths.key,
+                credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText),
+                multipath: switchMultipath.state == .on
+            )
+            return try config.validated()
         }
 
         func readForm() throws -> HostPrivateNetworkConfig {
@@ -436,47 +745,75 @@ extension AppDelegate {
                 bridge = nil
             }
 
-            return HostPrivateNetworkConfig(dhcp: dhcp, bridge: bridge)
+            return HostPrivateNetworkConfig(dhcp: dhcp, bridge: bridge, switch: try readSwitchConfig())
         }
 
-        func updateStatus(_ status: PrivateNetworkBridgeStatus = PrivateNetworkRuntimeRegistry.shared.bridgeStatus(identifier: identifier)) {
+        func updateStatus(
+            bridgeStatus status: PrivateNetworkBridgeStatus = PrivateNetworkRuntimeRegistry.shared.bridgeStatus(identifier: identifier),
+            switchStatus: PrivateNetworkSwitchStatus = PrivateNetworkRuntimeRegistry.shared.switchStatus(identifier: identifier)
+        ) {
             bindStatusLabel.stringValue = status.bindMessage
-            bindStatusLabel.textColor = status.isListening ? .systemGreen : .secondaryLabelColor
+            bindStatusLabel.textColor = status.isListening ? .systemGreen : NetworkConfigPalette.secondaryText
 
+            switchStatusLabel.stringValue = switchStatus.state.rawValue.capitalized
+            switchStatusLabel.textColor = switchStatusColor(switchStatus.state)
+            switchServerStatusLabel.stringValue = switchStatus.server ?? "Not configured"
+            switchServerStatusLabel.textColor = switchStatus.isConnected ? .systemGreen : NetworkConfigPalette.secondaryText
+
+            let switchMessage = switchStatus.state == .disabled
+                ? (switchEnabled.state == .on ? "Apply to connect Web Switch." : "Web Switch disabled.")
+                : (switchStatus.errorMessage ?? switchStatus.message)
+            switchMessageLabel.stringValue = switchMessage
+            switchMessageLabel.textColor = switchStatus.errorMessage == nil
+                ? switchStatusColor(switchStatus.state)
+                : .systemRed
+
+            var bridgeMessages: [String] = []
+            var bridgeMessageColor = NetworkConfigPalette.secondaryText
             if let error = status.errorMessage {
                 peerStatusLabel.stringValue = "Error"
                 peerStatusLabel.textColor = .systemRed
-                messageLabel.stringValue = error
-                messageLabel.textColor = .systemRed
+                bridgeMessages.append(error)
+                bridgeMessageColor = .systemRed
+                bridgeMessageLabel.stringValue = bridgeMessages.joined(separator: "\n")
+                bridgeMessageLabel.textColor = bridgeMessageColor
                 return
             }
 
             if status.peers.isEmpty {
                 peerStatusLabel.stringValue = "No peers"
-                peerStatusLabel.textColor = .secondaryLabelColor
-                return
-            }
-
-            let connected = status.peers.filter(\.isConnected).count
-            let failed = status.peers.filter { $0.state == .failed || $0.state == .rejected }.count
-            let connecting = status.peers.filter { $0.state == .connecting }.count
-            if failed > 0 {
-                peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected, \(failed) error"
-                peerStatusLabel.textColor = .systemRed
-            } else if connecting > 0 {
-                peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected, \(connecting) connecting"
-                peerStatusLabel.textColor = .systemOrange
+                peerStatusLabel.textColor = NetworkConfigPalette.secondaryText
+                bridgeMessages.append(bridgeEnabled.state == .on ? "No bridge peers configured." : "Bridge disabled.")
             } else {
-                peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected"
-                peerStatusLabel.textColor = connected == status.peers.count ? .systemGreen : .secondaryLabelColor
+                let connected = status.peers.filter(\.isConnected).count
+                let failed = status.peers.filter { $0.state == .failed || $0.state == .rejected }.count
+                let connecting = status.peers.filter { $0.state == .connecting }.count
+                if failed > 0 {
+                    peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected, \(failed) error"
+                    peerStatusLabel.textColor = .systemRed
+                } else if connecting > 0 {
+                    peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected, \(connecting) connecting"
+                    peerStatusLabel.textColor = .systemOrange
+                } else {
+                    peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected"
+                    peerStatusLabel.textColor = connected == status.peers.count ? .systemGreen : NetworkConfigPalette.secondaryText
+                }
+
+                bridgeMessages.append(contentsOf: status.peers.map { peer in
+                    "\(peer.endpoint.description) [\(peer.state.rawValue)]: \(peer.message)"
+                })
+
+                if failed > 0 {
+                    bridgeMessageColor = .systemRed
+                } else if connecting > 0 {
+                    bridgeMessageColor = .systemOrange
+                } else if connected == status.peers.count {
+                    bridgeMessageColor = .systemGreen
+                }
             }
 
-            messageLabel.stringValue = status.peers.map { peer in
-                "\(peer.endpoint.description) [\(peer.state.rawValue)]: \(peer.message)"
-            }.joined(separator: "\n")
-            messageLabel.textColor = failed > 0
-                ? .systemRed
-                : (status.peers.allSatisfy(\.isConnected) ? .systemGreen : .systemOrange)
+            bridgeMessageLabel.stringValue = bridgeMessages.joined(separator: "\n")
+            bridgeMessageLabel.textColor = bridgeMessageColor
         }
 
         let actions = NetworkConfigPanelActions()
@@ -489,21 +826,26 @@ extension AppDelegate {
                 let dhcpRange = try privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                     dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
                 }
-                let status = PrivateNetworkRuntimeRegistry.shared.configureBridge(
+                let bridgeStatus = PrivateNetworkRuntimeRegistry.shared.configureBridge(
                     identifier: identifier,
                     bridgeConfig: privateNetwork.bridge,
                     dhcpRange: dhcpRange
                 )
-                messageLabel.stringValue = "Saved network config."
-                messageLabel.textColor = .secondaryLabelColor
-                updateStatus(status)
+                let switchStatus = PrivateNetworkRuntimeRegistry.shared.configureSwitch(
+                    identifier: identifier,
+                    switchConfig: privateNetwork.switch,
+                    dhcpRange: dhcpRange
+                )
+                setPanelMessage("Saved network config.")
+                updateTransportControls()
+                updateStatus(bridgeStatus: bridgeStatus, switchStatus: switchStatus)
             } catch {
-                messageLabel.stringValue = error.localizedDescription
-                messageLabel.textColor = .systemRed
+                setPanelMessage(error.localizedDescription, isError: true)
             }
         }
         actions.onRefresh = {
             updateStatus()
+            setPanelMessage("Refreshed status.")
         }
         actions.onAddPeer = {
             do {
@@ -521,17 +863,14 @@ extension AppDelegate {
                 peersTable.selectRowIndexes(IndexSet(integer: peers.count - 1), byExtendingSelection: false)
                 peerHostField.stringValue = ""
                 peerPortField.stringValue = "7777"
-                messageLabel.stringValue = "Added peer \(peer.description)."
-                messageLabel.textColor = .secondaryLabelColor
+                setPanelMessage("Added peer \(peer.description).")
             } catch {
-                messageLabel.stringValue = error.localizedDescription
-                messageLabel.textColor = .systemRed
+                setPanelMessage(error.localizedDescription, isError: true)
             }
         }
         actions.onRemovePeer = {
             guard !peersTable.peers.isEmpty else {
-                messageLabel.stringValue = "No peer selected."
-                messageLabel.textColor = .secondaryLabelColor
+                setPanelMessage("No peer selected.")
                 return
             }
             let selectedRow = peersTable.selectedRow
@@ -540,8 +879,33 @@ extension AppDelegate {
             guard index < peers.count else { return }
             let removedPeer = peers.remove(at: index)
             peersTable.peers = peers
-            messageLabel.stringValue = "Removed peer \(removedPeer.description)."
-            messageLabel.textColor = .secondaryLabelColor
+            setPanelMessage("Removed peer \(removedPeer.description).")
+        }
+        actions.onBridgeToggle = {
+            if bridgeEnabled.state == .on {
+                setPanelMessage(
+                    switchEnabled.state == .on
+                        ? "Bridge enabled; Web Switch will remain available as fallback."
+                        : "Bridge enabled."
+                )
+            } else {
+                setPanelMessage("Bridge disabled.")
+            }
+            updateTransportControls()
+            updateStatus()
+        }
+        actions.onSwitchToggle = {
+            if switchEnabled.state == .on {
+                setPanelMessage(
+                    bridgeEnabled.state == .on
+                        ? "Web Switch enabled as fallback when Bridge is unavailable."
+                        : "Web Switch enabled."
+                )
+            } else {
+                setPanelMessage("Web Switch disabled.")
+            }
+            updateTransportControls()
+            updateStatus()
         }
         actions.onClose = { [weak panel] in
             panel?.close()
@@ -557,20 +921,35 @@ extension AppDelegate {
         addPeerButton.action = #selector(NetworkConfigPanelActions.addPeer)
         removePeerButton.target = actions
         removePeerButton.action = #selector(NetworkConfigPanelActions.removePeer)
+        bridgeEnabled.target = actions
+        bridgeEnabled.action = #selector(NetworkConfigPanelActions.bridgeToggle)
+        switchEnabled.target = actions
+        switchEnabled.action = #selector(NetworkConfigPanelActions.switchToggle)
 
         loadFields()
-        if !PrivateNetworkRuntimeRegistry.shared.hasBridge(identifier: identifier),
-           let bridge = (try? store.load().privateNetworks[identifier]?.bridge),
-           let privateNetwork = try? readForm() {
-            let dhcpRange = try? privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
+        do {
+            let savedPrivateNetwork = try store.load().privateNetworks[identifier]
+            let dhcpRange = try savedPrivateNetwork?.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                 dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
             }
-            updateStatus(PrivateNetworkRuntimeRegistry.shared.configureBridge(
-                identifier: identifier,
-                bridgeConfig: bridge,
-                dhcpRange: dhcpRange ?? nil
-            ))
-        } else {
+            let bridgeStatus = !PrivateNetworkRuntimeRegistry.shared.hasBridge(identifier: identifier)
+                && savedPrivateNetwork?.bridge != nil
+                ? PrivateNetworkRuntimeRegistry.shared.configureBridge(
+                    identifier: identifier,
+                    bridgeConfig: savedPrivateNetwork?.bridge,
+                    dhcpRange: dhcpRange ?? nil
+                )
+                : PrivateNetworkRuntimeRegistry.shared.bridgeStatus(identifier: identifier)
+            let switchStatus = !PrivateNetworkRuntimeRegistry.shared.hasSwitch(identifier: identifier)
+                && savedPrivateNetwork?.switch?.enabled == true
+                ? PrivateNetworkRuntimeRegistry.shared.configureSwitch(
+                    identifier: identifier,
+                    switchConfig: savedPrivateNetwork?.switch,
+                    dhcpRange: dhcpRange ?? nil
+                )
+                : PrivateNetworkRuntimeRegistry.shared.switchStatus(identifier: identifier)
+            updateStatus(bridgeStatus: bridgeStatus, switchStatus: switchStatus)
+        } catch {
             updateStatus()
         }
 
@@ -601,6 +980,13 @@ extension AppDelegate {
         button.setAccessibilityIdentifier(identifier)
         button.translatesAutoresizingMaskIntoConstraints = false
         button.font = .systemFont(ofSize: 13)
+        button.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NetworkConfigPalette.primaryText
+            ]
+        )
         return button
     }
 
@@ -610,14 +996,159 @@ extension AppDelegate {
         field.translatesAutoresizingMaskIntoConstraints = false
         field.font = .systemFont(ofSize: 13)
         field.controlSize = .large
+        field.textColor = NetworkConfigPalette.primaryText
+        field.backgroundColor = NetworkConfigPalette.fieldBackground
+        field.drawsBackground = true
         return field
+    }
+
+    private func setNetworkPlaceholder(_ text: String, on field: NSTextField) {
+        field.placeholderAttributedString = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NetworkConfigPalette.disabledText
+            ]
+        )
+    }
+
+    private func makeNetworkMessageBanner(identifier: String) -> (NSView, NSTextField) {
+        let banner = NSView()
+        banner.translatesAutoresizingMaskIntoConstraints = false
+        banner.wantsLayer = true
+        banner.layer?.cornerRadius = 8
+        banner.layer?.borderWidth = 1
+        banner.layer?.backgroundColor = NetworkConfigPalette.infoBackground.cgColor
+        banner.layer?.borderColor = NetworkConfigPalette.infoBorder.cgColor
+
+        let label = NSTextField(labelWithString: "")
+        label.setAccessibilityIdentifier(identifier)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = NetworkConfigPalette.secondaryText
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 2
+        label.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        banner.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: banner.leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: banner.trailingAnchor, constant: -10),
+            label.topAnchor.constraint(equalTo: banner.topAnchor, constant: 6),
+            label.bottomAnchor.constraint(equalTo: banner.bottomAnchor, constant: -6)
+        ])
+        return (banner, label)
+    }
+
+    private func makeNetworkTextArea(identifier: String, height: CGFloat) -> (NSScrollView, NSTextView) {
+        let textView = NSTextView()
+        textView.setAccessibilityIdentifier(identifier)
+        textView.frame = NSRect(x: 0, y: 0, width: networkControlColumnWidth(), height: height)
+        textView.isRichText = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isEditable = false
+        textView.isSelectable = false
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.allowsUndo = true
+        textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.textColor = networkTextAreaTextColor(enabled: false)
+        textView.insertionPointColor = networkTextAreaInsertionPointColor()
+        textView.backgroundColor = networkTextAreaBackgroundColor()
+        textView.textContainerInset = NSSize(width: 6, height: 6)
+        textView.textContainer?.containerSize = NSSize(width: networkControlColumnWidth(), height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.borderType = .bezelBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = networkTextAreaBackgroundColor()
+        scrollView.documentView = textView
+        scrollView.heightAnchor.constraint(equalToConstant: height).isActive = true
+        return (scrollView, textView)
+    }
+
+    private func networkTextAreaBackgroundColor() -> NSColor {
+        NetworkConfigPalette.fieldBackground
+    }
+
+    private func networkTextAreaTextColor(enabled: Bool) -> NSColor {
+        enabled ? NetworkConfigPalette.primaryText : NetworkConfigPalette.disabledText
+    }
+
+    private func networkTextAreaInsertionPointColor() -> NSColor {
+        NetworkConfigPalette.primaryText
+    }
+
+    private func makeNetworkSettingsStack(_ sections: [NSView]) -> NSStackView {
+        let stack = NSStackView(views: sections)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 14
+        return stack
+    }
+
+    private func makeNetworkSettingsSection(title: String, contentView: NSView) -> NSStackView {
+        let titleRow = makeNetworkSectionTitleRow(title)
+        let separator = makeNetworkSeparator()
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+
+        let stack = NSStackView(views: [titleRow, separator, contentView])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 8
+        stack.setCustomSpacing(6, after: titleRow)
+        stack.setCustomSpacing(12, after: separator)
+        return stack
+    }
+
+    private func makeNetworkSectionTitleRow(_ text: String) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = makeNetworkSectionTitle(text)
+        row.addSubview(label)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 18),
+            label.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
+            label.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+        ])
+        return row
+    }
+
+    private func makeNetworkTabItem(label: String, contentView: NSView) -> NSTabViewItem {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(contentView)
+        NSLayoutConstraint.activate([
+            contentView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            contentView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            contentView.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            contentView.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -14)
+        ])
+
+        let item = NSTabViewItem(identifier: label)
+        item.label = label
+        item.view = container
+        return item
     }
 
     private func makeNetworkSectionTitle(_ text: String) -> NSTextField {
         let label = NSTextField(labelWithString: text)
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 13, weight: .semibold)
-        label.textColor = .labelColor
+        label.font = .systemFont(ofSize: 13, weight: .bold)
+        label.textColor = NetworkConfigPalette.primaryText
+        label.alignment = .left
+        label.cell?.alignment = .left
         return label
     }
 
@@ -625,7 +1156,7 @@ extension AppDelegate {
         let separator = NSView()
         separator.translatesAutoresizingMaskIntoConstraints = false
         separator.wantsLayer = true
-        separator.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        separator.layer?.backgroundColor = NetworkConfigPalette.separator.cgColor
         return separator
     }
 
@@ -633,7 +1164,7 @@ extension AppDelegate {
         let label = NSTextField(labelWithString: text)
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 12, weight: .medium)
-        label.textColor = .secondaryLabelColor
+        label.textColor = NetworkConfigPalette.secondaryText
         return label
     }
 
@@ -642,6 +1173,7 @@ extension AppDelegate {
         label.setAccessibilityIdentifier(identifier)
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = NetworkConfigPalette.secondaryText
         label.lineBreakMode = .byTruncatingMiddle
         label.maximumNumberOfLines = 1
         return label
@@ -649,12 +1181,33 @@ extension AppDelegate {
 
     private func configureNetworkGrid(_ grid: NSGridView) {
         grid.column(at: 0).xPlacement = .trailing
-        grid.column(at: 0).width = 116
+        grid.column(at: 0).width = networkLabelColumnWidth()
         grid.column(at: 1).xPlacement = .fill
-        grid.column(at: 1).width = 500
-        grid.rowSpacing = 10
-        grid.columnSpacing = 12
+        grid.column(at: 1).width = networkControlColumnWidth()
+        grid.rowSpacing = 11
+        grid.columnSpacing = 14
         grid.translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    private func networkLabelColumnWidth() -> CGFloat {
+        132
+    }
+
+    private func networkControlColumnWidth() -> CGFloat {
+        520
+    }
+
+    private func switchStatusColor(_ state: PrivateNetworkSwitchConnectionState) -> NSColor {
+        switch state {
+        case .connected:
+            return .systemGreen
+        case .connecting:
+            return .systemOrange
+        case .failed, .rejected:
+            return .systemRed
+        case .disabled:
+            return NetworkConfigPalette.secondaryText
+        }
     }
 }
 

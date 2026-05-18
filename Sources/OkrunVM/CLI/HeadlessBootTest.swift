@@ -10,7 +10,13 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
     private let managedGuestLogsDirectory: URL?
     private let privateNetwork: PrivateNetworkConfig
     private let privateNetworkDHCP: Bool
+    private let expectedOutputOverride: String?
+    private let mirrorSerialOutput: Bool
+    private let lingerAfterExpectedOutput: TimeInterval
     private var expectedOutput: String {
+        if let expectedOutputOverride {
+            return expectedOutputOverride
+        }
         if privateNetworkDHCP {
             return "OKRUN_E2E_PRIVATE_NETWORK_DHCP_PASSED"
         }
@@ -34,7 +40,10 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         sharedDirectory: SharedDirectoryConfig?,
         managedGuestLogsDirectory: URL?,
         privateNetwork: PrivateNetworkConfig,
-        privateNetworkDHCP: Bool = false
+        privateNetworkDHCP: Bool = false,
+        expectedOutputOverride: String? = nil,
+        mirrorSerialOutput: Bool = false,
+        lingerAfterExpectedOutput: TimeInterval = 0
     ) {
         self.kernelURL = kernelURL
         self.initialRamdiskURL = initialRamdiskURL
@@ -43,12 +52,16 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         self.managedGuestLogsDirectory = managedGuestLogsDirectory
         self.privateNetwork = privateNetwork
         self.privateNetworkDHCP = privateNetworkDHCP
+        self.expectedOutputOverride = expectedOutputOverride
+        self.mirrorSerialOutput = mirrorSerialOutput
+        self.lingerAfterExpectedOutput = lingerAfterExpectedOutput
     }
 
     static func runIfRequested(arguments: [String] = CommandLine.arguments) -> Int32? {
         guard arguments.contains("--headless-boot-test")
             || arguments.contains("--headless-save-restore-test")
             || arguments.contains("--headless-private-network-test")
+            || arguments.contains("--headless-switch-host-test")
             || arguments.contains("--headless-project-save-restore-test")
             || arguments.contains("--headless-import-asif") else {
             return nil
@@ -113,7 +126,10 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
                 sharedDirectory: options.sharedDirectory,
                 managedGuestLogsDirectory: options.managedGuestLogsDirectory,
                 privateNetwork: options.privateNetwork,
-                privateNetworkDHCP: options.privateNetworkDHCP
+                privateNetworkDHCP: options.privateNetworkDHCP,
+                expectedOutputOverride: options.expectedOutput,
+                mirrorSerialOutput: options.mirrorSerialOutput,
+                lingerAfterExpectedOutput: options.lingerAfterExpectedOutput
             )
             try test.run()
             print("Headless boot E2E passed: \(test.expectedOutput)")
@@ -193,7 +209,10 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         privateNetworkClientInitialRamdisk: URL?,
         managedGuestLogsDirectory: URL?,
         projectRoot: URL?,
-        privateNetworkDHCP: Bool
+        privateNetworkDHCP: Bool,
+        expectedOutput: String?,
+        mirrorSerialOutput: Bool,
+        lingerAfterExpectedOutput: TimeInterval
     ) {
         var kernelPath: String?
         var initialRamdiskPath: String?
@@ -205,6 +224,9 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         var privateNetwork = PrivateNetworkConfig.disabled
         var projectRootPath: String?
         var privateNetworkDHCP = false
+        var expectedOutput: String?
+        var mirrorSerialOutput = false
+        var lingerAfterExpectedOutput: TimeInterval = 0
         var iterator = arguments.dropFirst().makeIterator()
 
         while let argument = iterator.next() {
@@ -231,6 +253,18 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             case "--private-network-dhcp":
                 privateNetwork = PrivateNetworkConfig(enabled: true)
                 privateNetworkDHCP = true
+            case "--expect-output":
+                guard let value = iterator.next(), !value.isEmpty else {
+                    throw AppError("Missing --expect-output value.")
+                }
+                expectedOutput = value
+            case "--mirror-serial-output":
+                mirrorSerialOutput = true
+            case "--linger-after-output":
+                guard let value = iterator.next(), let parsed = TimeInterval(value), parsed >= 0 else {
+                    throw AppError("--linger-after-output must be a non-negative number of seconds.")
+                }
+                lingerAfterExpectedOutput = parsed
             case "--private-network-id":
                 guard let value = iterator.next() else {
                     throw AppError("Missing --private-network-id value.")
@@ -294,7 +328,10 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             privateNetworkClientInitialRamdisk,
             managedGuestLogsDirectory,
             projectRoot,
-            privateNetworkDHCP
+            privateNetworkDHCP,
+            expectedOutput,
+            mirrorSerialOutput,
+            lingerAfterExpectedOutput
         )
     }
 
@@ -324,9 +361,11 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
 
-        outputPipe.fileHandleForReading.readabilityHandler = nil
-        try stopVM()
-        PrivateNetworkRuntimeRegistry.shared.releaseAll()
+        defer {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            try? stopVM()
+            PrivateNetworkRuntimeRegistry.shared.releaseAll()
+        }
 
         guard let result else {
             let output = String(decoding: serialOutput, as: UTF8.self)
@@ -334,6 +373,12 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
         }
 
         try result.get()
+        if lingerAfterExpectedOutput > 0 {
+            let lingerDeadline = Date().addingTimeInterval(lingerAfterExpectedOutput)
+            while Date() < lingerDeadline {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            }
+        }
     }
 
     private func makeConfiguration(serialOutput: FileHandle) throws -> VZVirtualMachineConfiguration {
@@ -374,6 +419,9 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
 
     private func appendSerialOutput(_ data: Data) {
         serialOutput.append(data)
+        if mirrorSerialOutput {
+            FileHandle.standardOutput.write(data)
+        }
         let output = String(decoding: serialOutput, as: UTF8.self)
         if output.contains(expectedOutput) {
             finish(.success(()))

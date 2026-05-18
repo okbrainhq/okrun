@@ -533,22 +533,55 @@ swapping VM memory.
 ## Diagnostics
 
 Okrun writes host-side lifecycle, storage, and VM start/stop events to macOS
-Unified Logging under the `local.okrun.vm` subsystem. Stream logs while
-reproducing an issue:
+Unified Logging under the `local.okrun.vm` subsystem. The easiest way to tail
+logs while reproducing an issue is:
 
 ```sh
-log stream --style compact --predicate 'subsystem == "local.okrun.vm"'
+./scripts/logs
+```
+
+By default this streams only the Web Switch logs, including connection attempts,
+connection-refused waits, reconnect scheduling, server rejections, TLS ready
+events, and successful INIT handshakes. When the server is unavailable, expect
+retry logs to settle into this cadence:
+
+```text
+delayMs=500
+delayMs=1000
+delayMs=2000
+delayMs=3000
+delayMs=3000
+```
+
+Stream every Okrun category:
+
+```sh
+./scripts/logs all
+```
+
+Stream a specific category:
+
+```sh
+./scripts/logs virtual-machine
+./scripts/logs lifecycle
+./scripts/logs storage
+```
+
+The helper wraps `log stream`; the equivalent raw command for Web Switch logs is:
+
+```sh
+log stream --style compact --level debug --predicate '(subsystem == "local.okrun.vm" || subsystem == "com.okrun.vm") && category == "web-switch"'
 ```
 
 Show recent Okrun logs after a VM hangs or stops:
 
 ```sh
-log show --last 2h --style compact --predicate 'subsystem == "local.okrun.vm"'
+log show --last 2h --style compact --predicate 'subsystem == "local.okrun.vm" || subsystem == "com.okrun.vm"'
 ```
 
 These logs include the app bundle path, selected project, CPU/RAM/disk config,
 disk image apparent and allocated sizes, disk expansion warnings, and VM
-start/stop errors.
+start/stop errors. Web Switch logs are in the `web-switch` category.
 
 For a broader host-side snapshot, run:
 

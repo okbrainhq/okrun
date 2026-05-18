@@ -7,4 +7,5 @@ enum AppLog {
     static let lifecycle = Logger(subsystem: subsystem, category: "lifecycle")
     static let storage = Logger(subsystem: subsystem, category: "storage")
     static let virtualMachine = Logger(subsystem: subsystem, category: "virtual-machine")
+    static let webSwitch = Logger(subsystem: subsystem, category: "web-switch")
 }

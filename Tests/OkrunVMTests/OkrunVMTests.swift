@@ -672,6 +672,47 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRouterTransfersFramesAcrossBridgeTransport() throws {
+        let network = "router-bridge-\(UUID().uuidString)"
+        let portA = try unusedLoopbackPort()
+        let runtimeA = try PrivateNetworkRuntime(identifier: "\(network)-a")
+        let runtimeB = try PrivateNetworkRuntime(identifier: "\(network)-b")
+        let routerA = PrivateNetworkTransportRouter(identifier: network)
+        let routerB = PrivateNetworkTransportRouter(identifier: network)
+        let bridgeA = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA), peers: []),
+            onRemoteFrame: { [weak routerA] frame in
+                routerA?.receiveRemoteFrame(frame, via: .bridge)
+            }
+        )
+        let bridgeB = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(
+                bind: nil,
+                peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA)]
+            ),
+            onRemoteFrame: { [weak routerB] frame in
+                routerB?.receiveRemoteFrame(frame, via: .bridge)
+            }
+        )
+        routerA.setBridge(bridgeA)
+        routerB.setBridge(bridgeB)
+        routerA.addRuntime(runtimeA)
+        routerB.addRuntime(runtimeB)
+
+        let frame = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xab, 0xab, 0xab, 0xab, 0x01],
+            payload: [0x05, 0x06, 0x07, 0x08]
+        )
+
+        try sendFrame(frame, from: runtimeA.fileHandle, untilReceivedOn: runtimeB.fileHandle.fileDescriptor, timeout: 5)
+        try sendFrame(frame, from: runtimeB.fileHandle, untilReceivedOn: runtimeA.fileHandle.fileDescriptor, timeout: 5)
+        withExtendedLifetime((routerA, routerB, bridgeA, bridgeB, runtimeA, runtimeB)) {}
+    }
+
+    @Test
     func privateNetworkBridgeRejectsOverlappingDHCPRanges() throws {
         let network = "bridge-\(UUID().uuidString)"
         let portA = try unusedLoopbackPort()
@@ -1286,6 +1327,170 @@ struct OkrunVMTests {
         throw AppError("Timed out waiting for private network bridge frame.")
     }
 
+    @Test
+    func switchFrameProtocolRoundTripsAndHandlesPartialReads() throws {
+        let frame = SwitchFrame(
+            streamID: SwitchFrame.ethernetStreamID,
+            type: .data,
+            sequenceNumber: 42,
+            payload: Data([0xaa, 0xbb, 0xcc])
+        )
+        let encoded = try SwitchFrameProtocol.encode(frame)
+        let decoder = SwitchFrameDecoder(maxPayloadLength: 16)
+
+        #expect(try decoder.push(Data(encoded.prefix(5))).isEmpty)
+        #expect(try decoder.push(Data(encoded.dropFirst(5))) == [frame])
+
+        let secondFrame = SwitchFrame(
+            streamID: SwitchFrame.ethernetStreamID,
+            type: .data,
+            sequenceNumber: 43,
+            payload: Data([0xdd])
+        )
+        #expect(try decoder.push(try SwitchFrameProtocol.encode(secondFrame)) == [secondFrame])
+    }
+
+    @Test
+    func switchFrameDecoderRejectsOversizedPayloads() throws {
+        let encoded = try SwitchFrameProtocol.encode(SwitchFrame(
+            streamID: SwitchFrame.ethernetStreamID,
+            type: .data,
+            sequenceNumber: 1,
+            payload: Data(repeating: 0x01, count: 11)
+        ))
+        let decoder = SwitchFrameDecoder(maxPayloadLength: 10)
+
+        #expect(throws: (any Error).self) {
+            try decoder.push(encoded)
+        }
+    }
+
+    @Test
+    func switchDedupWindowDropsDuplicatesAndOldFrames() {
+        let window = SwitchDedupWindow()
+
+        #expect(window.accept(10))
+        #expect(!window.accept(10))
+        #expect(window.accept(12))
+        #expect(window.accept(11))
+        #expect(window.accept(140))
+        #expect(!window.accept(11))
+
+        window.reset()
+        #expect(window.accept(1))
+    }
+
+    @Test
+    func privateNetworkRouterPrefersBridgeAndFallsBackToSwitch() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let bridge = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setBridge(bridge)
+        router.setWebSwitch(webSwitch)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01]
+        let bridgeRemoteMAC: [UInt8] = [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x01]
+        let switchRemoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x01]
+        let bridgeFrame = ethernetFrame(destination: localMAC, source: bridgeRemoteMAC, payload: [0x01])
+        let switchFrame = ethernetFrame(destination: localMAC, source: switchRemoteMAC, payload: [0x02])
+
+        router.receiveRemoteFrame(bridgeFrame, via: .bridge)
+        router.receiveRemoteFrame(switchFrame, via: .webSwitch)
+
+        let toBridgeRemote = ethernetFrame(destination: bridgeRemoteMAC, source: localMAC, payload: [0x03])
+        router.routeLocalFrame(toBridgeRemote)
+        #expect(bridge.sentFrames == [toBridgeRemote])
+        #expect(webSwitch.sentFrames.isEmpty)
+
+        let toSwitchRemote = ethernetFrame(destination: switchRemoteMAC, source: localMAC, payload: [0x04])
+        router.routeLocalFrame(toSwitchRemote)
+        #expect(webSwitch.sentFrames == [toSwitchRemote])
+
+        bridge.canSendPrivateNetworkFrames = false
+        router.routeLocalFrame(toBridgeRemote)
+        #expect(bridge.sentFrames == [toBridgeRemote])
+        #expect(webSwitch.sentFrames == [toSwitchRemote, toBridgeRemote])
+    }
+
+    @Test
+    func privateNetworkRouterSendsDiscoveryFramesAcrossReachableTransports() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let bridge = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setBridge(bridge)
+        router.setWebSwitch(webSwitch)
+
+        let frame = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x01],
+            payload: [0x05]
+        )
+
+        router.routeLocalFrame(frame)
+
+        #expect(bridge.sentFrames == [frame])
+        #expect(webSwitch.sentFrames == [frame])
+    }
+
+    @Test
+    func hostNetworkConfigLoadsAndValidatesSwitchConfig() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
+        let switchConfig = PrivateNetworkSwitchConfig(
+            enabled: true,
+            server: "localhost:9443",
+            caCert: "/tmp/ca-cert.pem",
+            clientCert: "/tmp/client-cert.pem",
+            clientKey: "/tmp/client-key.pem",
+            credentialFingerprint: "bundle-a",
+            multipath: false
+        )
+        try store.save(HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(dhcp: nil, switch: switchConfig)
+        ]))
+
+        #expect(try store.switchConfigForPrivateNetwork(identifier: "okrun") == switchConfig)
+        #expect(try store.load().privateNetworks["okrun"]?.switch == switchConfig)
+
+        let bridge = PrivateNetworkBridgeConfig(
+            bind: nil,
+            peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: 9444)]
+        )
+        let invalidConfig = HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(dhcp: nil, bridge: bridge, switch: switchConfig)
+        ])
+        try store.save(invalidConfig)
+        let combined = try store.load().privateNetworks["okrun"]
+        #expect(combined?.bridge == bridge)
+        #expect(combined?.switch == switchConfig)
+
+        let changedCredentials = PrivateNetworkSwitchConfig(
+            enabled: true,
+            server: "localhost:9443",
+            caCert: "/tmp/ca-cert.pem",
+            clientCert: "/tmp/client-cert.pem",
+            clientKey: "/tmp/client-key.pem",
+            credentialFingerprint: "bundle-b",
+            multipath: false
+        )
+        #expect(changedCredentials != switchConfig)
+
+        let legacyJSON = """
+        {
+          "enabled": true,
+          "server": "localhost:9443",
+          "caCert": "/tmp/ca-cert.pem",
+          "clientCert": "/tmp/client-cert.pem",
+          "clientKey": "/tmp/client-key.pem",
+          "multipath": false
+        }
+        """
+        let legacySwitchConfig = try JSONDecoder().decode(PrivateNetworkSwitchConfig.self, from: Data(legacyJSON.utf8))
+        #expect(legacySwitchConfig.credentialFingerprint == "")
+    }
+
     private func sendFrame(
         _ frame: Data,
         from source: FileHandle,
@@ -1343,6 +1548,15 @@ struct OkrunVMTests {
 
     private func drainFrames(on descriptor: Int32) {
         while readFrame(on: descriptor) != nil {}
+    }
+
+    private final class MockRoutableTransport: PrivateNetworkRoutableTransport {
+        var canSendPrivateNetworkFrames = true
+        var sentFrames: [Data] = []
+
+        func sendFrameToRemote(_ frame: Data) {
+            sentFrames.append(frame)
+        }
     }
 
     private func unusedLoopbackPort() throws -> Int {
