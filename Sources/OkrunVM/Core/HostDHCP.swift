@@ -163,9 +163,6 @@ final class HostNetworkConfigStore {
             _ = try privateNetwork.dhcp?.validated()
             _ = try privateNetwork.bridge?.validated()
             _ = try privateNetwork.switch?.validated()
-            if privateNetwork.bridge != nil && privateNetwork.switch?.enabled == true {
-                throw AppError("private network cannot enable both bridge and switch for the same network.")
-            }
         }
         return config
     }
@@ -205,9 +202,6 @@ final class HostNetworkConfigStore {
             _ = try privateNetwork.dhcp?.validated()
             _ = try privateNetwork.bridge?.validated()
             _ = try privateNetwork.switch?.validated()
-            if privateNetwork.bridge != nil && privateNetwork.switch?.enabled == true {
-                throw AppError("private network cannot enable both bridge and switch for the same network.")
-            }
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

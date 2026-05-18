@@ -672,6 +672,47 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRouterTransfersFramesAcrossBridgeTransport() throws {
+        let network = "router-bridge-\(UUID().uuidString)"
+        let portA = try unusedLoopbackPort()
+        let runtimeA = try PrivateNetworkRuntime(identifier: "\(network)-a")
+        let runtimeB = try PrivateNetworkRuntime(identifier: "\(network)-b")
+        let routerA = PrivateNetworkTransportRouter(identifier: network)
+        let routerB = PrivateNetworkTransportRouter(identifier: network)
+        let bridgeA = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA), peers: []),
+            onRemoteFrame: { [weak routerA] frame in
+                routerA?.receiveRemoteFrame(frame, via: .bridge)
+            }
+        )
+        let bridgeB = try PrivateNetworkBridge(
+            identifier: network,
+            config: PrivateNetworkBridgeConfig(
+                bind: nil,
+                peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA)]
+            ),
+            onRemoteFrame: { [weak routerB] frame in
+                routerB?.receiveRemoteFrame(frame, via: .bridge)
+            }
+        )
+        routerA.setBridge(bridgeA)
+        routerB.setBridge(bridgeB)
+        routerA.addRuntime(runtimeA)
+        routerB.addRuntime(runtimeB)
+
+        let frame = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xab, 0xab, 0xab, 0xab, 0x01],
+            payload: [0x05, 0x06, 0x07, 0x08]
+        )
+
+        try sendFrame(frame, from: runtimeA.fileHandle, untilReceivedOn: runtimeB.fileHandle.fileDescriptor, timeout: 5)
+        try sendFrame(frame, from: runtimeB.fileHandle, untilReceivedOn: runtimeA.fileHandle.fileDescriptor, timeout: 5)
+        withExtendedLifetime((routerA, routerB, bridgeA, bridgeB, runtimeA, runtimeB)) {}
+    }
+
+    @Test
     func privateNetworkBridgeRejectsOverlappingDHCPRanges() throws {
         let network = "bridge-\(UUID().uuidString)"
         let portA = try unusedLoopbackPort()
@@ -1337,6 +1378,58 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRouterPrefersBridgeAndFallsBackToSwitch() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let bridge = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setBridge(bridge)
+        router.setWebSwitch(webSwitch)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01]
+        let bridgeRemoteMAC: [UInt8] = [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x01]
+        let switchRemoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x01]
+        let bridgeFrame = ethernetFrame(destination: localMAC, source: bridgeRemoteMAC, payload: [0x01])
+        let switchFrame = ethernetFrame(destination: localMAC, source: switchRemoteMAC, payload: [0x02])
+
+        router.receiveRemoteFrame(bridgeFrame, via: .bridge)
+        router.receiveRemoteFrame(switchFrame, via: .webSwitch)
+
+        let toBridgeRemote = ethernetFrame(destination: bridgeRemoteMAC, source: localMAC, payload: [0x03])
+        router.routeLocalFrame(toBridgeRemote)
+        #expect(bridge.sentFrames == [toBridgeRemote])
+        #expect(webSwitch.sentFrames.isEmpty)
+
+        let toSwitchRemote = ethernetFrame(destination: switchRemoteMAC, source: localMAC, payload: [0x04])
+        router.routeLocalFrame(toSwitchRemote)
+        #expect(webSwitch.sentFrames == [toSwitchRemote])
+
+        bridge.canSendPrivateNetworkFrames = false
+        router.routeLocalFrame(toBridgeRemote)
+        #expect(bridge.sentFrames == [toBridgeRemote])
+        #expect(webSwitch.sentFrames == [toSwitchRemote, toBridgeRemote])
+    }
+
+    @Test
+    func privateNetworkRouterSendsDiscoveryFramesAcrossReachableTransports() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let bridge = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setBridge(bridge)
+        router.setWebSwitch(webSwitch)
+
+        let frame = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x01],
+            payload: [0x05]
+        )
+
+        router.routeLocalFrame(frame)
+
+        #expect(bridge.sentFrames == [frame])
+        #expect(webSwitch.sentFrames == [frame])
+    }
+
+    @Test
     func hostNetworkConfigLoadsAndValidatesSwitchConfig() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
@@ -1364,9 +1457,10 @@ struct OkrunVMTests {
         let invalidConfig = HostNetworkConfig(version: 1, privateNetworks: [
             "okrun": HostPrivateNetworkConfig(dhcp: nil, bridge: bridge, switch: switchConfig)
         ])
-        #expect(throws: (any Error).self) {
-            try store.save(invalidConfig)
-        }
+        try store.save(invalidConfig)
+        let combined = try store.load().privateNetworks["okrun"]
+        #expect(combined?.bridge == bridge)
+        #expect(combined?.switch == switchConfig)
     }
 
     private func sendFrame(
@@ -1426,6 +1520,15 @@ struct OkrunVMTests {
 
     private func drainFrames(on descriptor: Int32) {
         while readFrame(on: descriptor) != nil {}
+    }
+
+    private final class MockRoutableTransport: PrivateNetworkRoutableTransport {
+        var canSendPrivateNetworkFrames = true
+        var sentFrames: [Data] = []
+
+        func sendFrameToRemote(_ frame: Data) {
+            sentFrames.append(frame)
+        }
     }
 
     private func unusedLoopbackPort() throws -> Int {

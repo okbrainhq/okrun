@@ -58,6 +58,7 @@ final class PrivateNetworkBridge {
     private let config: PrivateNetworkBridgeConfig
     fileprivate let dhcpRange: PrivateNetworkDHCPLeaseRange?
     fileprivate let nodeID = UUID()
+    private let onRemoteFrame: ((Data) -> Void)?
     private let queue: DispatchQueue
     private var listenerDescriptor: Int32?
     private var listenerSource: DispatchSourceRead?
@@ -72,11 +73,13 @@ final class PrivateNetworkBridge {
     init(
         identifier: String,
         config: PrivateNetworkBridgeConfig,
-        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
+        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil,
+        onRemoteFrame: ((Data) -> Void)? = nil
     ) throws {
         self.identifier = identifier
         self.config = try config.validated()
         self.dhcpRange = dhcpRange
+        self.onRemoteFrame = onRemoteFrame
         queue = DispatchQueue(label: "okrun.private-network-bridge.\(identifier).\(UUID().uuidString)")
 
         if let bind = self.config.bind {
@@ -158,6 +161,18 @@ final class PrivateNetworkBridge {
     func matches(config bridgeConfig: PrivateNetworkBridgeConfig, dhcpRange: PrivateNetworkDHCPLeaseRange?) -> Bool {
         guard let validatedConfig = try? bridgeConfig.validated() else { return false }
         return config == validatedConfig && self.dhcpRange == dhcpRange
+    }
+
+    func hasActiveConnections() -> Bool {
+        queue.sync {
+            connections.values.contains { $0.isActive }
+        }
+    }
+
+    func sendFrameToRemote(_ frame: Data) {
+        queue.async { [weak self] in
+            self?.sendFrameToRemoteOnQueue(frame)
+        }
     }
 
     private func stop() {
@@ -397,7 +412,11 @@ final class PrivateNetworkBridge {
 
     fileprivate func receiveFrame(_ frame: Data, from connection: PrivateNetworkBridgeConnection) {
         guard connection.isActive else { return }
-        injectFrameToLocalGuests(frame)
+        if let onRemoteFrame {
+            onRemoteFrame(frame)
+        } else {
+            injectFrameToLocalGuests(frame)
+        }
     }
 
     fileprivate func connectionDidClose(_ connection: PrivateNetworkBridgeConnection) {
@@ -492,9 +511,7 @@ final class PrivateNetworkBridge {
             }
         }
 
-        for connection in Array(connections.values) where connection.isActive {
-            connection.sendFrame(frame)
-        }
+        sendFrameToRemoteOnQueue(frame)
     }
 
     private func injectFrameToLocalGuests(_ frame: Data) {
@@ -507,6 +524,12 @@ final class PrivateNetworkBridge {
     private func shouldForwardLocalFrameToRemote(destination: EthernetAddress) -> Bool {
         guard destination.isUnicast else { return true }
         return !localMACs.contains(destination)
+    }
+
+    private func sendFrameToRemoteOnQueue(_ frame: Data) {
+        for connection in Array(connections.values) where connection.isActive {
+            connection.sendFrame(frame)
+        }
     }
 
     private static func makeIPv4Socket() throws -> Int32 {

@@ -884,6 +884,7 @@ final class PrivateNetworkSwitchBridge {
     private let identifier: String
     private let config: PrivateNetworkSwitchConfig
     private let dhcpRange: PrivateNetworkDHCPLeaseRange?
+    private let onRemoteFrame: ((Data) -> Void)?
     private let queue: DispatchQueue
     private let client: PrivateNetworkSwitchClient
     private var runtimes: [WeakRuntime] = []
@@ -893,11 +894,13 @@ final class PrivateNetworkSwitchBridge {
     init(
         identifier: String,
         config: PrivateNetworkSwitchConfig,
-        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
+        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil,
+        onRemoteFrame: ((Data) -> Void)? = nil
     ) throws {
         self.identifier = identifier
         self.config = try config.validated()
         self.dhcpRange = dhcpRange
+        self.onRemoteFrame = onRemoteFrame
         queue = DispatchQueue(label: "okrun.private-network-switch.\(identifier).\(UUID().uuidString)")
         client = try PrivateNetworkSwitchClient(
             identifier: identifier,
@@ -970,6 +973,15 @@ final class PrivateNetworkSwitchBridge {
         client.matches(config: switchConfig, dhcpRange: dhcpRange)
     }
 
+    func canSendFrames() -> Bool {
+        let state = statusSnapshot().state
+        return state == .connecting || state == .connected
+    }
+
+    func sendFrameToRemote(_ frame: Data) {
+        client.send(frame)
+    }
+
     private func handleLocalFrame(_ frame: Data) {
         if let header = EthernetFrameHeader.parse(frame) {
             localMACs.insert(header.source)
@@ -981,7 +993,7 @@ final class PrivateNetworkSwitchBridge {
         } else {
             SwitchDebug.log("send local malformed-ethernet bytes=\(frame.count)")
         }
-        client.send(frame)
+        sendFrameToRemote(frame)
     }
 
     private func injectFrameToLocalGuests(_ frame: Data) {
@@ -990,9 +1002,13 @@ final class PrivateNetworkSwitchBridge {
         } else {
             SwitchDebug.log("inject remote malformed-ethernet bytes=\(frame.count)")
         }
-        runtimes.removeAll { $0.runtime == nil }
-        for weakRuntime in runtimes {
-            weakRuntime.runtime?.injectFrameToGuest(frame)
+        if let onRemoteFrame {
+            onRemoteFrame(frame)
+        } else {
+            runtimes.removeAll { $0.runtime == nil }
+            for weakRuntime in runtimes {
+                weakRuntime.runtime?.injectFrameToGuest(frame)
+            }
         }
     }
 

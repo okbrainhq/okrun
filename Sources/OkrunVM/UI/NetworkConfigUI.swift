@@ -618,9 +618,6 @@ extension AppDelegate {
 
         func readSwitchConfig() throws -> PrivateNetworkSwitchConfig? {
             guard switchEnabled.state == .on else { return nil }
-            guard bridgeEnabled.state != .on else {
-                throw AppError("Disable Bridge before enabling Web Switch.")
-            }
 
             let serverText = switchServerField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let bundleText = bundleTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -833,8 +830,11 @@ extension AppDelegate {
         }
         actions.onBridgeToggle = {
             if bridgeEnabled.state == .on {
-                switchEnabled.state = .off
-                setPanelMessage("Bridge enabled; Web Switch disabled.")
+                setPanelMessage(
+                    switchEnabled.state == .on
+                        ? "Bridge enabled; Web Switch will remain available as fallback."
+                        : "Bridge enabled."
+                )
             } else {
                 setPanelMessage("Bridge disabled.")
             }
@@ -843,8 +843,11 @@ extension AppDelegate {
         }
         actions.onSwitchToggle = {
             if switchEnabled.state == .on {
-                bridgeEnabled.state = .off
-                setPanelMessage("Web Switch enabled; Bridge disabled.")
+                setPanelMessage(
+                    bridgeEnabled.state == .on
+                        ? "Web Switch enabled as fallback when Bridge is unavailable."
+                        : "Web Switch enabled."
+                )
             } else {
                 setPanelMessage("Web Switch disabled.")
             }

@@ -674,6 +674,7 @@ final class PrivateNetworkRuntimeRegistry {
     private var bridgeFailures: [String: PrivateNetworkBridgeStatus] = [:]
     private var switches: [String: PrivateNetworkSwitchBridge] = [:]
     private var switchFailures: [String: PrivateNetworkSwitchStatus] = [:]
+    private var routers: [String: PrivateNetworkTransportRouter] = [:]
 
     private init() {}
 
@@ -683,37 +684,38 @@ final class PrivateNetworkRuntimeRegistry {
         switchConfig: PrivateNetworkSwitchConfig? = nil,
         dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
     ) throws {
-        if bridgeConfig != nil && switchConfig != nil {
-            throw AppError("private network cannot enable both bridge and switch for the same network.")
-        }
-
         runtimes.append(runtime)
-        if let switchBridge = switches[runtime.identifier] {
-            switchBridge.addRuntime(runtime)
-            return
-        }
-        if let bridge = bridges[runtime.identifier] {
-            bridge.addRuntime(runtime)
-            return
-        }
+        let router = router(for: runtime.identifier)
+        router.addRuntime(runtime)
 
+        var retainedTransport = false
+        var retainedError: Error?
+        if let bridgeConfig {
+            do {
+                _ = try retainBridge(identifier: runtime.identifier, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
+                retainedTransport = true
+            } catch {
+                bridgeFailures[runtime.identifier] = .failed(identifier: runtime.identifier, error: error.localizedDescription)
+                retainedError = error
+            }
+        }
         if let switchConfig {
-            let switchBridge = try PrivateNetworkSwitchBridge(
-                identifier: runtime.identifier,
-                config: switchConfig,
-                dhcpRange: dhcpRange
-            )
-            switchBridge.addRuntime(runtime)
-            switches[runtime.identifier] = switchBridge
-            switchFailures[runtime.identifier] = nil
-            return
+            do {
+                _ = try retainSwitch(identifier: runtime.identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
+                retainedTransport = true
+            } catch {
+                switchFailures[runtime.identifier] = .failed(
+                    identifier: runtime.identifier,
+                    server: switchConfig.server,
+                    error: error.localizedDescription
+                )
+                retainedError = error
+            }
         }
 
-        guard let bridgeConfig else { return }
-        let bridge = try PrivateNetworkBridge(identifier: runtime.identifier, config: bridgeConfig, dhcpRange: dhcpRange)
-        bridge.addRuntime(runtime)
-        bridges[runtime.identifier] = bridge
-        bridgeFailures[runtime.identifier] = nil
+        if !retainedTransport, let retainedError {
+            throw retainedError
+        }
     }
 
     func configureBridge(
@@ -724,20 +726,21 @@ final class PrivateNetworkRuntimeRegistry {
         guard let bridgeConfig else {
             bridges[identifier] = nil
             bridgeFailures[identifier] = nil
+            routers[identifier]?.setBridge(nil)
             return .disabled(identifier: identifier)
         }
         if let existingBridge = bridges[identifier],
            existingBridge.matches(config: bridgeConfig, dhcpRange: dhcpRange) {
+            router(for: identifier).setBridge(existingBridge)
             return existingBridge.statusSnapshot()
         }
         bridges[identifier] = nil
+        router(for: identifier).setBridge(nil)
         do {
-            let bridge = try PrivateNetworkBridge(identifier: identifier, config: bridgeConfig, dhcpRange: dhcpRange)
+            let bridge = try makeBridge(identifier: identifier, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
             bridges[identifier] = bridge
+            router(for: identifier).setBridge(bridge)
             bridgeFailures[identifier] = nil
-            for runtime in runtimes where runtime.identifier == identifier {
-                bridge.addRuntime(runtime)
-            }
             return bridge.statusSnapshot()
         } catch {
             let status = PrivateNetworkBridgeStatus.failed(identifier: identifier, error: error.localizedDescription)
@@ -754,20 +757,21 @@ final class PrivateNetworkRuntimeRegistry {
         guard let switchConfig else {
             switches[identifier] = nil
             switchFailures[identifier] = nil
+            routers[identifier]?.setWebSwitch(nil)
             return .disabled(identifier: identifier)
         }
         if let existingSwitch = switches[identifier],
            existingSwitch.matches(config: switchConfig, dhcpRange: dhcpRange) {
+            router(for: identifier).setWebSwitch(existingSwitch)
             return existingSwitch.statusSnapshot()
         }
         switches[identifier] = nil
+        router(for: identifier).setWebSwitch(nil)
         do {
-            let switchBridge = try PrivateNetworkSwitchBridge(identifier: identifier, config: switchConfig, dhcpRange: dhcpRange)
+            let switchBridge = try makeSwitch(identifier: identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
             switches[identifier] = switchBridge
+            router(for: identifier).setWebSwitch(switchBridge)
             switchFailures[identifier] = nil
-            for runtime in runtimes where runtime.identifier == identifier {
-                switchBridge.addRuntime(runtime)
-            }
             return switchBridge.statusSnapshot()
         } catch {
             let status = PrivateNetworkSwitchStatus.failed(
@@ -802,19 +806,18 @@ final class PrivateNetworkRuntimeRegistry {
 
     func releaseAll() {
         for runtime in runtimes {
-            bridges[runtime.identifier]?.removeRuntime(runtime)
-            switches[runtime.identifier]?.removeRuntime(runtime)
+            routers[runtime.identifier]?.removeRuntime(runtime)
         }
         runtimes.removeAll()
         bridges.removeAll()
         switches.removeAll()
+        routers.removeAll()
     }
 
     func release(_ ownedRuntimes: [PrivateNetworkRuntime]) {
         guard !ownedRuntimes.isEmpty else { return }
         for runtime in ownedRuntimes {
-            bridges[runtime.identifier]?.removeRuntime(runtime)
-            switches[runtime.identifier]?.removeRuntime(runtime)
+            routers[runtime.identifier]?.removeRuntime(runtime)
         }
         runtimes.removeAll { runtime in
             ownedRuntimes.contains { $0 === runtime }
@@ -825,6 +828,100 @@ final class PrivateNetworkRuntimeRegistry {
         for identifier in Array(switches.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
             switches[identifier] = nil
         }
+        for identifier in Array(routers.keys) where routers[identifier]?.hasRuntimes() != true {
+            routers[identifier] = nil
+        }
+    }
+
+    @discardableResult
+    private func retainBridge(
+        identifier: String,
+        bridgeConfig: PrivateNetworkBridgeConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) throws -> PrivateNetworkBridge {
+        let transportRouter = router(for: identifier)
+        if let existingBridge = bridges[identifier],
+           existingBridge.matches(config: bridgeConfig, dhcpRange: dhcpRange) {
+            transportRouter.setBridge(existingBridge)
+            return existingBridge
+        }
+
+        bridges[identifier] = nil
+        transportRouter.setBridge(nil)
+        let bridge = try makeBridge(identifier: identifier, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
+        bridges[identifier] = bridge
+        bridgeFailures[identifier] = nil
+        transportRouter.setBridge(bridge)
+        return bridge
+    }
+
+    @discardableResult
+    private func retainSwitch(
+        identifier: String,
+        switchConfig: PrivateNetworkSwitchConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) throws -> PrivateNetworkSwitchBridge {
+        let transportRouter = router(for: identifier)
+        if let existingSwitch = switches[identifier],
+           existingSwitch.matches(config: switchConfig, dhcpRange: dhcpRange) {
+            transportRouter.setWebSwitch(existingSwitch)
+            return existingSwitch
+        }
+
+        switches[identifier] = nil
+        transportRouter.setWebSwitch(nil)
+        let switchBridge = try makeSwitch(identifier: identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
+        switches[identifier] = switchBridge
+        switchFailures[identifier] = nil
+        transportRouter.setWebSwitch(switchBridge)
+        return switchBridge
+    }
+
+    private func makeBridge(
+        identifier: String,
+        bridgeConfig: PrivateNetworkBridgeConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) throws -> PrivateNetworkBridge {
+        let transportRouter = router(for: identifier)
+        return try PrivateNetworkBridge(
+            identifier: identifier,
+            config: bridgeConfig,
+            dhcpRange: dhcpRange,
+            onRemoteFrame: { [weak transportRouter] frame in
+                transportRouter?.receiveRemoteFrame(frame, via: .bridge)
+            }
+        )
+    }
+
+    private func makeSwitch(
+        identifier: String,
+        switchConfig: PrivateNetworkSwitchConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) throws -> PrivateNetworkSwitchBridge {
+        let transportRouter = router(for: identifier)
+        return try PrivateNetworkSwitchBridge(
+            identifier: identifier,
+            config: switchConfig,
+            dhcpRange: dhcpRange,
+            onRemoteFrame: { [weak transportRouter] frame in
+                transportRouter?.receiveRemoteFrame(frame, via: .webSwitch)
+            }
+        )
+    }
+
+    private func router(for identifier: String) -> PrivateNetworkTransportRouter {
+        if let router = routers[identifier] {
+            return router
+        }
+        let router = PrivateNetworkTransportRouter(identifier: identifier)
+        if let bridge = bridges[identifier] {
+            router.setBridge(bridge)
+        }
+        if let switchBridge = switches[identifier] {
+            router.setWebSwitch(switchBridge)
+        }
+        routers[identifier] = router
+        return router
     }
 }
 
