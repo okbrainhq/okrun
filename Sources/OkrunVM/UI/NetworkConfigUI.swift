@@ -21,9 +21,6 @@ private final class NetworkConfigPanelActions: NSObject {
     var onApply: (() -> Void)?
     var onRefresh: (() -> Void)?
     var onClose: (() -> Void)?
-    var onAddPeer: (() -> Void)?
-    var onRemovePeer: (() -> Void)?
-    var onBridgeToggle: (() -> Void)?
     var onSwitchToggle: (() -> Void)?
 
     @objc func apply() {
@@ -38,18 +35,6 @@ private final class NetworkConfigPanelActions: NSObject {
         onClose?()
     }
 
-    @objc func addPeer() {
-        onAddPeer?()
-    }
-
-    @objc func removePeer() {
-        onRemovePeer?()
-    }
-
-    @objc func bridgeToggle() {
-        onBridgeToggle?()
-    }
-
     @objc func switchToggle() {
         onSwitchToggle?()
     }
@@ -60,159 +45,6 @@ private struct SwitchCertificateBundle: Decodable {
     var caCertPem: String
     var clientCertPem: String
     var clientKeyPem: String
-}
-
-private final class NetworkPeerRowView: NSView {
-    let index: Int?
-    var onSelect: ((Int) -> Void)?
-    var isSelected = false {
-        didSet {
-            layer?.backgroundColor = isSelected
-                ? NSColor.controlAccentColor.withAlphaComponent(0.25).cgColor
-                : backgroundColor.cgColor
-        }
-    }
-
-    private let backgroundColor: NSColor
-
-    init(host: String, port: String, index: Int?, isHeader: Bool = false) {
-        self.index = index
-        backgroundColor = isHeader ? NetworkConfigPalette.sectionBackground : NetworkConfigPalette.rowBackground
-        super.init(frame: .zero)
-        translatesAutoresizingMaskIntoConstraints = false
-        setContentHuggingPriority(.defaultLow, for: .horizontal)
-        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        wantsLayer = true
-        layer?.backgroundColor = backgroundColor.cgColor
-
-        let hostLabel = NSTextField(labelWithString: host)
-        hostLabel.translatesAutoresizingMaskIntoConstraints = false
-        hostLabel.font = isHeader ? .systemFont(ofSize: 12, weight: .semibold) : .monospacedSystemFont(ofSize: 12, weight: .regular)
-        hostLabel.textColor = isHeader ? NetworkConfigPalette.secondaryText : NetworkConfigPalette.primaryText
-        hostLabel.lineBreakMode = .byTruncatingMiddle
-
-        let portLabel = NSTextField(labelWithString: port)
-        portLabel.translatesAutoresizingMaskIntoConstraints = false
-        portLabel.font = hostLabel.font
-        portLabel.textColor = hostLabel.textColor
-        portLabel.alignment = .left
-
-        addSubview(hostLabel)
-        addSubview(portLabel)
-        NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 26),
-            hostLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            hostLabel.trailingAnchor.constraint(equalTo: portLabel.leadingAnchor, constant: -12),
-            hostLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            portLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            portLabel.widthAnchor.constraint(equalToConstant: 96),
-            portLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
-        ])
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard let index else { return }
-        onSelect?(index)
-    }
-}
-
-private final class NetworkPeerListView: NSView {
-    private let rows = NSStackView()
-    private var selectedIndex: Int?
-
-    var peers: [PrivateNetworkBridgeEndpoint] {
-        get { peerStorage }
-        set {
-            peerStorage = newValue
-            if let selectedIndex, selectedIndex >= newValue.count {
-                self.selectedIndex = nil
-            }
-            rebuildRows()
-        }
-    }
-    private var peerStorage: [PrivateNetworkBridgeEndpoint] = []
-
-    var selectedRow: Int {
-        selectedIndex ?? -1
-    }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        translatesAutoresizingMaskIntoConstraints = false
-
-        wantsLayer = true
-        layer?.borderWidth = 1
-        layer?.borderColor = NetworkConfigPalette.border.cgColor
-        layer?.backgroundColor = NetworkConfigPalette.rowBackground.cgColor
-        layer?.masksToBounds = true
-
-        rows.translatesAutoresizingMaskIntoConstraints = false
-        rows.orientation = .vertical
-        rows.alignment = .width
-        rows.spacing = 1
-
-        setAccessibilityIdentifier("okrun.network.bridge.peer-list")
-        addSubview(rows)
-        NSLayoutConstraint.activate([
-            rows.leadingAnchor.constraint(equalTo: leadingAnchor),
-            rows.trailingAnchor.constraint(equalTo: trailingAnchor),
-            rows.topAnchor.constraint(equalTo: topAnchor),
-            rows.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor),
-            rows.widthAnchor.constraint(equalTo: widthAnchor)
-        ])
-        rebuildRows()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    func selectRowIndexes(_ indexes: IndexSet, byExtendingSelection: Bool) {
-        selectedIndex = indexes.first
-        updateSelection()
-    }
-
-    private func rebuildRows() {
-        rows.arrangedSubviews.forEach { view in
-            rows.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-
-        appendRow(NetworkPeerRowView(host: "Host", port: "Port", index: nil, isHeader: true))
-        if peerStorage.isEmpty {
-            let empty = NetworkPeerRowView(host: "No peers configured", port: "", index: nil)
-            empty.alphaValue = 0.65
-            appendRow(empty)
-        } else {
-            for (index, peer) in peerStorage.enumerated() {
-                let row = NetworkPeerRowView(host: peer.host, port: "\(peer.port)", index: index)
-                row.onSelect = { [weak self] selected in
-                    self?.selectedIndex = selected
-                    self?.updateSelection()
-                }
-                appendRow(row)
-            }
-        }
-        updateSelection()
-    }
-
-    private func appendRow(_ row: NetworkPeerRowView) {
-        rows.addArrangedSubview(row)
-        row.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
-    }
-
-    private func updateSelection() {
-        for view in rows.arrangedSubviews {
-            guard let row = view as? NetworkPeerRowView else { continue }
-            row.isSelected = row.index == selectedIndex
-        }
-    }
 }
 
 extension AppDelegate {
@@ -255,33 +87,6 @@ extension AppDelegate {
         let rangeEndField = makeNetworkField(identifier: "okrun.network.dhcp.range-end")
         let leaseField = makeNetworkField(identifier: "okrun.network.dhcp.lease-seconds")
 
-        let bridgeEnabled = makeNetworkCheckbox("Bridge", identifier: "okrun.network.bridge.enabled")
-        let bindEnabled = makeNetworkCheckbox("Bind", identifier: "okrun.network.bridge.bind-enabled")
-        let bindHostField = makeNetworkField(identifier: "okrun.network.bridge.bind-host")
-        let bindPortField = makeNetworkField(identifier: "okrun.network.bridge.bind-port")
-        let peerHostField = makeNetworkField(identifier: "okrun.network.bridge.peer-host")
-        setNetworkPlaceholder("172.16.0.10", on: peerHostField)
-        let peerPortField = makeNetworkField(identifier: "okrun.network.bridge.peer-port")
-        setNetworkPlaceholder("7777", on: peerPortField)
-        peerPortField.stringValue = "7777"
-        let addPeerButton = NSButton(title: "Add Peer", target: nil, action: nil)
-        addPeerButton.setAccessibilityIdentifier("okrun.network.bridge.peer-add")
-        addPeerButton.bezelStyle = .rounded
-        let removePeerButton = NSButton(title: "Remove Peer", target: nil, action: nil)
-        removePeerButton.setAccessibilityIdentifier("okrun.network.bridge.peer-remove")
-        removePeerButton.bezelStyle = .rounded
-
-        let peerButtonRow = NSStackView(views: [addPeerButton, removePeerButton])
-        peerButtonRow.translatesAutoresizingMaskIntoConstraints = false
-        peerButtonRow.orientation = .horizontal
-        peerButtonRow.alignment = .centerY
-        peerButtonRow.spacing = 8
-        addPeerButton.widthAnchor.constraint(equalToConstant: 96).isActive = true
-        removePeerButton.widthAnchor.constraint(equalToConstant: 116).isActive = true
-
-        let peersTable = NetworkPeerListView()
-        peersTable.heightAnchor.constraint(equalToConstant: 112).isActive = true
-
         let switchEnabled = makeNetworkCheckbox("Web Switch", identifier: "okrun.network.switch.enabled")
         let switchMultipath = makeNetworkCheckbox("Multipath", identifier: "okrun.network.switch.multipath")
         let switchServerField = makeNetworkField(identifier: "okrun.network.switch.server")
@@ -292,11 +97,6 @@ extension AppDelegate {
             height: 190
         )
 
-        let bindStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.bind")
-        let peerStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.peers")
-        let bridgeMessageLabel = makeNetworkStatusLabel(identifier: "okrun.network.bridge.status.message")
-        bridgeMessageLabel.lineBreakMode = .byWordWrapping
-        bridgeMessageLabel.maximumNumberOfLines = 3
         let switchStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.switch")
         let switchServerStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.switch-server")
         let switchMessageLabel = makeNetworkStatusLabel(identifier: "okrun.network.switch.status.message")
@@ -337,32 +137,6 @@ extension AppDelegate {
             makeNetworkSettingsSection(title: "Lease Range", contentView: dhcpLeaseGrid)
         ])
 
-        let bridgeConnectionGrid = NSGridView(views: [
-            [makeNetworkLabel("Enabled"), bridgeEnabled],
-            [makeNetworkLabel("Bind"), bindEnabled],
-            [makeNetworkLabel("Bind Host"), bindHostField],
-            [makeNetworkLabel("Bind Port"), bindPortField]
-        ])
-        configureNetworkGrid(bridgeConnectionGrid)
-        let bridgePeersGrid = NSGridView(views: [
-            [makeNetworkLabel("Peer Host"), peerHostField],
-            [makeNetworkLabel("Peer Port"), peerPortField],
-            [makeNetworkLabel("Peer Actions"), peerButtonRow],
-            [makeNetworkLabel("Configured Peers"), peersTable]
-        ])
-        configureNetworkGrid(bridgePeersGrid)
-        let bridgeStatusGrid = NSGridView(views: [
-            [makeNetworkLabel("Bind Status"), bindStatusLabel],
-            [makeNetworkLabel("Peer Status"), peerStatusLabel],
-            [makeNetworkLabel("Message"), bridgeMessageLabel]
-        ])
-        configureNetworkGrid(bridgeStatusGrid)
-        let bridgeStack = makeNetworkSettingsStack([
-            makeNetworkSettingsSection(title: "Bridge", contentView: bridgeConnectionGrid),
-            makeNetworkSettingsSection(title: "Peers", contentView: bridgePeersGrid),
-            makeNetworkSettingsSection(title: "Status", contentView: bridgeStatusGrid)
-        ])
-
         let switchConnectionGrid = NSGridView(views: [
             [makeNetworkLabel("Enabled"), switchEnabled],
             [makeNetworkLabel("Multipath"), switchMultipath],
@@ -390,7 +164,6 @@ extension AppDelegate {
         tabView.setAccessibilityIdentifier("okrun.network.tabs")
         tabView.tabViewType = .topTabsBezelBorder
         tabView.addTabViewItem(makeNetworkTabItem(label: "DHCP", contentView: dhcpStack))
-        tabView.addTabViewItem(makeNetworkTabItem(label: "Bridge", contentView: bridgeStack))
         tabView.addTabViewItem(makeNetworkTabItem(label: "Web Switch", contentView: switchStack))
         tabView.selectTabViewItem(at: 0)
 
@@ -446,21 +219,9 @@ extension AppDelegate {
         }
 
         func updateTransportControls() {
-            let bridgeOn = bridgeEnabled.state == .on
             let switchOn = switchEnabled.state == .on
 
             switchEnabled.isEnabled = true
-            bridgeEnabled.isEnabled = true
-
-            let bridgeControlsEnabled = bridgeOn
-            bindEnabled.isEnabled = bridgeControlsEnabled
-            bindHostField.isEnabled = bridgeControlsEnabled
-            bindPortField.isEnabled = bridgeControlsEnabled
-            peerHostField.isEnabled = bridgeControlsEnabled
-            peerPortField.isEnabled = bridgeControlsEnabled
-            addPeerButton.isEnabled = bridgeControlsEnabled
-            removePeerButton.isEnabled = bridgeControlsEnabled
-            peersTable.alphaValue = bridgeControlsEnabled ? 1 : 0.55
 
             switchMultipath.isEnabled = switchOn
             switchServerField.isEnabled = switchOn
@@ -486,26 +247,6 @@ extension AppDelegate {
                 rangeEndField.stringValue = dhcp.rangeEnd
                 leaseField.stringValue = "\(dhcp.leaseSeconds)"
 
-                if let bridge = privateNetwork?.bridge {
-                    bridgeEnabled.state = .on
-                    if let bind = bridge.bind {
-                        bindEnabled.state = .on
-                        bindHostField.stringValue = bind.host
-                        bindPortField.stringValue = "\(bind.port)"
-                    } else {
-                        bindEnabled.state = .off
-                        bindHostField.stringValue = ""
-                        bindPortField.stringValue = "7777"
-                    }
-                    peersTable.peers = bridge.peers
-                } else {
-                    bridgeEnabled.state = .off
-                    bindEnabled.state = .off
-                    bindHostField.stringValue = ""
-                    bindPortField.stringValue = "7777"
-                    peersTable.peers = []
-                }
-
                 if let switchConfig = privateNetwork?.switch {
                     switchEnabled.state = switchConfig.enabled ? .on : .off
                     switchMultipath.state = switchConfig.multipath ? .on : .off
@@ -526,20 +267,6 @@ extension AppDelegate {
             } catch {
                 setPanelMessage(error.localizedDescription, isError: true)
             }
-        }
-
-        func parseEndpoint(host: String, port: String, context: String) throws -> PrivateNetworkBridgeEndpoint {
-            guard let parsedPort = Int(port.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-                throw AppError("\(context) port must be a number.")
-            }
-            return try PrivateNetworkBridgeEndpoint(
-                host: host.trimmingCharacters(in: .whitespacesAndNewlines),
-                port: parsedPort
-            ).validated(context: context)
-        }
-
-        func parsePeers() throws -> [PrivateNetworkBridgeEndpoint] {
-            peersTable.peers
         }
 
         func normalizedSwitchServer(_ rawValue: String) throws -> String {
@@ -735,26 +462,12 @@ extension AppDelegate {
                 leaseSeconds: leaseSeconds
             ).validated()
 
-            let bridge: PrivateNetworkBridgeConfig?
-            if bridgeEnabled.state == .on {
-                let bind = bindEnabled.state == .on
-                    ? try parseEndpoint(host: bindHostField.stringValue, port: bindPortField.stringValue, context: "private network bridge bind")
-                    : nil
-                bridge = try PrivateNetworkBridgeConfig(bind: bind, peers: parsePeers()).validated()
-            } else {
-                bridge = nil
-            }
-
-            return HostPrivateNetworkConfig(dhcp: dhcp, bridge: bridge, switch: try readSwitchConfig())
+            return HostPrivateNetworkConfig(dhcp: dhcp, switch: try readSwitchConfig())
         }
 
         func updateStatus(
-            bridgeStatus status: PrivateNetworkBridgeStatus = PrivateNetworkRuntimeRegistry.shared.bridgeStatus(identifier: identifier),
             switchStatus: PrivateNetworkSwitchStatus = PrivateNetworkRuntimeRegistry.shared.switchStatus(identifier: identifier)
         ) {
-            bindStatusLabel.stringValue = status.bindMessage
-            bindStatusLabel.textColor = status.isListening ? .systemGreen : NetworkConfigPalette.secondaryText
-
             switchStatusLabel.stringValue = switchStatus.state.rawValue.capitalized
             switchStatusLabel.textColor = switchStatusColor(switchStatus.state)
             switchServerStatusLabel.stringValue = switchStatus.server ?? "Not configured"
@@ -767,53 +480,6 @@ extension AppDelegate {
             switchMessageLabel.textColor = switchStatus.errorMessage == nil
                 ? switchStatusColor(switchStatus.state)
                 : .systemRed
-
-            var bridgeMessages: [String] = []
-            var bridgeMessageColor = NetworkConfigPalette.secondaryText
-            if let error = status.errorMessage {
-                peerStatusLabel.stringValue = "Error"
-                peerStatusLabel.textColor = .systemRed
-                bridgeMessages.append(error)
-                bridgeMessageColor = .systemRed
-                bridgeMessageLabel.stringValue = bridgeMessages.joined(separator: "\n")
-                bridgeMessageLabel.textColor = bridgeMessageColor
-                return
-            }
-
-            if status.peers.isEmpty {
-                peerStatusLabel.stringValue = "No peers"
-                peerStatusLabel.textColor = NetworkConfigPalette.secondaryText
-                bridgeMessages.append(bridgeEnabled.state == .on ? "No bridge peers configured." : "Bridge disabled.")
-            } else {
-                let connected = status.peers.filter(\.isConnected).count
-                let failed = status.peers.filter { $0.state == .failed || $0.state == .rejected }.count
-                let connecting = status.peers.filter { $0.state == .connecting }.count
-                if failed > 0 {
-                    peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected, \(failed) error"
-                    peerStatusLabel.textColor = .systemRed
-                } else if connecting > 0 {
-                    peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected, \(connecting) connecting"
-                    peerStatusLabel.textColor = .systemOrange
-                } else {
-                    peerStatusLabel.stringValue = "\(connected)/\(status.peers.count) connected"
-                    peerStatusLabel.textColor = connected == status.peers.count ? .systemGreen : NetworkConfigPalette.secondaryText
-                }
-
-                bridgeMessages.append(contentsOf: status.peers.map { peer in
-                    "\(peer.endpoint.description) [\(peer.state.rawValue)]: \(peer.message)"
-                })
-
-                if failed > 0 {
-                    bridgeMessageColor = .systemRed
-                } else if connecting > 0 {
-                    bridgeMessageColor = .systemOrange
-                } else if connected == status.peers.count {
-                    bridgeMessageColor = .systemGreen
-                }
-            }
-
-            bridgeMessageLabel.stringValue = bridgeMessages.joined(separator: "\n")
-            bridgeMessageLabel.textColor = bridgeMessageColor
         }
 
         let actions = NetworkConfigPanelActions()
@@ -826,11 +492,6 @@ extension AppDelegate {
                 let dhcpRange = try privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                     dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
                 }
-                let bridgeStatus = PrivateNetworkRuntimeRegistry.shared.configureBridge(
-                    identifier: identifier,
-                    bridgeConfig: privateNetwork.bridge,
-                    dhcpRange: dhcpRange
-                )
                 let switchStatus = PrivateNetworkRuntimeRegistry.shared.configureSwitch(
                     identifier: identifier,
                     switchConfig: privateNetwork.switch,
@@ -838,7 +499,7 @@ extension AppDelegate {
                 )
                 setPanelMessage("Saved network config.")
                 updateTransportControls()
-                updateStatus(bridgeStatus: bridgeStatus, switchStatus: switchStatus)
+                updateStatus(switchStatus: switchStatus)
             } catch {
                 setPanelMessage(error.localizedDescription, isError: true)
             }
@@ -847,60 +508,9 @@ extension AppDelegate {
             updateStatus()
             setPanelMessage("Refreshed status.")
         }
-        actions.onAddPeer = {
-            do {
-                let peer = try parseEndpoint(
-                    host: peerHostField.stringValue,
-                    port: peerPortField.stringValue,
-                    context: "private network bridge peer"
-                )
-                guard !peersTable.peers.contains(peer) else {
-                    throw AppError("private network bridge peers contains duplicate endpoint \(peer.description).")
-                }
-                var peers = peersTable.peers
-                peers.append(peer)
-                peersTable.peers = peers
-                peersTable.selectRowIndexes(IndexSet(integer: peers.count - 1), byExtendingSelection: false)
-                peerHostField.stringValue = ""
-                peerPortField.stringValue = "7777"
-                setPanelMessage("Added peer \(peer.description).")
-            } catch {
-                setPanelMessage(error.localizedDescription, isError: true)
-            }
-        }
-        actions.onRemovePeer = {
-            guard !peersTable.peers.isEmpty else {
-                setPanelMessage("No peer selected.")
-                return
-            }
-            let selectedRow = peersTable.selectedRow
-            var peers = peersTable.peers
-            let index = selectedRow >= 0 ? selectedRow : peers.count - 1
-            guard index < peers.count else { return }
-            let removedPeer = peers.remove(at: index)
-            peersTable.peers = peers
-            setPanelMessage("Removed peer \(removedPeer.description).")
-        }
-        actions.onBridgeToggle = {
-            if bridgeEnabled.state == .on {
-                setPanelMessage(
-                    switchEnabled.state == .on
-                        ? "Bridge enabled; Web Switch will remain available as fallback."
-                        : "Bridge enabled."
-                )
-            } else {
-                setPanelMessage("Bridge disabled.")
-            }
-            updateTransportControls()
-            updateStatus()
-        }
         actions.onSwitchToggle = {
             if switchEnabled.state == .on {
-                setPanelMessage(
-                    bridgeEnabled.state == .on
-                        ? "Web Switch enabled as fallback when Bridge is unavailable."
-                        : "Web Switch enabled."
-                )
+                setPanelMessage("Web Switch enabled.")
             } else {
                 setPanelMessage("Web Switch disabled.")
             }
@@ -917,12 +527,6 @@ extension AppDelegate {
         refreshButton.action = #selector(NetworkConfigPanelActions.refresh)
         closeButton.target = actions
         closeButton.action = #selector(NetworkConfigPanelActions.close)
-        addPeerButton.target = actions
-        addPeerButton.action = #selector(NetworkConfigPanelActions.addPeer)
-        removePeerButton.target = actions
-        removePeerButton.action = #selector(NetworkConfigPanelActions.removePeer)
-        bridgeEnabled.target = actions
-        bridgeEnabled.action = #selector(NetworkConfigPanelActions.bridgeToggle)
         switchEnabled.target = actions
         switchEnabled.action = #selector(NetworkConfigPanelActions.switchToggle)
 
@@ -932,14 +536,6 @@ extension AppDelegate {
             let dhcpRange = try savedPrivateNetwork?.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                 dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
             }
-            let bridgeStatus = !PrivateNetworkRuntimeRegistry.shared.hasBridge(identifier: identifier)
-                && savedPrivateNetwork?.bridge != nil
-                ? PrivateNetworkRuntimeRegistry.shared.configureBridge(
-                    identifier: identifier,
-                    bridgeConfig: savedPrivateNetwork?.bridge,
-                    dhcpRange: dhcpRange ?? nil
-                )
-                : PrivateNetworkRuntimeRegistry.shared.bridgeStatus(identifier: identifier)
             let switchStatus = !PrivateNetworkRuntimeRegistry.shared.hasSwitch(identifier: identifier)
                 && savedPrivateNetwork?.switch?.enabled == true
                 ? PrivateNetworkRuntimeRegistry.shared.configureSwitch(
@@ -948,7 +544,7 @@ extension AppDelegate {
                     dhcpRange: dhcpRange ?? nil
                 )
                 : PrivateNetworkRuntimeRegistry.shared.switchStatus(identifier: identifier)
-            updateStatus(bridgeStatus: bridgeStatus, switchStatus: switchStatus)
+            updateStatus(switchStatus: switchStatus)
         } catch {
             updateStatus()
         }

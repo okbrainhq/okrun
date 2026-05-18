@@ -10,64 +10,14 @@ struct HostNetworkConfig: Codable, Equatable {
 
 struct HostPrivateNetworkConfig: Codable, Equatable {
     var dhcp: PrivateNetworkDHCPConfig?
-    var bridge: PrivateNetworkBridgeConfig?
     var `switch`: PrivateNetworkSwitchConfig?
 
     init(
         dhcp: PrivateNetworkDHCPConfig?,
-        bridge: PrivateNetworkBridgeConfig? = nil,
         switch switchConfig: PrivateNetworkSwitchConfig? = nil
     ) {
         self.dhcp = dhcp
-        self.bridge = bridge
         self.switch = switchConfig
-    }
-}
-
-struct PrivateNetworkBridgeConfig: Codable, Equatable {
-    var bind: PrivateNetworkBridgeEndpoint?
-    var peers: [PrivateNetworkBridgeEndpoint]
-
-    func validated() throws -> PrivateNetworkBridgeConfig {
-        _ = try bind?.validated(context: "private network bridge bind")
-        guard bind != nil || !peers.isEmpty else {
-            throw AppError("private network bridge must configure bind, peers, or both.")
-        }
-        var seen = Set<PrivateNetworkBridgeEndpoint>()
-        for peer in peers {
-            let validatedPeer = try peer.validated(context: "private network bridge peer")
-            guard seen.insert(validatedPeer).inserted else {
-                throw AppError("private network bridge peers contains duplicate endpoint \(validatedPeer.description).")
-            }
-        }
-        return self
-    }
-}
-
-struct PrivateNetworkBridgeEndpoint: Codable, Equatable, Hashable {
-    var host: String
-    var port: Int
-
-    var description: String {
-        "\(host):\(port)"
-    }
-
-    func validated(context: String) throws -> PrivateNetworkBridgeEndpoint {
-        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedHost.isEmpty else {
-            throw AppError("\(context) host must not be empty.")
-        }
-        guard trimmedHost.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
-            throw AppError("\(context) host must not contain NUL.")
-        }
-        var address = in_addr()
-        guard trimmedHost.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else {
-            throw AppError("\(context) host must be an IPv4 address.")
-        }
-        guard (1...65_535).contains(port) else {
-            throw AppError("\(context) port must be between 1 and 65535.")
-        }
-        return PrivateNetworkBridgeEndpoint(host: trimmedHost, port: port)
     }
 }
 
@@ -161,7 +111,6 @@ final class HostNetworkConfigStore {
         let config = try JSONDecoder().decode(HostNetworkConfig.self, from: data)
         for (_, privateNetwork) in config.privateNetworks {
             _ = try privateNetwork.dhcp?.validated()
-            _ = try privateNetwork.bridge?.validated()
             _ = try privateNetwork.switch?.validated()
         }
         return config
@@ -182,13 +131,6 @@ final class HostNetworkConfigStore {
         return dhcp
     }
 
-    func bridgeConfigForPrivateNetwork(identifier: String) throws -> PrivateNetworkBridgeConfig? {
-        guard let bridge = try load().privateNetworks[identifier]?.bridge else {
-            return nil
-        }
-        return try bridge.validated()
-    }
-
     func switchConfigForPrivateNetwork(identifier: String) throws -> PrivateNetworkSwitchConfig? {
         guard let switchConfig = try load().privateNetworks[identifier]?.switch else {
             return nil
@@ -200,7 +142,6 @@ final class HostNetworkConfigStore {
     func save(_ config: HostNetworkConfig) throws {
         for (_, privateNetwork) in config.privateNetworks {
             _ = try privateNetwork.dhcp?.validated()
-            _ = try privateNetwork.bridge?.validated()
             _ = try privateNetwork.switch?.validated()
         }
         let encoder = JSONEncoder()

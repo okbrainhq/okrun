@@ -540,308 +540,6 @@ struct OkrunVMTests {
     }
 
     @Test
-    func hostNetworkConfigStoreValidatesBridgeConfig() throws {
-        let root = try makeTemporaryDirectory()
-        defer { removeTemporaryDirectory(root) }
-        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
-
-        let validBridge = PrivateNetworkBridgeConfig(
-            bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: 41000),
-            peers: [
-                PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: 41001)
-            ]
-        )
-        let validConfig = HostNetworkConfig(version: 1, privateNetworks: [
-            "okrun": HostPrivateNetworkConfig(dhcp: nil, bridge: validBridge)
-        ])
-
-        try store.save(validConfig)
-        #expect(try store.bridgeConfigForPrivateNetwork(identifier: "okrun") == validBridge)
-        #expect(try store.load() == validConfig)
-
-        let clientOnlyBridge = PrivateNetworkBridgeConfig(
-            bind: nil,
-            peers: [
-                PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: 41000)
-            ]
-        )
-        let clientOnlyConfig = HostNetworkConfig(version: 1, privateNetworks: [
-            "okrun": HostPrivateNetworkConfig(dhcp: nil, bridge: clientOnlyBridge)
-        ])
-        try store.save(clientOnlyConfig)
-        #expect(try store.bridgeConfigForPrivateNetwork(identifier: "okrun") == clientOnlyBridge)
-
-        let invalidPort = HostNetworkConfig(version: 1, privateNetworks: [
-            "okrun": HostPrivateNetworkConfig(
-                dhcp: nil,
-                bridge: PrivateNetworkBridgeConfig(
-                    bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: 0),
-                    peers: []
-                )
-            )
-        ])
-        #expect(throws: (any Error).self) {
-            try store.save(invalidPort)
-        }
-
-        let invalidHost = HostNetworkConfig(version: 1, privateNetworks: [
-            "okrun": HostPrivateNetworkConfig(
-                dhcp: nil,
-                bridge: PrivateNetworkBridgeConfig(
-                    bind: PrivateNetworkBridgeEndpoint(host: "localhost", port: 41000),
-                    peers: []
-                )
-            )
-        ])
-        #expect(throws: (any Error).self) {
-            try store.save(invalidHost)
-        }
-
-        let emptyBridge = HostNetworkConfig(version: 1, privateNetworks: [
-            "okrun": HostPrivateNetworkConfig(
-                dhcp: nil,
-                bridge: PrivateNetworkBridgeConfig(bind: nil, peers: [])
-            )
-        ])
-        #expect(throws: (any Error).self) {
-            try store.save(emptyBridge)
-        }
-    }
-
-    @Test
-    func privateNetworkBridgeMessageRoundTripsFramedMessages() throws {
-        let nodeID = UUID()
-        let frame = Data([0xde, 0xad, 0xbe, 0xef])
-        let dhcpRange = PrivateNetworkDHCPLeaseRange(
-            cidr: "10.77.0.0/24",
-            rangeStart: "10.77.0.20",
-            rangeEnd: "10.77.0.109"
-        )
-        var buffer = Data()
-        buffer.append(PrivateNetworkBridgeMessage.encodeHello(
-            nodeID: nodeID,
-            networkIdentifier: "okrun",
-            dhcpRange: dhcpRange
-        ))
-        buffer.append(PrivateNetworkBridgeMessage.encodeFrame(frame))
-
-        let messages = try PrivateNetworkBridgeMessage.decodeMessages(from: &buffer)
-
-        #expect(messages == [
-            .hello(nodeID: nodeID, networkIdentifier: "okrun", dhcpRange: dhcpRange),
-            .frame(frame)
-        ])
-        #expect(buffer.isEmpty)
-
-        var partial = PrivateNetworkBridgeMessage.encodeFrame(frame)
-        partial.removeLast()
-        let partialMessages = try PrivateNetworkBridgeMessage.decodeMessages(from: &partial)
-        #expect(partialMessages.isEmpty)
-        #expect(!partial.isEmpty)
-    }
-
-    @Test
-    func privateNetworkBridgeTransfersFramesBetweenHostBridges() throws {
-        let network = "bridge-\(UUID().uuidString)"
-        let portA = try unusedLoopbackPort()
-        let runtimeA = try PrivateNetworkRuntime(identifier: "\(network)-a")
-        let runtimeB = try PrivateNetworkRuntime(identifier: "\(network)-b")
-        let bridgeA = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA), peers: [])
-        )
-        let bridgeB = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(
-                bind: nil,
-                peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA)]
-            )
-        )
-        bridgeA.addRuntime(runtimeA)
-        bridgeB.addRuntime(runtimeB)
-
-        let frame = ethernetFrame(
-            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            source: [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01],
-            payload: [0x01, 0x02, 0x03, 0x04]
-        )
-
-        try sendFrame(frame, from: runtimeA.fileHandle, untilReceivedOn: runtimeB.fileHandle.fileDescriptor, timeout: 5)
-        try sendFrame(frame, from: runtimeB.fileHandle, untilReceivedOn: runtimeA.fileHandle.fileDescriptor, timeout: 5)
-        withExtendedLifetime((bridgeA, bridgeB, runtimeA, runtimeB)) {}
-    }
-
-    @Test
-    func privateNetworkRouterTransfersFramesAcrossBridgeTransport() throws {
-        let network = "router-bridge-\(UUID().uuidString)"
-        let portA = try unusedLoopbackPort()
-        let runtimeA = try PrivateNetworkRuntime(identifier: "\(network)-a")
-        let runtimeB = try PrivateNetworkRuntime(identifier: "\(network)-b")
-        let routerA = PrivateNetworkTransportRouter(identifier: network)
-        let routerB = PrivateNetworkTransportRouter(identifier: network)
-        let bridgeA = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA), peers: []),
-            onRemoteFrame: { [weak routerA] frame in
-                routerA?.receiveRemoteFrame(frame, via: .bridge)
-            }
-        )
-        let bridgeB = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(
-                bind: nil,
-                peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA)]
-            ),
-            onRemoteFrame: { [weak routerB] frame in
-                routerB?.receiveRemoteFrame(frame, via: .bridge)
-            }
-        )
-        routerA.setBridge(bridgeA)
-        routerB.setBridge(bridgeB)
-        routerA.addRuntime(runtimeA)
-        routerB.addRuntime(runtimeB)
-
-        let frame = ethernetFrame(
-            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            source: [0x02, 0xab, 0xab, 0xab, 0xab, 0x01],
-            payload: [0x05, 0x06, 0x07, 0x08]
-        )
-
-        try sendFrame(frame, from: runtimeA.fileHandle, untilReceivedOn: runtimeB.fileHandle.fileDescriptor, timeout: 5)
-        try sendFrame(frame, from: runtimeB.fileHandle, untilReceivedOn: runtimeA.fileHandle.fileDescriptor, timeout: 5)
-        withExtendedLifetime((routerA, routerB, bridgeA, bridgeB, runtimeA, runtimeB)) {}
-    }
-
-    @Test
-    func privateNetworkBridgeRejectsOverlappingDHCPRanges() throws {
-        let network = "bridge-\(UUID().uuidString)"
-        let portA = try unusedLoopbackPort()
-        let endpointA = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portA)
-        let bridgeA = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: endpointA, peers: []),
-            dhcpRange: PrivateNetworkDHCPLeaseRange(
-                cidr: "10.77.0.0/24",
-                rangeStart: "10.77.0.20",
-                rangeEnd: "10.77.0.120"
-            )
-        )
-        let bridgeB = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpointA]),
-            dhcpRange: PrivateNetworkDHCPLeaseRange(
-                cidr: "10.77.0.0/24",
-                rangeStart: "10.77.0.110",
-                rangeEnd: "10.77.0.200"
-            )
-        )
-
-        let status = try waitForPeerState(
-            bridgeB,
-            endpoint: endpointA,
-            state: .rejected,
-            timeout: 5
-        )
-
-        #expect(status.message.localizedCaseInsensitiveContains("overlaps"))
-        withExtendedLifetime((bridgeA, bridgeB)) {}
-    }
-
-    @Test
-    func privateNetworkBridgeReportsPeerConnectionFailureDetails() throws {
-        let network = "bridge-\(UUID().uuidString)"
-        let endpoint = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: try unusedLoopbackPort())
-        let bridge = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpoint])
-        )
-
-        let status = try waitForPeerState(
-            bridge,
-            endpoint: endpoint,
-            state: .failed,
-            timeout: 5
-        )
-
-        #expect(status.message.contains("Failed to connect to \(endpoint.description)"))
-        #expect(status.message.contains("Retrying"))
-        #expect(status.message.contains("Bridge and Bind"))
-        withExtendedLifetime(bridge) {}
-    }
-
-    @Test
-    func privateNetworkBridgeReportsConfiguredPeerConnectedViaInboundConnection() throws {
-        let network = "bridge-\(UUID().uuidString)"
-        let endpointA = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: try unusedLoopbackPort())
-        let endpointB = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: try unusedLoopbackPort())
-        let bridgeA = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: endpointA, peers: [endpointB])
-        )
-        let bridgeB = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpointA])
-        )
-
-        let status = try waitForPeerState(
-            bridgeA,
-            endpoint: endpointB,
-            state: .connected,
-            timeout: 5
-        )
-        #expect(status.message.contains("inbound bridge connection"))
-
-        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1.2))
-        let statusAfterRetryWindow = bridgeA.statusSnapshot().peers.first { $0.endpoint == endpointB }
-        #expect(statusAfterRetryWindow?.state == .connected)
-        withExtendedLifetime((bridgeA, bridgeB)) {}
-    }
-
-    @Test
-    func privateNetworkBridgeDoesNotRelayRemoteFramesToOtherHosts() throws {
-        let network = "bridge-\(UUID().uuidString)"
-        let portB = try unusedLoopbackPort()
-        let runtimeA = try PrivateNetworkRuntime(identifier: "\(network)-a")
-        let runtimeB = try PrivateNetworkRuntime(identifier: "\(network)-b")
-        let runtimeC = try PrivateNetworkRuntime(identifier: "\(network)-c")
-        let endpointB = PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: portB)
-        let bridgeA = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpointB])
-        )
-        let bridgeB = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: endpointB, peers: [])
-        )
-        let bridgeC = try PrivateNetworkBridge(
-            identifier: network,
-            config: PrivateNetworkBridgeConfig(bind: nil, peers: [endpointB])
-        )
-        bridgeA.addRuntime(runtimeA)
-        bridgeB.addRuntime(runtimeB)
-        bridgeC.addRuntime(runtimeC)
-
-        let warmup = ethernetFrame(
-            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            source: [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x01],
-            payload: [0x09]
-        )
-        try sendFrame(warmup, from: runtimeC.fileHandle, untilReceivedOn: runtimeB.fileHandle.fileDescriptor, timeout: 5)
-        #expect(waitForNoFrame(on: runtimeA.fileHandle.fileDescriptor, duration: 0.5))
-        drainFrames(on: runtimeC.fileHandle.fileDescriptor)
-
-        let frame = ethernetFrame(
-            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            source: [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01],
-            payload: [0x01, 0x02, 0x03, 0x04]
-        )
-
-        try sendFrame(frame, from: runtimeA.fileHandle, untilReceivedOn: runtimeB.fileHandle.fileDescriptor, timeout: 5)
-        #expect(waitForNoFrame(on: runtimeC.fileHandle.fileDescriptor, duration: 0.5))
-        withExtendedLifetime((bridgeA, bridgeB, bridgeC, runtimeA, runtimeB, runtimeC)) {}
-    }
-
-    @Test
     func dhcpLeaseAllocatorReusesIdentityAndExhaustsRange() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
@@ -1324,7 +1022,7 @@ struct OkrunVMTests {
             }
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
         }
-        throw AppError("Timed out waiting for private network bridge frame.")
+        throw AppError("Timed out waiting for private network frame.")
     }
 
     @Test
@@ -1381,43 +1079,43 @@ struct OkrunVMTests {
     }
 
     @Test
-    func privateNetworkRouterPrefersBridgeAndFallsBackToSwitch() throws {
+    func privateNetworkRouterSendsKnownRemoteFramesToWebSwitch() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
-        let bridge = MockRoutableTransport()
         let webSwitch = MockRoutableTransport()
-        router.setBridge(bridge)
         router.setWebSwitch(webSwitch)
 
         let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01]
-        let bridgeRemoteMAC: [UInt8] = [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x01]
-        let switchRemoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x01]
-        let bridgeFrame = ethernetFrame(destination: localMAC, source: bridgeRemoteMAC, payload: [0x01])
-        let switchFrame = ethernetFrame(destination: localMAC, source: switchRemoteMAC, payload: [0x02])
+        let remoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x01]
+        let remoteFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
 
-        router.receiveRemoteFrame(bridgeFrame, via: .bridge)
-        router.receiveRemoteFrame(switchFrame, via: .webSwitch)
+        router.receiveRemoteFrame(remoteFrame, via: .webSwitch)
 
-        let toBridgeRemote = ethernetFrame(destination: bridgeRemoteMAC, source: localMAC, payload: [0x03])
-        router.routeLocalFrame(toBridgeRemote)
-        #expect(bridge.sentFrames == [toBridgeRemote])
-        #expect(webSwitch.sentFrames.isEmpty)
+        let reply = ethernetFrame(destination: remoteMAC, source: localMAC, payload: [0x03])
+        router.routeLocalFrame(reply)
 
-        let toSwitchRemote = ethernetFrame(destination: switchRemoteMAC, source: localMAC, payload: [0x04])
-        router.routeLocalFrame(toSwitchRemote)
-        #expect(webSwitch.sentFrames == [toSwitchRemote])
-
-        bridge.canSendPrivateNetworkFrames = false
-        router.routeLocalFrame(toBridgeRemote)
-        #expect(bridge.sentFrames == [toBridgeRemote])
-        #expect(webSwitch.sentFrames == [toSwitchRemote, toBridgeRemote])
+        #expect(webSwitch.sentFrames == [reply])
     }
 
     @Test
-    func privateNetworkRouterSendsDiscoveryFramesAcrossReachableTransports() throws {
+    func privateNetworkRouterInjectsWebSwitchFramesIntoLocalRuntimes() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
-        let bridge = MockRoutableTransport()
+        let runtime = try PrivateNetworkRuntime(identifier: "router-runtime-\(UUID().uuidString)")
+        router.addRuntime(runtime)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x10]
+        let remoteMAC: [UInt8] = [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x10]
+        let switchFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+
+        router.receiveRemoteFrame(switchFrame, via: .webSwitch)
+
+        #expect(try waitForFrame(on: runtime.fileHandle.fileDescriptor, timeout: 1) == switchFrame)
+        withExtendedLifetime((router, runtime)) {}
+    }
+
+    @Test
+    func privateNetworkRouterSendsDiscoveryFramesToWebSwitch() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let webSwitch = MockRoutableTransport()
-        router.setBridge(bridge)
         router.setWebSwitch(webSwitch)
 
         let frame = ethernetFrame(
@@ -1428,8 +1126,25 @@ struct OkrunVMTests {
 
         router.routeLocalFrame(frame)
 
-        #expect(bridge.sentFrames == [frame])
         #expect(webSwitch.sentFrames == [frame])
+    }
+
+    @Test
+    func privateNetworkRouterSkipsUnreachableWebSwitch() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let webSwitch = MockRoutableTransport()
+        router.setWebSwitch(webSwitch)
+        webSwitch.canSendPrivateNetworkFrames = false
+
+        let frame = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x02],
+            payload: [0x06]
+        )
+
+        router.routeLocalFrame(frame)
+
+        #expect(webSwitch.sentFrames.isEmpty)
     }
 
     @Test
@@ -1494,18 +1209,6 @@ struct OkrunVMTests {
         #expect(try store.switchConfigForPrivateNetwork(identifier: "okrun") == switchConfig)
         #expect(try store.load().privateNetworks["okrun"]?.switch == switchConfig)
 
-        let bridge = PrivateNetworkBridgeConfig(
-            bind: nil,
-            peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: 9444)]
-        )
-        let invalidConfig = HostNetworkConfig(version: 1, privateNetworks: [
-            "okrun": HostPrivateNetworkConfig(dhcp: nil, bridge: bridge, switch: switchConfig)
-        ])
-        try store.save(invalidConfig)
-        let combined = try store.load().privateNetworks["okrun"]
-        #expect(combined?.bridge == bridge)
-        #expect(combined?.switch == switchConfig)
-
         let changedCredentials = PrivateNetworkSwitchConfig(
             enabled: true,
             server: "localhost:9443",
@@ -1531,63 +1234,11 @@ struct OkrunVMTests {
         #expect(legacySwitchConfig.credentialFingerprint == "")
     }
 
-    private func sendFrame(
-        _ frame: Data,
-        from source: FileHandle,
-        untilReceivedOn destinationDescriptor: Int32,
-        timeout: TimeInterval
-    ) throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            try source.write(contentsOf: frame)
-            let attemptDeadline = min(Date().addingTimeInterval(0.05), deadline)
-            while Date() < attemptDeadline {
-                if let received = readFrame(on: destinationDescriptor), received == frame {
-                    return
-                }
-                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
-            }
-        }
-        throw AppError("Timed out sending private network bridge frame.")
-    }
-
-    private func waitForPeerState(
-        _ bridge: PrivateNetworkBridge,
-        endpoint: PrivateNetworkBridgeEndpoint,
-        state: PrivateNetworkBridgePeerState,
-        timeout: TimeInterval
-    ) throws -> PrivateNetworkBridgePeerStatus {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if let status = bridge.statusSnapshot().peers.first(where: { $0.endpoint == endpoint }),
-               status.state == state {
-                return status
-            }
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
-        }
-        throw AppError("Timed out waiting for private network bridge peer state.")
-    }
-
-    private func waitForNoFrame(on descriptor: Int32, duration: TimeInterval) -> Bool {
-        let deadline = Date().addingTimeInterval(duration)
-        while Date() < deadline {
-            if readFrame(on: descriptor) != nil {
-                return false
-            }
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
-        }
-        return true
-    }
-
     private func readFrame(on descriptor: Int32) -> Data? {
         var buffer = [UInt8](repeating: 0, count: 65_535)
         let count = recv(descriptor, &buffer, buffer.count, MSG_DONTWAIT)
         guard count > 0 else { return nil }
         return Data(buffer.prefix(count))
-    }
-
-    private func drainFrames(on descriptor: Int32) {
-        while readFrame(on: descriptor) != nil {}
     }
 
     private final class MockRoutableTransport: PrivateNetworkRoutableTransport {
@@ -1625,48 +1276,6 @@ struct OkrunVMTests {
         }
     }
 
-    private func unusedLoopbackPort() throws -> Int {
-        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
-        guard descriptor >= 0 else {
-            throw AppError("Failed to create test socket: \(String(cString: strerror(errno))).")
-        }
-        defer { close(descriptor) }
-
-        var reuse: Int32 = 1
-        setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-
-        var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = 0
-        let parseResult = "127.0.0.1".withCString {
-            inet_pton(AF_INET, $0, &address.sin_addr)
-        }
-        guard parseResult == 1 else {
-            throw AppError("Failed to parse loopback address for test socket.")
-        }
-
-        let bindResult = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            throw AppError("Failed to bind test socket: \(String(cString: strerror(errno))).")
-        }
-
-        var addressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(descriptor, $0, &addressLength)
-            }
-        }
-        guard nameResult == 0 else {
-            throw AppError("Failed to inspect test socket port: \(String(cString: strerror(errno))).")
-        }
-
-        return Int(UInt16(bigEndian: address.sin_port))
-    }
 
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory

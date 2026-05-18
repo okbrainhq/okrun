@@ -633,12 +633,10 @@ enum NetworkDeviceFactory {
         }
         let dhcpRange = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier)
             .map { try PrivateNetworkDHCPLeaseRange(config: $0) }
-        let bridgeConfig = try hostNetworkConfigStore.bridgeConfigForPrivateNetwork(identifier: identifier)
         let switchConfig = try hostNetworkConfigStore.switchConfigForPrivateNetwork(identifier: identifier)
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
         try PrivateNetworkRuntimeRegistry.shared.retain(
             runtime,
-            bridgeConfig: bridgeConfig,
             switchConfig: switchConfig,
             dhcpRange: dhcpRange
         )
@@ -670,9 +668,7 @@ final class PrivateNetworkRuntimeRegistry {
     static let shared = PrivateNetworkRuntimeRegistry()
 
     private var runtimes: [PrivateNetworkRuntime] = []
-    private var bridges: [String: PrivateNetworkBridge] = [:]
-    private var bridgeFailures: [String: PrivateNetworkBridgeStatus] = [:]
-    private var switches: [String: PrivateNetworkSwitchBridge] = [:]
+    private var switches: [String: PrivateNetworkSwitchTransport] = [:]
     private var switchFailures: [String: PrivateNetworkSwitchStatus] = [:]
     private var routers: [String: PrivateNetworkTransportRouter] = [:]
 
@@ -680,7 +676,6 @@ final class PrivateNetworkRuntimeRegistry {
 
     func retain(
         _ runtime: PrivateNetworkRuntime,
-        bridgeConfig: PrivateNetworkBridgeConfig? = nil,
         switchConfig: PrivateNetworkSwitchConfig? = nil,
         dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
     ) throws {
@@ -690,15 +685,6 @@ final class PrivateNetworkRuntimeRegistry {
 
         var retainedTransport = false
         var retainedError: Error?
-        if let bridgeConfig {
-            do {
-                _ = try retainBridge(identifier: runtime.identifier, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
-                retainedTransport = true
-            } catch {
-                bridgeFailures[runtime.identifier] = .failed(identifier: runtime.identifier, error: error.localizedDescription)
-                retainedError = error
-            }
-        }
         if let switchConfig {
             do {
                 _ = try retainSwitch(identifier: runtime.identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
@@ -715,37 +701,6 @@ final class PrivateNetworkRuntimeRegistry {
 
         if !retainedTransport, let retainedError {
             throw retainedError
-        }
-    }
-
-    func configureBridge(
-        identifier: String,
-        bridgeConfig: PrivateNetworkBridgeConfig?,
-        dhcpRange: PrivateNetworkDHCPLeaseRange?
-    ) -> PrivateNetworkBridgeStatus {
-        guard let bridgeConfig else {
-            bridges[identifier] = nil
-            bridgeFailures[identifier] = nil
-            routers[identifier]?.setBridge(nil)
-            return .disabled(identifier: identifier)
-        }
-        if let existingBridge = bridges[identifier],
-           existingBridge.matches(config: bridgeConfig, dhcpRange: dhcpRange) {
-            router(for: identifier).setBridge(existingBridge)
-            return existingBridge.statusSnapshot()
-        }
-        bridges[identifier] = nil
-        router(for: identifier).setBridge(nil)
-        do {
-            let bridge = try makeBridge(identifier: identifier, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
-            bridges[identifier] = bridge
-            router(for: identifier).setBridge(bridge)
-            bridgeFailures[identifier] = nil
-            return bridge.statusSnapshot()
-        } catch {
-            let status = PrivateNetworkBridgeStatus.failed(identifier: identifier, error: error.localizedDescription)
-            bridgeFailures[identifier] = status
-            return status
         }
     }
 
@@ -768,11 +723,11 @@ final class PrivateNetworkRuntimeRegistry {
         switches[identifier] = nil
         router(for: identifier).setWebSwitch(nil)
         do {
-            let switchBridge = try makeSwitch(identifier: identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
-            switches[identifier] = switchBridge
-            router(for: identifier).setWebSwitch(switchBridge)
+            let switchTransport = try makeSwitch(identifier: identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
+            switches[identifier] = switchTransport
+            router(for: identifier).setWebSwitch(switchTransport)
             switchFailures[identifier] = nil
-            return switchBridge.statusSnapshot()
+            return switchTransport.statusSnapshot()
         } catch {
             let status = PrivateNetworkSwitchStatus.failed(
                 identifier: identifier,
@@ -794,22 +749,11 @@ final class PrivateNetworkRuntimeRegistry {
             ?? .disabled(identifier: identifier)
     }
 
-    func hasBridge(identifier: String) -> Bool {
-        bridges[identifier] != nil
-    }
-
-    func bridgeStatus(identifier: String) -> PrivateNetworkBridgeStatus {
-        bridges[identifier]?.statusSnapshot()
-            ?? bridgeFailures[identifier]
-            ?? .disabled(identifier: identifier)
-    }
-
     func releaseAll() {
         for runtime in runtimes {
             routers[runtime.identifier]?.removeRuntime(runtime)
         }
         runtimes.removeAll()
-        bridges.removeAll()
         switches.removeAll()
         routers.removeAll()
     }
@@ -822,9 +766,6 @@ final class PrivateNetworkRuntimeRegistry {
         runtimes.removeAll { runtime in
             ownedRuntimes.contains { $0 === runtime }
         }
-        for identifier in Array(bridges.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
-            bridges[identifier] = nil
-        }
         for identifier in Array(switches.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
             switches[identifier] = nil
         }
@@ -834,33 +775,11 @@ final class PrivateNetworkRuntimeRegistry {
     }
 
     @discardableResult
-    private func retainBridge(
-        identifier: String,
-        bridgeConfig: PrivateNetworkBridgeConfig,
-        dhcpRange: PrivateNetworkDHCPLeaseRange?
-    ) throws -> PrivateNetworkBridge {
-        let transportRouter = router(for: identifier)
-        if let existingBridge = bridges[identifier],
-           existingBridge.matches(config: bridgeConfig, dhcpRange: dhcpRange) {
-            transportRouter.setBridge(existingBridge)
-            return existingBridge
-        }
-
-        bridges[identifier] = nil
-        transportRouter.setBridge(nil)
-        let bridge = try makeBridge(identifier: identifier, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
-        bridges[identifier] = bridge
-        bridgeFailures[identifier] = nil
-        transportRouter.setBridge(bridge)
-        return bridge
-    }
-
-    @discardableResult
     private func retainSwitch(
         identifier: String,
         switchConfig: PrivateNetworkSwitchConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange?
-    ) throws -> PrivateNetworkSwitchBridge {
+    ) throws -> PrivateNetworkSwitchTransport {
         let transportRouter = router(for: identifier)
         if let existingSwitch = switches[identifier],
            canReuseSwitch(existingSwitch, config: switchConfig, dhcpRange: dhcpRange) {
@@ -870,15 +789,15 @@ final class PrivateNetworkRuntimeRegistry {
 
         switches[identifier] = nil
         transportRouter.setWebSwitch(nil)
-        let switchBridge = try makeSwitch(identifier: identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
-        switches[identifier] = switchBridge
+        let switchTransport = try makeSwitch(identifier: identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
+        switches[identifier] = switchTransport
         switchFailures[identifier] = nil
-        transportRouter.setWebSwitch(switchBridge)
-        return switchBridge
+        transportRouter.setWebSwitch(switchTransport)
+        return switchTransport
     }
 
     private func canReuseSwitch(
-        _ existingSwitch: PrivateNetworkSwitchBridge,
+        _ existingSwitch: PrivateNetworkSwitchTransport,
         config switchConfig: PrivateNetworkSwitchConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange?
     ) -> Bool {
@@ -889,29 +808,13 @@ final class PrivateNetworkRuntimeRegistry {
         return state == .connecting || state == .connected
     }
 
-    private func makeBridge(
-        identifier: String,
-        bridgeConfig: PrivateNetworkBridgeConfig,
-        dhcpRange: PrivateNetworkDHCPLeaseRange?
-    ) throws -> PrivateNetworkBridge {
-        let transportRouter = router(for: identifier)
-        return try PrivateNetworkBridge(
-            identifier: identifier,
-            config: bridgeConfig,
-            dhcpRange: dhcpRange,
-            onRemoteFrame: { [weak transportRouter] frame in
-                transportRouter?.receiveRemoteFrame(frame, via: .bridge)
-            }
-        )
-    }
-
     private func makeSwitch(
         identifier: String,
         switchConfig: PrivateNetworkSwitchConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange?
-    ) throws -> PrivateNetworkSwitchBridge {
+    ) throws -> PrivateNetworkSwitchTransport {
         let transportRouter = router(for: identifier)
-        return try PrivateNetworkSwitchBridge(
+        return try PrivateNetworkSwitchTransport(
             identifier: identifier,
             config: switchConfig,
             dhcpRange: dhcpRange,
@@ -926,11 +829,8 @@ final class PrivateNetworkRuntimeRegistry {
             return router
         }
         let router = PrivateNetworkTransportRouter(identifier: identifier)
-        if let bridge = bridges[identifier] {
-            router.setBridge(bridge)
-        }
-        if let switchBridge = switches[identifier] {
-            router.setWebSwitch(switchBridge)
+        if let switchTransport = switches[identifier] {
+            router.setWebSwitch(switchTransport)
         }
         routers[identifier] = router
         return router
@@ -941,11 +841,11 @@ final class PrivateNetworkRuntime {
     let identifier: String
     let fileHandle: FileHandle
 
-    private let bridgeDescriptor: Int32
+    private let hostDescriptor: Int32
     private let peerDescriptor: Int32
     private let peerURL: URL
     private let networkDirectory: URL
-    private let bridgeSource: DispatchSourceRead
+    private let hostSource: DispatchSourceRead
     private let peerSource: DispatchSourceRead
     private let queue: DispatchQueue
     private let observerLock = NSLock()
@@ -959,15 +859,15 @@ final class PrivateNetworkRuntime {
             throw AppError("Failed to create private network socket pair: \(String(cString: strerror(errno))).")
         }
 
-        bridgeDescriptor = descriptors[1]
+        hostDescriptor = descriptors[1]
         let guestDescriptor = descriptors[0]
 
         let sendBufferSize = 1_048_576
         let receiveBufferSize = 4_194_304
         try Self.setSocketOption(guestDescriptor, SO_SNDBUF, sendBufferSize)
         try Self.setSocketOption(guestDescriptor, SO_RCVBUF, receiveBufferSize)
-        try Self.setSocketOption(bridgeDescriptor, SO_SNDBUF, sendBufferSize)
-        try Self.setSocketOption(bridgeDescriptor, SO_RCVBUF, receiveBufferSize)
+        try Self.setSocketOption(hostDescriptor, SO_SNDBUF, sendBufferSize)
+        try Self.setSocketOption(hostDescriptor, SO_RCVBUF, receiveBufferSize)
 
         let socketRoot = ProcessInfo.processInfo.environment["OKRUN_PRIVATE_NETWORK_SOCKET_ROOT"]
             .flatMap { $0.isEmpty ? nil : $0 }
@@ -979,7 +879,7 @@ final class PrivateNetworkRuntime {
         peerDescriptor = socket(AF_UNIX, SOCK_DGRAM, 0)
         guard peerDescriptor >= 0 else {
             close(guestDescriptor)
-            close(bridgeDescriptor)
+            close(hostDescriptor)
             throw AppError("Failed to create private network peer socket: \(String(cString: strerror(errno))).")
         }
         try Self.setSocketOption(peerDescriptor, SO_SNDBUF, sendBufferSize)
@@ -991,23 +891,23 @@ final class PrivateNetworkRuntime {
         fileHandle = FileHandle(fileDescriptor: guestDescriptor, closeOnDealloc: true)
         queue = DispatchQueue(label: "okrun.private-network.\(identifier).\(UUID().uuidString)")
 
-        bridgeSource = DispatchSource.makeReadSource(fileDescriptor: bridgeDescriptor, queue: queue)
+        hostSource = DispatchSource.makeReadSource(fileDescriptor: hostDescriptor, queue: queue)
         peerSource = DispatchSource.makeReadSource(fileDescriptor: peerDescriptor, queue: queue)
 
-        bridgeSource.setEventHandler { [weak self] in
+        hostSource.setEventHandler { [weak self] in
             self?.readGuestFrames()
         }
         peerSource.setEventHandler { [weak self] in
             self?.readPeerFrames()
         }
-        bridgeSource.resume()
+        hostSource.resume()
         peerSource.resume()
     }
 
     deinit {
-        bridgeSource.cancel()
+        hostSource.cancel()
         peerSource.cancel()
-        close(bridgeDescriptor)
+        close(hostDescriptor)
         close(peerDescriptor)
         try? FileManager.default.removeItem(at: peerURL)
     }
@@ -1016,7 +916,7 @@ final class PrivateNetworkRuntime {
         var buffer = [UInt8](repeating: 0, count: 65_535)
 
         while true {
-            let count = recv(bridgeDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
+            let count = recv(hostDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
             if count > 0 {
                 notifyObservers(direction: .fromGuest, frame: Data(buffer.prefix(count)))
                 broadcastFrame(buffer, count: count)
@@ -1037,7 +937,7 @@ final class PrivateNetworkRuntime {
             if count > 0 {
                 notifyObservers(direction: .fromPeer, frame: Data(buffer.prefix(count)))
                 _ = buffer.withUnsafeBufferPointer { pointer in
-                    write(bridgeDescriptor, pointer.baseAddress, count)
+                    write(hostDescriptor, pointer.baseAddress, count)
                 }
                 continue
             }
@@ -1074,7 +974,7 @@ final class PrivateNetworkRuntime {
     func injectFrameToGuest(_ frame: Data) {
         frame.withUnsafeBytes { bytes in
             guard let baseAddress = bytes.baseAddress else { return }
-            _ = write(bridgeDescriptor, baseAddress, frame.count)
+            _ = write(hostDescriptor, baseAddress, frame.count)
         }
     }
 
