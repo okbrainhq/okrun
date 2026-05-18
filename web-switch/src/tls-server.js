@@ -113,6 +113,8 @@ class SwitchTLSServer {
   }
 
   handleSocket(socket) {
+    socket.setNoDelay(true);
+
     const peer = socket.getPeerCertificate();
     const identity = {
       clientSerial: normalizeSerial(peer.serialNumber),

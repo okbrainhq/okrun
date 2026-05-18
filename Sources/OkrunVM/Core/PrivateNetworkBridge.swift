@@ -551,6 +551,11 @@ final class PrivateNetworkBridge {
     private static func configureConnectedSocket(_ descriptor: Int32) throws {
         var noSignal: Int32 = 1
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+
+        var noDelay: Int32 = 1
+        guard setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &noDelay, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            throw AppError("Failed to disable Nagle for private network bridge socket: \(String(cString: strerror(errno))).")
+        }
     }
 
     private static func setNonBlocking(_ descriptor: Int32) throws {

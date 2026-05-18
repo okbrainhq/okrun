@@ -613,7 +613,9 @@ private final class RealSwitchSocket {
             let tlsOptions = NWProtocolTLS.Options()
             configureTLSOptions(tlsOptions, identity: identity, caCertificate: caCertificate)
 
-            let parameters = NWParameters(tls: tlsOptions, tcp: NWProtocolTCP.Options())
+            let tcpOptions = NWProtocolTCP.Options()
+            tcpOptions.noDelay = true
+            let parameters = NWParameters(tls: tlsOptions, tcp: tcpOptions)
             parameters.allowLocalEndpointReuse = true
             let connection = NWConnection(
                 host: NWEndpoint.Host(endpoint.host),
