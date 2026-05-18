@@ -507,6 +507,11 @@ private final class VirtualSwitchSocket {
 }
 
 private final class RealSwitchSocket {
+    private static let initialReconnectDelay: TimeInterval = 0.5
+    private static let maxReconnectDelay: TimeInterval = 3
+    private static let connectionTimeout: TimeInterval = 25
+    private static let initResponseTimeout: TimeInterval = 10
+
     var onFrame: ((SwitchFrame) -> Void)?
     var onResetSeq: (([UInt32]) -> Void)?
     var onStatusChange: ((PrivateNetworkSwitchConnectionState, String, Int, String?) -> Void)?
@@ -518,12 +523,17 @@ private final class RealSwitchSocket {
     private let nodeID: UUID
     private let interfaceName: String
     private let queue = DispatchQueue(label: "okrun.switch.real.\(UUID().uuidString)")
-    private let decoder: SwitchFrameDecoder
+    private var decoder: SwitchFrameDecoder
     private var connection: NWConnection?
     private var pendingWrites: [Data] = []
     private var initialized = false
     private var stopped = false
     private var maxFrameSize: Int
+    private var reconnectDelay = RealSwitchSocket.initialReconnectDelay
+    private var reconnectAttempts = 0
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var connectionTimeoutWorkItem: DispatchWorkItem?
+    private var initResponseWorkItem: DispatchWorkItem?
 
     init(
         identifier: String,
@@ -544,7 +554,12 @@ private final class RealSwitchSocket {
 
     func start() {
         queue.async { [weak self] in
-            self?.startOnQueue()
+            guard let self else { return }
+            stopped = false
+            reconnectDelay = Self.initialReconnectDelay
+            reconnectAttempts = 0
+            pendingWrites.removeAll()
+            startOnQueue()
         }
     }
 
@@ -552,6 +567,12 @@ private final class RealSwitchSocket {
         queue.async { [weak self] in
             guard let self else { return }
             stopped = true
+            AppLog.webSwitch.info(
+                "stop network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public)"
+            )
+            cancelReconnect()
+            cancelConnectionTimeout()
+            cancelInitResponseTimeout()
             connection?.cancel()
             connection = nil
             pendingWrites.removeAll()
@@ -567,7 +588,11 @@ private final class RealSwitchSocket {
     private func startOnQueue() {
         guard !stopped else { return }
         initialized = false
-        pendingWrites.removeAll()
+        maxFrameSize = SwitchFrame.defaultMaxFrameSize
+        decoder = SwitchFrameDecoder(maxPayloadLength: maxFrameSize)
+        AppLog.webSwitch.info(
+            "connect start network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) attempt=\(self.reconnectAttempts, privacy: .public)"
+        )
         report(.connecting, "Connecting to \(endpoint.description).", connections: 0, error: nil)
 
         do {
@@ -584,13 +609,18 @@ private final class RealSwitchSocket {
                 using: parameters
             )
             self.connection = connection
-            connection.stateUpdateHandler = { [weak self] state in
+            scheduleConnectionTimeout(for: connection)
+            connection.stateUpdateHandler = { [weak self, weak connection] state in
                 self?.queue.async {
-                    self?.handleState(state)
+                    guard let self, let connection, connection === self.connection else { return }
+                    self.handleState(state, for: connection)
                 }
             }
             connection.start(queue: queue)
         } catch {
+            AppLog.webSwitch.error(
+                "connect preparation failed network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+            )
             report(.failed, error.localizedDescription, connections: 0, error: error.localizedDescription)
         }
     }
@@ -619,25 +649,53 @@ private final class RealSwitchSocket {
         }, verifyQueue)
     }
 
-    private func handleState(_ state: NWConnection.State) {
+    private func handleState(_ state: NWConnection.State, for connection: NWConnection) {
         switch state {
         case .ready:
+            cancelConnectionTimeout()
+            AppLog.webSwitch.info(
+                "tls ready network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public)"
+            )
             report(.connecting, "Connected to \(endpoint.description). Sending INIT.", connections: 0, error: nil)
-            receiveLoop()
+            receiveLoop(connection)
             sendInit()
+            scheduleInitResponseTimeout(for: connection)
         case .failed(let error):
             initialized = false
-            report(.failed, "Switch connection failed: \(error.localizedDescription)", connections: 0, error: error.localizedDescription)
-            connection?.cancel()
-            connection = nil
+            AppLog.webSwitch.error(
+                "connection failed network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+            )
+            closeConnection(
+                connection,
+                message: "Switch connection failed: \(error.localizedDescription)",
+                error: error.localizedDescription,
+                retry: true
+            )
         case .cancelled:
             initialized = false
-            connection = nil
             if !stopped {
-                report(.failed, "Switch connection closed.", connections: 0, error: "Switch connection closed.")
+                AppLog.webSwitch.warning(
+                    "connection cancelled network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public)"
+                )
+                closeConnection(
+                    connection,
+                    message: "Switch connection closed.",
+                    error: "Switch connection closed.",
+                    retry: true
+                )
+            } else if connection === self.connection {
+                self.connection = nil
             }
         case .waiting(let error):
-            report(.connecting, "Waiting to connect to \(endpoint.description): \(error.localizedDescription)", connections: 0, error: nil)
+            AppLog.webSwitch.info(
+                "connection waiting network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+            )
+            closeConnection(
+                connection,
+                message: "Waiting to connect to \(endpoint.description): \(error.localizedDescription)",
+                error: error.localizedDescription,
+                retry: true
+            )
         case .preparing, .setup:
             report(.connecting, "Connecting to \(endpoint.description).", connections: 0, error: nil)
         @unknown default:
@@ -660,44 +718,71 @@ private final class RealSwitchSocket {
             let encoded = try SwitchFrameProtocol.encodeJSON(type: .initFrame, value: payload)
             sendNow(encoded)
         } catch {
-            report(.failed, error.localizedDescription, connections: 0, error: error.localizedDescription)
-            connection?.cancel()
+            if let connection {
+                closeConnection(connection, message: error.localizedDescription, error: error.localizedDescription, retry: false)
+            } else {
+                report(.failed, error.localizedDescription, connections: 0, error: error.localizedDescription)
+            }
         }
     }
 
-    private func receiveLoop() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] content, _, isComplete, error in
+    private func receiveLoop(_ activeConnection: NWConnection) {
+        activeConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self, weak activeConnection] content, _, isComplete, error in
             guard let self else { return }
             queue.async {
+                guard let activeConnection, activeConnection === self.connection else { return }
                 if let content, !content.isEmpty {
                     do {
                         for frame in try self.decoder.push(content) {
                             self.handleFrame(frame)
                         }
                     } catch {
-                        self.report(.failed, "Switch protocol error: \(error.localizedDescription)", connections: 0, error: error.localizedDescription)
-                        self.connection?.cancel()
+                        AppLog.webSwitch.error(
+                            "protocol error network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                        )
+                        self.closeConnection(
+                            activeConnection,
+                            message: "Switch protocol error: \(error.localizedDescription)",
+                            error: error.localizedDescription,
+                            retry: true
+                        )
                         return
                     }
                 }
 
                 if let error {
                     self.initialized = false
-                    self.report(.failed, "Switch receive failed: \(error.localizedDescription)", connections: 0, error: error.localizedDescription)
-                    self.connection?.cancel()
+                    AppLog.webSwitch.error(
+                        "receive failed network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                    self.closeConnection(
+                        activeConnection,
+                        message: "Switch receive failed: \(error.localizedDescription)",
+                        error: error.localizedDescription,
+                        retry: true
+                    )
                     return
                 }
 
                 guard !isComplete else {
                     self.initialized = false
                     if !self.stopped {
-                        self.report(.failed, "Switch connection closed by server.", connections: 0, error: "Switch connection closed by server.")
+                        AppLog.webSwitch.warning(
+                            "connection closed by server network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public)"
+                        )
+                        self.closeConnection(
+                            activeConnection,
+                            message: "Switch connection closed by server.",
+                            error: "Switch connection closed by server.",
+                            retry: true
+                        )
+                    } else {
+                        self.connection = nil
                     }
-                    self.connection?.cancel()
                     return
                 }
 
-                self.receiveLoop()
+                self.receiveLoop(activeConnection)
             }
         }
     }
@@ -712,11 +797,29 @@ private final class RealSwitchSocket {
                 }
                 maxFrameSize = ack.maxFrameSize
                 initialized = true
+                cancelInitResponseTimeout()
+                let completedAttempts = reconnectAttempts
+                reconnectDelay = Self.initialReconnectDelay
+                reconnectAttempts = 0
+                AppLog.webSwitch.info(
+                    "init complete network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) reconnectAttempts=\(completedAttempts, privacy: .public) maxFrameSize=\(self.maxFrameSize, privacy: .public)"
+                )
                 flushPendingWrites()
                 report(.connected, "Connected to \(endpoint.description).", connections: 1, error: nil)
             } catch {
-                report(.failed, "Invalid switch INIT ACK: \(error.localizedDescription)", connections: 0, error: error.localizedDescription)
-                connection?.cancel()
+                AppLog.webSwitch.error(
+                    "invalid init ack network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                )
+                if let connection {
+                    closeConnection(
+                        connection,
+                        message: "Invalid switch INIT ACK: \(error.localizedDescription)",
+                        error: error.localizedDescription,
+                        retry: true
+                    )
+                } else {
+                    report(.failed, "Invalid switch INIT ACK: \(error.localizedDescription)", connections: 0, error: error.localizedDescription)
+                }
             }
         case .data:
             guard initialized else { return }
@@ -726,8 +829,13 @@ private final class RealSwitchSocket {
             let decoded = try? JSONDecoder().decode(SwitchErrorPayload.self, from: frame.payload)
             let message = decoded?.message ?? String(decoding: frame.payload, as: UTF8.self)
             let code = decoded?.code
+            AppLog.webSwitch.error(
+                "server rejected switch connection network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) code=\(code ?? "unknown", privacy: .public) message=\(message, privacy: .public)"
+            )
             report(.rejected, message, connections: 0, error: code)
-            connection?.cancel()
+            if let connection {
+                closeConnection(connection, message: message, error: code, retry: true, reportFinalFailure: false)
+            }
         case .ping:
             sendPong()
         case .pong:
@@ -781,10 +889,125 @@ private final class RealSwitchSocket {
         connection.send(content: data, completion: .contentProcessed { [weak self] error in
             guard let self, let error else { return }
             queue.async {
-                self.report(.failed, "Switch send failed: \(error.localizedDescription)", connections: 0, error: error.localizedDescription)
-                self.connection?.cancel()
+                guard let connection = self.connection else { return }
+                AppLog.webSwitch.error(
+                    "send failed network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                )
+                self.closeConnection(
+                    connection,
+                    message: "Switch send failed: \(error.localizedDescription)",
+                    error: error.localizedDescription,
+                    retry: true
+                )
             }
         })
+    }
+
+    private func scheduleConnectionTimeout(for connection: NWConnection) {
+        cancelConnectionTimeout()
+        let workItem = DispatchWorkItem { [weak self, weak connection] in
+            guard let self,
+                  let connection,
+                  !self.stopped,
+                  connection === self.connection,
+                  !self.initialized else { return }
+            AppLog.webSwitch.warning(
+                "connection timeout network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) timeoutSeconds=\(Int(Self.connectionTimeout), privacy: .public)"
+            )
+            self.closeConnection(
+                connection,
+                message: "Switch connection timed out after \(Int(Self.connectionTimeout))s.",
+                error: "Switch connection timed out.",
+                retry: true
+            )
+        }
+        connectionTimeoutWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + Self.connectionTimeout, execute: workItem)
+    }
+
+    private func cancelConnectionTimeout() {
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
+    }
+
+    private func scheduleInitResponseTimeout(for connection: NWConnection) {
+        cancelInitResponseTimeout()
+        let workItem = DispatchWorkItem { [weak self, weak connection] in
+            guard let self,
+                  let connection,
+                  !self.stopped,
+                  connection === self.connection,
+                  !self.initialized else { return }
+            AppLog.webSwitch.warning(
+                "init timeout network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) timeoutSeconds=\(Int(Self.initResponseTimeout), privacy: .public)"
+            )
+            self.closeConnection(
+                connection,
+                message: "Switch INIT response timed out after \(Int(Self.initResponseTimeout))s.",
+                error: "Switch INIT response timed out.",
+                retry: true
+            )
+        }
+        initResponseWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + Self.initResponseTimeout, execute: workItem)
+    }
+
+    private func cancelInitResponseTimeout() {
+        initResponseWorkItem?.cancel()
+        initResponseWorkItem = nil
+    }
+
+    private func closeConnection(
+        _ activeConnection: NWConnection,
+        message: String,
+        error: String?,
+        retry: Bool,
+        reportFinalFailure: Bool = true
+    ) {
+        guard activeConnection === connection else { return }
+        initialized = false
+        cancelConnectionTimeout()
+        cancelInitResponseTimeout()
+        connection = nil
+        activeConnection.cancel()
+
+        guard retry, !stopped else {
+            if reportFinalFailure {
+                report(.failed, message, connections: 0, error: error)
+            }
+            return
+        }
+        scheduleReconnect(message: message, error: error)
+    }
+
+    private func scheduleReconnect(message: String, error: String?) {
+        guard reconnectWorkItem == nil, !stopped else { return }
+        reconnectAttempts += 1
+        let delay = reconnectDelay
+        let milliseconds = Int(delay * 1000)
+        AppLog.webSwitch.warning(
+            "schedule reconnect network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) attempt=\(self.reconnectAttempts, privacy: .public) delayMs=\(milliseconds, privacy: .public) reason=\(message, privacy: .public)"
+        )
+        report(
+            .connecting,
+            "\(message) Reconnect attempt #\(reconnectAttempts) in \(milliseconds)ms.",
+            connections: 0,
+            error: error
+        )
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            reconnectWorkItem = nil
+            startOnQueue()
+        }
+        reconnectWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+        reconnectDelay = min(reconnectDelay * 2, Self.maxReconnectDelay)
+    }
+
+    private func cancelReconnect() {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
     }
 
     private func report(

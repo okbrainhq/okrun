@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CATEGORY="${1:-web-switch}"
+STYLE="${OKRUN_LOG_STYLE:-compact}"
+SUBSYSTEM_PREDICATE='(subsystem == "local.okrun.vm" || subsystem == "com.okrun.vm")'
+
+if [[ "$CATEGORY" == "all" ]]; then
+  PREDICATE="$SUBSYSTEM_PREDICATE"
+else
+  PREDICATE="$SUBSYSTEM_PREDICATE && category == \"$CATEGORY\""
+fi
+
+printf 'Tailing OkRun logs category=%s\n' "$CATEGORY" >&2
+printf 'Predicate: %s\n' "$PREDICATE" >&2
+
+exec log stream --style "$STYLE" --level debug --predicate "$PREDICATE"
