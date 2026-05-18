@@ -1286,6 +1286,89 @@ struct OkrunVMTests {
         throw AppError("Timed out waiting for private network bridge frame.")
     }
 
+    @Test
+    func switchFrameProtocolRoundTripsAndHandlesPartialReads() throws {
+        let frame = SwitchFrame(
+            streamID: SwitchFrame.ethernetStreamID,
+            type: .data,
+            sequenceNumber: 42,
+            payload: Data([0xaa, 0xbb, 0xcc])
+        )
+        let encoded = try SwitchFrameProtocol.encode(frame)
+        let decoder = SwitchFrameDecoder(maxPayloadLength: 16)
+
+        #expect(try decoder.push(Data(encoded.prefix(5))).isEmpty)
+        #expect(try decoder.push(Data(encoded.dropFirst(5))) == [frame])
+
+        let secondFrame = SwitchFrame(
+            streamID: SwitchFrame.ethernetStreamID,
+            type: .data,
+            sequenceNumber: 43,
+            payload: Data([0xdd])
+        )
+        #expect(try decoder.push(try SwitchFrameProtocol.encode(secondFrame)) == [secondFrame])
+    }
+
+    @Test
+    func switchFrameDecoderRejectsOversizedPayloads() throws {
+        let encoded = try SwitchFrameProtocol.encode(SwitchFrame(
+            streamID: SwitchFrame.ethernetStreamID,
+            type: .data,
+            sequenceNumber: 1,
+            payload: Data(repeating: 0x01, count: 11)
+        ))
+        let decoder = SwitchFrameDecoder(maxPayloadLength: 10)
+
+        #expect(throws: (any Error).self) {
+            try decoder.push(encoded)
+        }
+    }
+
+    @Test
+    func switchDedupWindowDropsDuplicatesAndOldFrames() {
+        let window = SwitchDedupWindow()
+
+        #expect(window.accept(10))
+        #expect(!window.accept(10))
+        #expect(window.accept(12))
+        #expect(window.accept(11))
+        #expect(window.accept(140))
+        #expect(!window.accept(11))
+    }
+
+    @Test
+    func hostNetworkConfigLoadsAndValidatesSwitchConfig() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
+        let switchConfig = PrivateNetworkSwitchConfig(
+            enabled: true,
+            server: "localhost:9443",
+            caCert: "/tmp/ca-cert.pem",
+            clientCert: "/tmp/client-cert.pem",
+            clientKey: "/tmp/client-key.pem",
+            multipath: false
+        )
+        try store.save(HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(dhcp: nil, switch: switchConfig)
+        ]))
+
+        #expect(try store.switchConfigForPrivateNetwork(identifier: "okrun") == switchConfig)
+        #expect(try store.load().privateNetworks["okrun"]?.switch == switchConfig)
+
+        let bridge = PrivateNetworkBridgeConfig(
+            bind: nil,
+            peers: [PrivateNetworkBridgeEndpoint(host: "127.0.0.1", port: 9444)]
+        )
+        let invalidConfig = HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(dhcp: nil, bridge: bridge, switch: switchConfig)
+        ])
+        #expect(throws: (any Error).self) {
+            try store.save(invalidConfig)
+        }
+    }
+
     private func sendFrame(
         _ frame: Data,
         from source: FileHandle,

@@ -634,8 +634,14 @@ enum NetworkDeviceFactory {
         let dhcpRange = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier)
             .map { try PrivateNetworkDHCPLeaseRange(config: $0) }
         let bridgeConfig = try hostNetworkConfigStore.bridgeConfigForPrivateNetwork(identifier: identifier)
+        let switchConfig = try hostNetworkConfigStore.switchConfigForPrivateNetwork(identifier: identifier)
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
-        try PrivateNetworkRuntimeRegistry.shared.retain(runtime, bridgeConfig: bridgeConfig, dhcpRange: dhcpRange)
+        try PrivateNetworkRuntimeRegistry.shared.retain(
+            runtime,
+            bridgeConfig: bridgeConfig,
+            switchConfig: switchConfig,
+            dhcpRange: dhcpRange
+        )
         onRetainPrivateNetworkRuntime?(runtime)
         return networkDevice
     }
@@ -666,17 +672,40 @@ final class PrivateNetworkRuntimeRegistry {
     private var runtimes: [PrivateNetworkRuntime] = []
     private var bridges: [String: PrivateNetworkBridge] = [:]
     private var bridgeFailures: [String: PrivateNetworkBridgeStatus] = [:]
+    private var switches: [String: PrivateNetworkSwitchBridge] = [:]
+    private var switchFailures: [String: PrivateNetworkSwitchStatus] = [:]
 
     private init() {}
 
     func retain(
         _ runtime: PrivateNetworkRuntime,
         bridgeConfig: PrivateNetworkBridgeConfig? = nil,
+        switchConfig: PrivateNetworkSwitchConfig? = nil,
         dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
     ) throws {
+        if bridgeConfig != nil && switchConfig != nil {
+            throw AppError("private network cannot enable both bridge and switch for the same network.")
+        }
+
         runtimes.append(runtime)
+        if let switchBridge = switches[runtime.identifier] {
+            switchBridge.addRuntime(runtime)
+            return
+        }
         if let bridge = bridges[runtime.identifier] {
             bridge.addRuntime(runtime)
+            return
+        }
+
+        if let switchConfig {
+            let switchBridge = try PrivateNetworkSwitchBridge(
+                identifier: runtime.identifier,
+                config: switchConfig,
+                dhcpRange: dhcpRange
+            )
+            switchBridge.addRuntime(runtime)
+            switches[runtime.identifier] = switchBridge
+            switchFailures[runtime.identifier] = nil
             return
         }
 
@@ -717,6 +746,50 @@ final class PrivateNetworkRuntimeRegistry {
         }
     }
 
+    func configureSwitch(
+        identifier: String,
+        switchConfig: PrivateNetworkSwitchConfig?,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) -> PrivateNetworkSwitchStatus {
+        guard let switchConfig else {
+            switches[identifier] = nil
+            switchFailures[identifier] = nil
+            return .disabled(identifier: identifier)
+        }
+        if let existingSwitch = switches[identifier],
+           existingSwitch.matches(config: switchConfig, dhcpRange: dhcpRange) {
+            return existingSwitch.statusSnapshot()
+        }
+        switches[identifier] = nil
+        do {
+            let switchBridge = try PrivateNetworkSwitchBridge(identifier: identifier, config: switchConfig, dhcpRange: dhcpRange)
+            switches[identifier] = switchBridge
+            switchFailures[identifier] = nil
+            for runtime in runtimes where runtime.identifier == identifier {
+                switchBridge.addRuntime(runtime)
+            }
+            return switchBridge.statusSnapshot()
+        } catch {
+            let status = PrivateNetworkSwitchStatus.failed(
+                identifier: identifier,
+                server: switchConfig.server,
+                error: error.localizedDescription
+            )
+            switchFailures[identifier] = status
+            return status
+        }
+    }
+
+    func hasSwitch(identifier: String) -> Bool {
+        switches[identifier] != nil
+    }
+
+    func switchStatus(identifier: String) -> PrivateNetworkSwitchStatus {
+        switches[identifier]?.statusSnapshot()
+            ?? switchFailures[identifier]
+            ?? .disabled(identifier: identifier)
+    }
+
     func hasBridge(identifier: String) -> Bool {
         bridges[identifier] != nil
     }
@@ -730,21 +803,27 @@ final class PrivateNetworkRuntimeRegistry {
     func releaseAll() {
         for runtime in runtimes {
             bridges[runtime.identifier]?.removeRuntime(runtime)
+            switches[runtime.identifier]?.removeRuntime(runtime)
         }
         runtimes.removeAll()
         bridges.removeAll()
+        switches.removeAll()
     }
 
     func release(_ ownedRuntimes: [PrivateNetworkRuntime]) {
         guard !ownedRuntimes.isEmpty else { return }
         for runtime in ownedRuntimes {
             bridges[runtime.identifier]?.removeRuntime(runtime)
+            switches[runtime.identifier]?.removeRuntime(runtime)
         }
         runtimes.removeAll { runtime in
             ownedRuntimes.contains { $0 === runtime }
         }
         for identifier in Array(bridges.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
             bridges[identifier] = nil
+        }
+        for identifier in Array(switches.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
+            switches[identifier] = nil
         }
     }
 }
@@ -781,7 +860,10 @@ final class PrivateNetworkRuntime {
         try Self.setSocketOption(bridgeDescriptor, SO_SNDBUF, sendBufferSize)
         try Self.setSocketOption(bridgeDescriptor, SO_RCVBUF, receiveBufferSize)
 
-        let root = URL(fileURLWithPath: "/tmp/okrun-vnet", isDirectory: true)
+        let socketRoot = ProcessInfo.processInfo.environment["OKRUN_PRIVATE_NETWORK_SOCKET_ROOT"]
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? "/tmp/okrun-vnet"
+        let root = URL(fileURLWithPath: socketRoot, isDirectory: true)
         networkDirectory = root.appendingPathComponent(identifier, isDirectory: true)
         try FileManager.default.createDirectory(at: networkDirectory, withIntermediateDirectories: true)
 

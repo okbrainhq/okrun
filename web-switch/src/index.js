@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
@@ -42,6 +43,8 @@ function numberOption(value, fallback, name) {
 function buildConfig(argv = process.argv.slice(2), env = process.env) {
   const args = parseArgs(argv);
   const root = path.resolve(__dirname, '..');
+  const serverBundlePath = args['server-bundle'] ?? env.OKRUN_SWITCH_SERVER_BUNDLE;
+  const serverBundle = serverBundlePath ? readServerBundle(serverBundlePath) : {};
 
   return {
     host: args.host ?? env.OKRUN_SWITCH_HOST ?? '0.0.0.0',
@@ -51,9 +54,13 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
       8080,
       'status-port'
     ),
-    serverKeyPath: args['server-key'] ?? env.OKRUN_SWITCH_SERVER_KEY ?? path.join(root, '.certs/server/server-key.pem'),
-    serverCertPath: args['server-cert'] ?? env.OKRUN_SWITCH_SERVER_CERT ?? path.join(root, '.certs/server/server-cert.pem'),
-    caCertPath: args['ca-cert'] ?? env.OKRUN_SWITCH_CA_CERT ?? path.join(root, '.ca/ca-cert.pem'),
+    serverBundlePath: serverBundlePath ? path.resolve(serverBundlePath) : null,
+    serverKeyPem: serverBundle.serverKeyPem,
+    serverCertPem: serverBundle.serverCertPem,
+    caCertPem: serverBundle.caCertPem,
+    serverKeyPath: serverBundlePath ? null : args['server-key'] ?? env.OKRUN_SWITCH_SERVER_KEY ?? path.join(root, '.certs/server/server-key.pem'),
+    serverCertPath: serverBundlePath ? null : args['server-cert'] ?? env.OKRUN_SWITCH_SERVER_CERT ?? path.join(root, '.certs/server/server-cert.pem'),
+    caCertPath: serverBundlePath ? null : args['ca-cert'] ?? env.OKRUN_SWITCH_CA_CERT ?? path.join(root, '.ca/ca-cert.pem'),
     crlPath: args.crl ?? env.OKRUN_SWITCH_CRL ?? path.join(root, '.ca/crl.txt'),
     keepaliveIntervalMs: numberOption(
       args['keepalive-interval-ms'] ?? env.OKRUN_SWITCH_KEEPALIVE_INTERVAL_MS,
@@ -81,6 +88,24 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
       'max-frame-size'
     )
   };
+}
+
+function readServerBundle(file) {
+  const bundlePath = path.resolve(file);
+  const bundle = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
+  return {
+    caCertPem: requiredBundleString(bundle, 'caCertPem', bundlePath),
+    serverCertPem: requiredBundleString(bundle, 'serverCertPem', bundlePath),
+    serverKeyPem: requiredBundleString(bundle, 'serverKeyPem', bundlePath)
+  };
+}
+
+function requiredBundleString(bundle, key, file) {
+  const value = bundle[key];
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`${file} is missing ${key}`);
+  }
+  return value;
 }
 
 function createStatusServer(fabric) {
@@ -121,6 +146,7 @@ function start(config) {
       event: 'tls_listening',
       host: address.address,
       port: address.port,
+      serverBundle: config.serverBundlePath,
       serverCert: config.serverCertPath,
       caCert: config.caCertPath,
       crl: config.crlPath

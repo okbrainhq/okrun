@@ -15,6 +15,8 @@ let package = Package(
             name: "OkrunVM",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("Network"),
+                .linkedFramework("Security"),
                 .linkedFramework("Virtualization")
             ]
         ),
@@ -22,6 +24,8 @@ let package = Package(
             name: "OkrunVMTests",
             dependencies: ["OkrunVM"],
             linkerSettings: [
+                .linkedFramework("Network"),
+                .linkedFramework("Security"),
                 .linkedFramework("Virtualization")
             ]
         )

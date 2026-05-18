@@ -85,9 +85,9 @@ class SwitchTLSServer {
 
     this.server = tls.createServer(
       {
-        key: fs.readFileSync(options.serverKeyPath),
-        cert: fs.readFileSync(options.serverCertPath),
-        ca: fs.readFileSync(options.caCertPath),
+        key: readPEMOption(options.serverKeyPem, options.serverKeyPath, 'server key'),
+        cert: readPEMOption(options.serverCertPem, options.serverCertPath, 'server certificate'),
+        ca: readPEMOption(options.caCertPem, options.caCertPath, 'CA certificate'),
         requestCert: true,
         rejectUnauthorized: true,
         minVersion: 'TLSv1.2'
@@ -250,7 +250,18 @@ class SwitchConnection {
     }
 
     if (frame.type === FrameType.DATA) {
-      this.fabric.handleData(this, frame);
+      const result = this.fabric.handleData(this, frame);
+      if (process.env.OKRUN_SWITCH_DEBUG === '1') {
+        this.log('data', {
+          clientSerial: this.identity.clientSerial,
+          nodeID: this.nodeID,
+          network: this.networkKey,
+          seqNo: frame.seqNo,
+          bytes: frame.payload.length,
+          duplicate: result.duplicate,
+          forwarded: result.forwarded
+        });
+      }
       return;
     }
 
@@ -407,6 +418,16 @@ function writeErrorAndEnd(socket, error) {
       socket.destroy();
     }
   }, 100).unref();
+}
+
+function readPEMOption(inlinePEM, filePath, label) {
+  if (inlinePEM) {
+    return inlinePEM;
+  }
+  if (filePath) {
+    return fs.readFileSync(filePath);
+  }
+  throw new Error(`Missing ${label}`);
 }
 
 function normalizeSerial(serial) {

@@ -27,4 +27,5 @@ run_e2e() {
 (cd "$ROOT" && swift test --disable-sandbox)
 run_e2e "Guest tools installer E2E" "$ROOT/scripts/e2e-guest-tools-installer.sh"
 run_e2e "Headless boot E2E" "$ROOT/scripts/e2e-headless-boot.sh"
+run_e2e "Headless switch E2E" "$ROOT/scripts/e2e-switch-headless.sh"
 printf '\nAll tests passed.\n'

@@ -25,6 +25,9 @@ function main(argv) {
     case 'print-host-bundle':
       printHostBundle(options);
       break;
+    case 'print-server-bundle':
+      printServerBundle(options);
+      break;
     case 'revoke':
       revoke(caDir, options);
       break;
@@ -59,8 +62,9 @@ function usage() {
   console.log(`Usage:
   okrun-switch-ca init [--ca-dir <dir>]
   okrun-switch-ca issue-server --hostname <host> [--output <dir>] [--ca-dir <dir>]
-  okrun-switch-ca issue-host --name <name> [--output <dir>] [--ca-dir <dir>]
+  okrun-switch-ca issue-host --name <name> [--server <host:port>] [--output <dir>] [--ca-dir <dir>]
   okrun-switch-ca print-host-bundle --input <dir> [--server <host:port>]
+  okrun-switch-ca print-server-bundle --input <dir>
   okrun-switch-ca revoke --serial <serial> [--ca-dir <dir>]
   okrun-switch-ca list [--ca-dir <dir>]`);
 }
@@ -151,7 +155,8 @@ function issueServer(caDir, options) {
   }
 
   recordIssued(caDir, { serial, type: 'server', name: hostname, certPath });
-  console.log(JSON.stringify({ type: 'server', serial, cert: certPath, key: keyPath }));
+  const bundlePath = writeServerBundle(caDir, output, { hostname, serial, certPath, keyPath });
+  console.log(JSON.stringify({ type: 'server', serial, bundle: bundlePath }));
 }
 
 function issueHost(caDir, options) {
@@ -161,6 +166,7 @@ function issueHost(caDir, options) {
   }
 
   const output = path.resolve(options.output ?? path.join('.certs/hosts', name));
+  const server = options.server ?? 'localhost:9443';
   initCa(caDir);
   ensureDir(output);
 
@@ -203,28 +209,91 @@ function issueHost(caDir, options) {
   fs.rmSync(csrPath, { force: true });
   fs.rmSync(configPath, { force: true });
 
-  const bundle = {
-    name,
-    serial,
-    caCert: caCertPath,
-    clientCert: certPath,
-    clientKey: keyPath
-  };
-  fs.writeFileSync(path.join(output, 'okrun-switch-bundle.json'), `${JSON.stringify(bundle, null, 2)}\n`);
+  const bundlePath = writeHostBundle(output, { name, serial, server, caCertPath, certPath, keyPath });
   recordIssued(caDir, { serial, type: 'host', name, certPath });
-  console.log(JSON.stringify({ type: 'host', serial, cert: certPath, key: keyPath }));
+  console.log(JSON.stringify({ type: 'host', serial, bundle: bundlePath }));
 }
 
 function printHostBundle(options) {
   const input = path.resolve(required(options, 'input'));
-  const server = options.server ?? 'localhost:9443';
-  const bundle = {
-    server,
-    caCertPem: fs.readFileSync(path.join(input, 'ca-cert.pem'), 'utf8'),
-    clientCertPem: fs.readFileSync(path.join(input, 'client-cert.pem'), 'utf8'),
-    clientKeyPem: fs.readFileSync(path.join(input, 'client-key.pem'), 'utf8')
-  };
+  const bundlePath = path.join(input, 'okrun-switch-bundle.json');
+  const bundle = fs.existsSync(bundlePath)
+    ? JSON.parse(fs.readFileSync(bundlePath, 'utf8'))
+    : makeHostBundle({
+      name: path.basename(input),
+      serial: null,
+      server: options.server ?? 'localhost:9443',
+      caCertPath: path.join(input, 'ca-cert.pem'),
+      certPath: path.join(input, 'client-cert.pem'),
+      keyPath: path.join(input, 'client-key.pem')
+    });
+  if (options.server) {
+    bundle.server = options.server;
+  }
   console.log(JSON.stringify(bundle, null, 2));
+}
+
+function printServerBundle(options) {
+  const input = path.resolve(required(options, 'input'));
+  const bundlePath = path.join(input, 'okrun-switch-server-bundle.json');
+  const bundle = fs.existsSync(bundlePath)
+    ? JSON.parse(fs.readFileSync(bundlePath, 'utf8'))
+    : makeServerBundle({
+      hostname: path.basename(input),
+      serial: null,
+      caCertPath: path.join(input, 'ca-cert.pem'),
+      certPath: path.join(input, 'server-cert.pem'),
+      keyPath: path.join(input, 'server-key.pem')
+    });
+  console.log(JSON.stringify(bundle, null, 2));
+}
+
+function writeServerBundle(caDir, output, { hostname, serial, certPath, keyPath }) {
+  const bundlePath = path.join(output, 'okrun-switch-server-bundle.json');
+  const bundle = makeServerBundle({
+    hostname,
+    serial,
+    caCertPath: path.join(caDir, 'ca-cert.pem'),
+    certPath,
+    keyPath
+  });
+  writePrivateJSON(bundlePath, bundle);
+  return bundlePath;
+}
+
+function writeHostBundle(output, { name, serial, server, caCertPath, certPath, keyPath }) {
+  const bundlePath = path.join(output, 'okrun-switch-bundle.json');
+  const bundle = makeHostBundle({ name, serial, server, caCertPath, certPath, keyPath });
+  writePrivateJSON(bundlePath, bundle);
+  return bundlePath;
+}
+
+function makeServerBundle({ hostname, serial, caCertPath, certPath, keyPath }) {
+  return {
+    type: 'server',
+    hostname,
+    serial,
+    caCertPem: fs.readFileSync(caCertPath, 'utf8'),
+    serverCertPem: fs.readFileSync(certPath, 'utf8'),
+    serverKeyPem: fs.readFileSync(keyPath, 'utf8')
+  };
+}
+
+function makeHostBundle({ name, serial, server, caCertPath, certPath, keyPath }) {
+  return {
+    type: 'host',
+    name,
+    serial,
+    server,
+    caCertPem: fs.readFileSync(caCertPath, 'utf8'),
+    clientCertPem: fs.readFileSync(certPath, 'utf8'),
+    clientKeyPem: fs.readFileSync(keyPath, 'utf8')
+  };
+}
+
+function writePrivateJSON(file, value) {
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
 }
 
 function revoke(caDir, options) {
