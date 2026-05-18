@@ -761,7 +761,7 @@ final class PrivateNetworkRuntimeRegistry {
             return .disabled(identifier: identifier)
         }
         if let existingSwitch = switches[identifier],
-           existingSwitch.matches(config: switchConfig, dhcpRange: dhcpRange) {
+           canReuseSwitch(existingSwitch, config: switchConfig, dhcpRange: dhcpRange) {
             router(for: identifier).setWebSwitch(existingSwitch)
             return existingSwitch.statusSnapshot()
         }
@@ -863,7 +863,7 @@ final class PrivateNetworkRuntimeRegistry {
     ) throws -> PrivateNetworkSwitchBridge {
         let transportRouter = router(for: identifier)
         if let existingSwitch = switches[identifier],
-           existingSwitch.matches(config: switchConfig, dhcpRange: dhcpRange) {
+           canReuseSwitch(existingSwitch, config: switchConfig, dhcpRange: dhcpRange) {
             transportRouter.setWebSwitch(existingSwitch)
             return existingSwitch
         }
@@ -875,6 +875,18 @@ final class PrivateNetworkRuntimeRegistry {
         switchFailures[identifier] = nil
         transportRouter.setWebSwitch(switchBridge)
         return switchBridge
+    }
+
+    private func canReuseSwitch(
+        _ existingSwitch: PrivateNetworkSwitchBridge,
+        config switchConfig: PrivateNetworkSwitchConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) -> Bool {
+        guard existingSwitch.matches(config: switchConfig, dhcpRange: dhcpRange) else {
+            return false
+        }
+        let state = existingSwitch.statusSnapshot().state
+        return state == .connecting || state == .connected
     }
 
     private func makeBridge(

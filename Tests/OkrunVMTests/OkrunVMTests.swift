@@ -1441,6 +1441,7 @@ struct OkrunVMTests {
             caCert: "/tmp/ca-cert.pem",
             clientCert: "/tmp/client-cert.pem",
             clientKey: "/tmp/client-key.pem",
+            credentialFingerprint: "bundle-a",
             multipath: false
         )
         try store.save(HostNetworkConfig(version: 1, privateNetworks: [
@@ -1461,6 +1462,30 @@ struct OkrunVMTests {
         let combined = try store.load().privateNetworks["okrun"]
         #expect(combined?.bridge == bridge)
         #expect(combined?.switch == switchConfig)
+
+        let changedCredentials = PrivateNetworkSwitchConfig(
+            enabled: true,
+            server: "localhost:9443",
+            caCert: "/tmp/ca-cert.pem",
+            clientCert: "/tmp/client-cert.pem",
+            clientKey: "/tmp/client-key.pem",
+            credentialFingerprint: "bundle-b",
+            multipath: false
+        )
+        #expect(changedCredentials != switchConfig)
+
+        let legacyJSON = """
+        {
+          "enabled": true,
+          "server": "localhost:9443",
+          "caCert": "/tmp/ca-cert.pem",
+          "clientCert": "/tmp/client-cert.pem",
+          "clientKey": "/tmp/client-key.pem",
+          "multipath": false
+        }
+        """
+        let legacySwitchConfig = try JSONDecoder().decode(PrivateNetworkSwitchConfig.self, from: Data(legacyJSON.utf8))
+        #expect(legacySwitchConfig.credentialFingerprint == "")
     }
 
     private func sendFrame(

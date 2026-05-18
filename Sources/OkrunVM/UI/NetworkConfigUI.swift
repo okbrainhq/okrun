@@ -462,17 +462,17 @@ extension AppDelegate {
             removePeerButton.isEnabled = bridgeControlsEnabled
             peersTable.alphaValue = bridgeControlsEnabled ? 1 : 0.55
 
-            let switchControlsEnabled = switchOn
-            switchMultipath.isEnabled = switchControlsEnabled
-            switchServerField.isEnabled = switchControlsEnabled
-            bundleTextView.isEditable = switchControlsEnabled
-            bundleTextView.isSelectable = switchControlsEnabled
-            bundleTextView.textColor = networkTextAreaTextColor(enabled: switchControlsEnabled)
+            switchMultipath.isEnabled = switchOn
+            switchServerField.isEnabled = switchOn
+            bundleTextView.isEditable = true
+            bundleTextView.isSelectable = true
+            bundleTextView.textColor = networkTextAreaTextColor(enabled: true)
             bundleTextView.insertionPointColor = networkTextAreaInsertionPointColor()
-            bundleScroll.alphaValue = switchControlsEnabled ? 1 : 0.55
+            bundleScroll.alphaValue = 1
         }
 
         var loadedSwitchServer = ""
+        var loadedSwitchBundleText = ""
 
         func loadFields() {
             do {
@@ -511,13 +511,15 @@ extension AppDelegate {
                     switchMultipath.state = switchConfig.multipath ? .on : .off
                     switchServerField.stringValue = switchConfig.server
                     loadedSwitchServer = switchConfig.server
-                    bundleTextView.string = ""
+                    bundleTextView.string = (try? readSavedSwitchBundleText()) ?? ""
+                    loadedSwitchBundleText = normalizedSwitchBundleText(bundleTextView.string)
                 } else {
                     switchEnabled.state = .off
                     switchMultipath.state = .off
                     switchServerField.stringValue = ""
                     loadedSwitchServer = ""
-                    bundleTextView.string = ""
+                    bundleTextView.string = (try? readSavedSwitchBundleText()) ?? ""
+                    loadedSwitchBundleText = normalizedSwitchBundleText(bundleTextView.string)
                 }
                 updateTransportControls()
                 setPanelMessage("Loaded network config.")
@@ -573,6 +575,28 @@ extension AppDelegate {
                 .appendingPathComponent(identifier, isDirectory: true)
         }
 
+        func switchBundleURL() -> URL {
+            switchCertDirectory().appendingPathComponent("okrun-switch-bundle.json")
+        }
+
+        func normalizedSwitchBundleText(_ text: String) -> String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "" : trimmed + "\n"
+        }
+
+        func switchCredentialFingerprint(bundleJSON: String) -> String {
+            let hash = String(FNV1a64.hash(Array(bundleJSON.utf8)), radix: 16)
+            return String(repeating: "0", count: max(0, 16 - hash.count)) + hash
+        }
+
+        func readSavedSwitchBundleText() throws -> String? {
+            let url = switchBundleURL()
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return nil
+            }
+            return try String(contentsOf: url, encoding: .utf8)
+        }
+
         func normalizedPEM(_ text: String, marker: String, label: String) throws -> String {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.contains("-----BEGIN \(marker)-----"),
@@ -592,7 +616,12 @@ extension AppDelegate {
             return trimmed + "\n"
         }
 
-        func writeSwitchPEMFiles(ca: String, cert: String, key: String) throws -> (ca: String, cert: String, key: String) {
+        func writeSwitchCredentials(
+            bundleJSON: String,
+            ca: String,
+            cert: String,
+            key: String
+        ) throws -> (ca: String, cert: String, key: String) {
             let directory = switchCertDirectory()
             try FileManager.default.createDirectory(
                 at: directory,
@@ -604,11 +633,14 @@ extension AppDelegate {
             let caURL = directory.appendingPathComponent("ca-cert.pem")
             let certURL = directory.appendingPathComponent("client-cert.pem")
             let keyURL = directory.appendingPathComponent("client-key.pem")
+            let bundleURL = switchBundleURL()
 
+            try Data(bundleJSON.utf8).write(to: bundleURL, options: .atomic)
             try Data(ca.utf8).write(to: caURL, options: .atomic)
             try Data(cert.utf8).write(to: certURL, options: .atomic)
             try Data(key.utf8).write(to: keyURL, options: .atomic)
 
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bundleURL.path)
             try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: caURL.path)
             try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: certURL.path)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
@@ -620,7 +652,7 @@ extension AppDelegate {
             guard switchEnabled.state == .on else { return nil }
 
             let serverText = switchServerField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            let bundleText = bundleTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            let bundleText = normalizedSwitchBundleText(bundleTextView.string)
             if bundleText.isEmpty {
                 if let saved = try store.load().privateNetworks[identifier]?.switch, saved.enabled {
                     let server = try normalizedSwitchServer(serverText.isEmpty ? saved.server : serverText)
@@ -632,15 +664,33 @@ extension AppDelegate {
                         caCert: saved.caCert,
                         clientCert: saved.clientCert,
                         clientKey: saved.clientKey,
+                        credentialFingerprint: saved.credentialFingerprint,
                         multipath: switchMultipath.state == .on
                     ).validated()
                 }
                 throw AppError("Paste a Web Switch host bundle JSON before applying.")
             }
 
+            if bundleText == loadedSwitchBundleText,
+               let saved = try store.load().privateNetworks[identifier]?.switch,
+               saved.enabled {
+                let server = try normalizedSwitchServer(serverText.isEmpty ? saved.server : serverText)
+                switchServerField.stringValue = server
+                loadedSwitchServer = server
+                return try PrivateNetworkSwitchConfig(
+                    enabled: true,
+                    server: server,
+                    caCert: saved.caCert,
+                    clientCert: saved.clientCert,
+                    clientKey: saved.clientKey,
+                    credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText),
+                    multipath: switchMultipath.state == .on
+                ).validated()
+            }
+
             let bundle: SwitchCertificateBundle
             do {
-                let data = Data(bundleTextView.string.utf8)
+                let data = Data(bundleText.utf8)
                 bundle = try JSONDecoder().decode(SwitchCertificateBundle.self, from: data)
             } catch {
                 throw AppError("Switch bundle JSON is invalid: \(error.localizedDescription)")
@@ -651,12 +701,14 @@ extension AppDelegate {
                 ? bundleServer
                 : serverText
             let server = try normalizedSwitchServer(serverSource)
-            let paths = try writeSwitchPEMFiles(
+            let paths = try writeSwitchCredentials(
+                bundleJSON: bundleText,
                 ca: normalizedPEM(bundle.caCertPem, marker: "CERTIFICATE", label: "CA certificate"),
                 cert: normalizedPEM(bundle.clientCertPem, marker: "CERTIFICATE", label: "Client certificate"),
                 key: normalizedPrivateKeyPEM(bundle.clientKeyPem)
             )
-            bundleTextView.string = ""
+            bundleTextView.string = bundleText
+            loadedSwitchBundleText = bundleText
             switchServerField.stringValue = server
             loadedSwitchServer = server
 
@@ -666,6 +718,7 @@ extension AppDelegate {
                 caCert: paths.ca,
                 clientCert: paths.cert,
                 clientKey: paths.key,
+                credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText),
                 multipath: switchMultipath.state == .on
             )
             return try config.validated()

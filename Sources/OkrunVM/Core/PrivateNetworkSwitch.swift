@@ -213,6 +213,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
     var caCert: String
     var clientCert: String
     var clientKey: String
+    var credentialFingerprint: String
     var multipath: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -221,6 +222,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         case caCert
         case clientCert
         case clientKey
+        case credentialFingerprint
         case multipath
     }
 
@@ -230,6 +232,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         caCert: String = "",
         clientCert: String = "",
         clientKey: String = "",
+        credentialFingerprint: String = "",
         multipath: Bool = false
     ) {
         self.enabled = enabled
@@ -237,6 +240,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         self.caCert = caCert
         self.clientCert = clientCert
         self.clientKey = clientKey
+        self.credentialFingerprint = credentialFingerprint
         self.multipath = multipath
     }
 
@@ -247,6 +251,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         caCert = try container.decodeIfPresent(String.self, forKey: .caCert) ?? ""
         clientCert = try container.decodeIfPresent(String.self, forKey: .clientCert) ?? ""
         clientKey = try container.decodeIfPresent(String.self, forKey: .clientKey) ?? ""
+        credentialFingerprint = try container.decodeIfPresent(String.self, forKey: .credentialFingerprint) ?? ""
         multipath = try container.decodeIfPresent(Bool.self, forKey: .multipath) ?? false
     }
 
@@ -265,6 +270,9 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
             guard trimmed.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
                 throw AppError("private network switch \(label) path must not contain NUL.")
             }
+        }
+        guard credentialFingerprint.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
+            throw AppError("private network switch credential fingerprint must not contain NUL.")
         }
         return self
     }
@@ -848,9 +856,15 @@ private enum SwitchTLSIdentity {
     }
 
     private static func importPKCS12(data: Data, password: String) throws -> SecIdentity {
-        let options = [kSecImportExportPassphrase as String: password] as CFDictionary
+        var options: [String: Any] = [kSecImportExportPassphrase as String: password]
+        if #available(macOS 15.0, *) {
+            options[kSecImportToMemoryOnly as String] = true
+        } else {
+            throw AppError("Web Switch certificate import without Keychain requires macOS 15 or later.")
+        }
+
         var rawItems: CFArray?
-        let status = SecPKCS12Import(data as CFData, options, &rawItems)
+        let status = SecPKCS12Import(data as CFData, options as CFDictionary, &rawItems)
         guard status == errSecSuccess,
               let items = rawItems as? [[String: Any]],
               let rawIdentity = items.first?[kSecImportItemIdentity as String] else {
