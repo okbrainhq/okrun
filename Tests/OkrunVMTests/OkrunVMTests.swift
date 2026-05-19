@@ -1079,6 +1079,37 @@ struct OkrunVMTests {
     }
 
     @Test
+    func pendingSwitchWriteBufferDropsFullAndExpiredFrames() {
+        let now = Date(timeIntervalSince1970: 100)
+        let buffer = PendingSwitchWriteBuffer(limit: 2, maxAge: 10)
+
+        #expect(buffer.append(Data([0x01]), at: now))
+        #expect(buffer.append(Data([0x02]), at: now))
+        #expect(!buffer.append(Data([0x03]), at: now))
+
+        var result = buffer.flush(at: now.addingTimeInterval(5))
+        #expect(result.writes == [Data([0x01]), Data([0x02])])
+        #expect(result.dropped == 0)
+
+        #expect(buffer.append(Data([0x04]), at: now))
+        #expect(buffer.append(Data([0x05]), at: now.addingTimeInterval(9)))
+        result = buffer.flush(at: now.addingTimeInterval(11))
+        #expect(result.writes == [Data([0x05])])
+        #expect(result.dropped == 1)
+    }
+
+    @Test
+    func switchServerErrorRetryPolicySlowsRecoverableRejections() {
+        #expect(SwitchServerErrorRetryPolicy.policy(for: "certificate_revoked") == .delayed(60))
+        #expect(SwitchServerErrorRetryPolicy.policy(for: "same_node_different_certificate") == .delayed(60))
+        #expect(SwitchServerErrorRetryPolicy.policy(for: "too_many_connections") == .delayed(60))
+        #expect(SwitchServerErrorRetryPolicy.policy(for: "dhcp_range_overlap") == .delayed(60))
+        #expect(SwitchServerErrorRetryPolicy.policy(for: nil) == .delayed(60))
+        #expect(SwitchServerErrorRetryPolicy.policy(for: "invalid_init") == .none)
+        #expect(SwitchServerErrorRetryPolicy.policy(for: "frame_too_large") == .none)
+    }
+
+    @Test
     func privateNetworkRouterSendsKnownRemoteFramesToWebSwitch() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let webSwitch = MockRoutableTransport()
@@ -1293,6 +1324,39 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRouterExpiresLocalMacs() throws {
+        let clock = TestClock(now: Date(timeIntervalSince1970: 200))
+        let router = PrivateNetworkTransportRouter(
+            identifier: "router-\(UUID().uuidString)",
+            macTtl: 1,
+            now: { clock.now }
+        )
+        let webSwitch = MockRoutableTransport()
+        router.setWebSwitch(webSwitch)
+
+        let firstLocalMAC: [UInt8] = [0x02, 0xfa, 0xfa, 0xfa, 0xfa, 0x01]
+        let secondLocalMAC: [UInt8] = [0x02, 0xfa, 0xfa, 0xfa, 0xfa, 0x02]
+        let thirdLocalMAC: [UInt8] = [0x02, 0xfa, 0xfa, 0xfa, 0xfa, 0x03]
+        let discovery = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: firstLocalMAC,
+            payload: [0x01]
+        )
+        router.routeLocalFrame(discovery)
+        #expect(webSwitch.sentFrames == [discovery])
+        webSwitch.sentFrames.removeAll()
+
+        let stillLocal = ethernetFrame(destination: firstLocalMAC, source: secondLocalMAC, payload: [0x02])
+        router.routeLocalFrame(stillLocal)
+        #expect(webSwitch.sentFrames.isEmpty)
+
+        clock.advance(by: 2)
+        let expiredLocal = ethernetFrame(destination: firstLocalMAC, source: thirdLocalMAC, payload: [0x03])
+        router.routeLocalFrame(expiredLocal)
+        #expect(webSwitch.sentFrames == [expiredLocal])
+    }
+
+    @Test
     func hostNetworkConfigLoadsAndValidatesSwitchConfig() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
@@ -1358,6 +1422,18 @@ struct OkrunVMTests {
 
         func sendFrameToRemote(_ frame: Data) {
             sentFrames.append(frame)
+        }
+    }
+
+    private final class TestClock {
+        var now: Date
+
+        init(now: Date) {
+            self.now = now
+        }
+
+        func advance(by interval: TimeInterval) {
+            now = now.addingTimeInterval(interval)
         }
     }
 

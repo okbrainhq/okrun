@@ -30,6 +30,11 @@ final class PrivateNetworkTransportRouter {
         case inject([PrivateNetworkRuntime])
     }
 
+    private struct RemoteRouteEntry {
+        var route: PrivateNetworkTransportRoute
+        var updatedAt: Date
+    }
+
     private struct LocalFrameSendPlan {
         var transport: PrivateNetworkRoutableTransport?
         var route: PrivateNetworkTransportRoute?
@@ -47,18 +52,27 @@ final class PrivateNetworkTransportRouter {
     }
 
     private static let queueKey = DispatchSpecificKey<UUID>()
+    private static let defaultMacTtl: TimeInterval = 5 * 60
 
     private let identifier: String
     private let queueID = UUID()
     private let queue: DispatchQueue
+    private let macTtl: TimeInterval
+    private let now: () -> Date
     private var runtimes: [WeakRuntime] = []
     private var localSwitch: PrivateNetworkRoutableTransport?
     private var webSwitch: PrivateNetworkRoutableTransport?
-    private var localMACs = Set<EthernetAddress>()
-    private var remoteRoutes: [EthernetAddress: PrivateNetworkTransportRoute] = [:]
+    private var localMACs: [EthernetAddress: Date] = [:]
+    private var remoteRoutes: [EthernetAddress: RemoteRouteEntry] = [:]
 
-    init(identifier: String) {
+    init(
+        identifier: String,
+        macTtl: TimeInterval = defaultMacTtl,
+        now: @escaping () -> Date = Date.init
+    ) {
         self.identifier = identifier
+        self.macTtl = macTtl
+        self.now = now
         queue = DispatchQueue(label: "okrun.private-network-router.\(identifier).\(UUID().uuidString)")
         queue.setSpecific(key: Self.queueKey, value: queueID)
     }
@@ -137,12 +151,14 @@ final class PrivateNetworkTransportRouter {
     }
 
     private func localFrameSendPlanOnQueue(_ frame: Data) -> LocalFrameSendPlan {
+        let currentDate = now()
+        expireMacsOnQueue(now: currentDate)
         guard let header = EthernetFrameHeader.parse(frame) else {
             return remoteSendPlanOnQueue(logsNoReachableTransport: true)
         }
 
-        localMACs.insert(header.source)
-        if header.destination.isUnicast, localMACs.contains(header.destination) {
+        localMACs[header.source] = currentDate
+        if header.destination.isUnicast, localMACs[header.destination] != nil {
             return .none
         }
 
@@ -158,15 +174,17 @@ final class PrivateNetworkTransportRouter {
     }
 
     private func remoteFrameActionOnQueue(_ frame: Data, via route: PrivateNetworkTransportRoute) -> RemoteFrameAction {
+        let currentDate = now()
+        expireMacsOnQueue(now: currentDate)
         guard let header = EthernetFrameHeader.parse(frame) else {
             return .inject(localGuestRuntimesOnQueue())
         }
 
-        if localMACs.contains(header.source) {
+        if localMACs[header.source] != nil {
             return .drop
         }
 
-        remoteRoutes[header.source] = route
+        remoteRoutes[header.source] = RemoteRouteEntry(route: route, updatedAt: currentDate)
         return .inject(localGuestRuntimesOnQueue())
     }
 
@@ -196,7 +214,12 @@ final class PrivateNetworkTransportRouter {
     }
 
     private func removeRemoteRoutesOnQueue(_ route: PrivateNetworkTransportRoute) {
-        remoteRoutes = remoteRoutes.filter { $0.value != route }
+        remoteRoutes = remoteRoutes.filter { $0.value.route != route }
+    }
+
+    private func expireMacsOnQueue(now currentDate: Date) {
+        localMACs = localMACs.filter { currentDate.timeIntervalSince($0.value) <= macTtl }
+        remoteRoutes = remoteRoutes.filter { currentDate.timeIntervalSince($0.value.updatedAt) <= macTtl }
     }
 
     private func firstReachableTransport(

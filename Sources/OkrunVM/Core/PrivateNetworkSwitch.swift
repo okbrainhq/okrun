@@ -427,6 +427,54 @@ struct PrivateNetworkSwitchStatus: Equatable {
     }
 }
 
+final class PendingSwitchWriteBuffer {
+    static let defaultLimit = 512
+    static let defaultMaxAge: TimeInterval = 15
+
+    private struct Entry {
+        var data: Data
+        var queuedAt: Date
+    }
+
+    private let limit: Int
+    private let maxAge: TimeInterval
+    private var entries: [Entry] = []
+
+    init(limit: Int = defaultLimit, maxAge: TimeInterval = defaultMaxAge) {
+        precondition(limit > 0, "Pending write buffer limit must be positive.")
+        precondition(maxAge >= 0, "Pending write max age must not be negative.")
+        self.limit = limit
+        self.maxAge = maxAge
+    }
+
+    var count: Int {
+        entries.count
+    }
+
+    @discardableResult
+    func append(_ data: Data, at now: Date = Date()) -> Bool {
+        pruneExpired(at: now)
+        guard entries.count < limit else { return false }
+        entries.append(Entry(data: data, queuedAt: now))
+        return true
+    }
+
+    func flush(at now: Date = Date()) -> (writes: [Data], dropped: Int) {
+        let freshEntries = entries.filter { now.timeIntervalSince($0.queuedAt) <= maxAge }
+        let dropped = entries.count - freshEntries.count
+        entries.removeAll()
+        return (freshEntries.map(\.data), dropped)
+    }
+
+    func removeAll() {
+        entries.removeAll()
+    }
+
+    private func pruneExpired(at now: Date) {
+        entries.removeAll { now.timeIntervalSince($0.queuedAt) > maxAge }
+    }
+}
+
 private struct SwitchInitPayload: Codable {
     var `protocol`: String
     var nodeID: String
@@ -450,6 +498,48 @@ private struct SwitchInitAckPayload: Codable {
 private struct SwitchErrorPayload: Codable {
     var code: String?
     var message: String?
+}
+
+enum SwitchServerErrorRetryPolicy: Equatable {
+    case none
+    case delayed(TimeInterval)
+
+    static let rejectedReconnectDelay: TimeInterval = 60
+
+    static func policy(for code: String?) -> SwitchServerErrorRetryPolicy {
+        guard let code else {
+            return .delayed(rejectedReconnectDelay)
+        }
+
+        switch code {
+        case "certificate_revoked",
+             "same_node_different_certificate",
+             "too_many_connections",
+             "dhcp_range_overlap":
+            return .delayed(rejectedReconnectDelay)
+        case "invalid_init",
+             "unsupported_protocol",
+             "invalid_node_id",
+             "invalid_network_identifier",
+             "invalid_interface",
+             "invalid_max_frame_size",
+             "invalid_dhcp_range",
+             "invalid_ipv4",
+             "data_before_init",
+             "duplicate_init",
+             "bad_stream",
+             "bad_frame_type",
+             "empty_frame",
+             "frame_too_large",
+             "reset_before_init",
+             "invalid_reset_seq",
+             "unsupported_frame_type",
+             "protocol_error":
+            return .none
+        default:
+            return .delayed(rejectedReconnectDelay)
+        }
+    }
 }
 
 private struct SwitchResetSeqPayload: Codable {
@@ -615,6 +705,8 @@ private final class RealSwitchSocket {
     private static let webConnectionTimeout: TimeInterval = 25
     private static let localConnectionTimeout: TimeInterval = 3
     private static let initResponseTimeout: TimeInterval = 10
+    private static let defaultWebKeepaliveInterval: TimeInterval = 10
+    private static let defaultWebKeepaliveTimeout: TimeInterval = 25
     private static let defaultLocalKeepaliveInterval: TimeInterval = 0.5
     private static let defaultLocalKeepaliveTimeout: TimeInterval = 1.5
 
@@ -632,7 +724,7 @@ private final class RealSwitchSocket {
     private let queue = DispatchQueue(label: "okrun.switch.real.\(UUID().uuidString)")
     private var decoder: SwitchFrameDecoder
     private var connection: NWConnection?
-    private var pendingWrites: [Data] = []
+    private var pendingWrites = PendingSwitchWriteBuffer()
     private var initialized = false
     private var stopped = false
     private var maxFrameSize: Int
@@ -705,8 +797,9 @@ private final class RealSwitchSocket {
         guard !stopped else { return }
         initialized = false
         maxFrameSize = SwitchFrame.defaultMaxFrameSize
-        clientKeepaliveInterval = Self.defaultLocalKeepaliveInterval
-        clientKeepaliveTimeout = Self.defaultLocalKeepaliveTimeout
+        let keepaliveDefaults = defaultKeepaliveTiming
+        clientKeepaliveInterval = keepaliveDefaults.interval
+        clientKeepaliveTimeout = keepaliveDefaults.timeout
         decoder = SwitchFrameDecoder(maxPayloadLength: maxFrameSize)
         AppLog.webSwitch.info(
             "connect start network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) attempt=\(self.reconnectAttempts, privacy: .public)"
@@ -827,6 +920,7 @@ private final class RealSwitchSocket {
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
         cancelClientKeepalive()
+        pendingWrites.removeAll()
         initialized = false
         if let activeConnection = connection {
             connection = nil
@@ -847,6 +941,7 @@ private final class RealSwitchSocket {
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
         cancelClientKeepalive()
+        pendingWrites.removeAll()
         initialized = false
         if let activeConnection = connection {
             connection = nil
@@ -1050,7 +1145,7 @@ private final class RealSwitchSocket {
             )
             report(.rejected, message, connections: 0, error: code)
             if let connection {
-                closeConnection(connection, message: message, error: code, retry: true, reportFinalFailure: false)
+                closeRejectedConnection(connection, message: message, error: code)
             }
         case .ping:
             sendPong()
@@ -1105,8 +1200,8 @@ private final class RealSwitchSocket {
     private func sendEncodedOnQueue(_ data: Data) {
         guard initialized else {
             SwitchDebug.log("buffer encoded bytes=\(data.count) until INIT ACK")
-            if pendingWrites.count < 512 {
-                pendingWrites.append(data)
+            if !pendingWrites.append(data) {
+                SwitchDebug.log("drop pending encoded bytes=\(data.count) reason=buffer-full")
             }
             return
         }
@@ -1115,10 +1210,12 @@ private final class RealSwitchSocket {
     }
 
     private func flushPendingWrites() {
-        let writes = pendingWrites
-        pendingWrites.removeAll()
+        let result = pendingWrites.flush()
+        let writes = result.writes
         if !writes.isEmpty {
-            SwitchDebug.log("flush pending writes count=\(writes.count)")
+            SwitchDebug.log("flush pending writes count=\(writes.count) droppedExpired=\(result.dropped)")
+        } else if result.dropped > 0 {
+            SwitchDebug.log("drop pending writes count=\(result.dropped) reason=expired")
         }
         for write in writes {
             sendNow(write)
@@ -1200,14 +1297,14 @@ private final class RealSwitchSocket {
     }
 
     private func startClientKeepaliveIfNeeded(ack: SwitchInitAckPayload) {
-        guard case .none = config.security else { return }
+        let keepaliveDefaults = defaultKeepaliveTiming
         clientKeepaliveInterval = Self.seconds(
             fromMilliseconds: ack.keepaliveIntervalMs,
-            fallback: Self.defaultLocalKeepaliveInterval
+            fallback: keepaliveDefaults.interval
         )
         clientKeepaliveTimeout = Self.seconds(
             fromMilliseconds: ack.keepaliveTimeoutMs,
-            fallback: Self.defaultLocalKeepaliveTimeout
+            fallback: keepaliveDefaults.timeout
         )
         lastPongAt = Date()
         scheduleClientKeepalive()
@@ -1222,12 +1319,12 @@ private final class RealSwitchSocket {
             guard age <= self.clientKeepaliveTimeout else {
                 if let connection = self.connection {
                     AppLog.webSwitch.warning(
-                        "local keepalive timeout network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) timeoutMs=\(Int(self.clientKeepaliveTimeout * 1000), privacy: .public)"
+                        "switch keepalive timeout network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) timeoutMs=\(Int(self.clientKeepaliveTimeout * 1000), privacy: .public)"
                     )
                     self.closeConnection(
                         connection,
-                        message: "Local Switch keepalive timed out.",
-                        error: "Local Switch keepalive timed out.",
+                        message: "Switch keepalive timed out.",
+                        error: "Switch keepalive timed out.",
                         retry: true
                     )
                 }
@@ -1260,6 +1357,15 @@ private final class RealSwitchSocket {
             return Self.localConnectionTimeout
         case .tls:
             return Self.webConnectionTimeout
+        }
+    }
+
+    private var defaultKeepaliveTiming: (interval: TimeInterval, timeout: TimeInterval) {
+        switch config.security {
+        case .none:
+            return (Self.defaultLocalKeepaliveInterval, Self.defaultLocalKeepaliveTimeout)
+        case .tls:
+            return (Self.defaultWebKeepaliveInterval, Self.defaultWebKeepaliveTimeout)
         }
     }
 
@@ -1296,17 +1402,57 @@ private final class RealSwitchSocket {
         scheduleReconnect(message: message, error: error)
     }
 
-    private func scheduleReconnect(message: String, error: String?) {
+    private func closeRejectedConnection(
+        _ activeConnection: NWConnection,
+        message: String,
+        error: String?
+    ) {
+        guard activeConnection === connection else { return }
+        initialized = false
+        cancelConnectionTimeout()
+        cancelInitResponseTimeout()
+        cancelClientKeepalive()
+        connection = nil
+        activeConnection.cancel()
+
+        guard !stopped else { return }
+
+        switch SwitchServerErrorRetryPolicy.policy(for: error) {
+        case .none:
+            return
+        case .delayed(let delay):
+            scheduleReconnect(
+                message: message,
+                error: error,
+                delayOverride: delay,
+                reportState: .rejected
+            )
+        }
+    }
+
+    private func scheduleReconnect(
+        message: String,
+        error: String?,
+        delayOverride: TimeInterval? = nil,
+        reportState: PrivateNetworkSwitchConnectionState = .connecting
+    ) {
         guard reconnectWorkItem == nil, !stopped else { return }
         reconnectAttempts += 1
-        let delay = reconnectDelay
+        let delay = delayOverride ?? reconnectDelay
         let milliseconds = Int(delay * 1000)
         AppLog.webSwitch.warning(
             "schedule reconnect network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) attempt=\(self.reconnectAttempts, privacy: .public) delayMs=\(milliseconds, privacy: .public) reason=\(message, privacy: .public)"
         )
+        let reconnectMessage: String
+        switch reportState {
+        case .rejected:
+            reconnectMessage = "\(message) Retrying rejected connection in \(milliseconds)ms."
+        default:
+            reconnectMessage = "\(message) Reconnect attempt #\(reconnectAttempts) in \(milliseconds)ms."
+        }
         report(
-            .connecting,
-            "\(message) Reconnect attempt #\(reconnectAttempts) in \(milliseconds)ms.",
+            reportState,
+            reconnectMessage,
             connections: 0,
             error: error
         )
@@ -1318,7 +1464,9 @@ private final class RealSwitchSocket {
         }
         reconnectWorkItem = workItem
         queue.asyncAfter(deadline: .now() + delay, execute: workItem)
-        reconnectDelay = min(reconnectDelay * 2, Self.maxReconnectDelay)
+        if delayOverride == nil {
+            reconnectDelay = min(reconnectDelay * 2, Self.maxReconnectDelay)
+        }
     }
 
     private func cancelReconnect() {
@@ -1439,16 +1587,20 @@ final class PrivateNetworkSwitchTransport {
         case connectedOnly
     }
 
+    private static let queueKey = DispatchSpecificKey<UUID>()
+    private static let localMacTtl: TimeInterval = 5 * 60
+
     private let identifier: String
     private let config: PrivateNetworkSwitchConnectionConfig
     private let dhcpRange: PrivateNetworkDHCPLeaseRange?
     private let onRemoteFrame: ((Data) -> Void)?
     private let routeAvailability: RouteAvailability
     private let interfaceName: String
+    private let queueID = UUID()
     private let queue: DispatchQueue
     private let client: PrivateNetworkSwitchClient
     private var runtimes: [WeakRuntime] = []
-    private var localMACs = Set<EthernetAddress>()
+    private var localMACs: [EthernetAddress: Date] = [:]
     private var status: PrivateNetworkSwitchStatus
 
     convenience init(
@@ -1503,6 +1655,7 @@ final class PrivateNetworkSwitchTransport {
         self.routeAvailability = routeAvailability
         self.interfaceName = interfaceName
         queue = DispatchQueue(label: "okrun.private-network-switch.\(identifier).\(UUID().uuidString)")
+        queue.setSpecific(key: Self.queueKey, value: queueID)
         client = try PrivateNetworkSwitchClient(
             identifier: identifier,
             config: self.config,
@@ -1567,7 +1720,7 @@ final class PrivateNetworkSwitchTransport {
     }
 
     func statusSnapshot() -> PrivateNetworkSwitchStatus {
-        queue.sync {
+        runOnQueue {
             status
         }
     }
@@ -1587,11 +1740,12 @@ final class PrivateNetworkSwitchTransport {
     }
 
     func canSendFrames() -> Bool {
-        queue.sync {
+        runOnQueue {
             switch routeAvailability {
             case .allowConnecting:
                 return status.state == .connecting || status.state == .connected
             case .connectedOnly:
+                // A local switch is only a useful route once another local member is present.
                 return status.state == .connected && status.activeConnections > 1
             }
         }
@@ -1602,8 +1756,10 @@ final class PrivateNetworkSwitchTransport {
     }
 
     private func handleLocalFrame(_ frame: Data) {
+        let currentDate = Date()
+        expireLocalMACsOnQueue(now: currentDate)
         if let header = EthernetFrameHeader.parse(frame) {
-            localMACs.insert(header.source)
+            localMACs[header.source] = currentDate
             guard shouldForwardLocalFrameToRemote(destination: header.destination) else {
                 SwitchDebug.log("skip local destination=\(header.destination.description) bytes=\(frame.count)")
                 return
@@ -1633,6 +1789,17 @@ final class PrivateNetworkSwitchTransport {
 
     private func shouldForwardLocalFrameToRemote(destination: EthernetAddress) -> Bool {
         guard destination.isUnicast else { return true }
-        return !localMACs.contains(destination)
+        return localMACs[destination] == nil
+    }
+
+    private func expireLocalMACsOnQueue(now currentDate: Date) {
+        localMACs = localMACs.filter { currentDate.timeIntervalSince($0.value) <= Self.localMacTtl }
+    }
+
+    private func runOnQueue<T>(_ work: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: Self.queueKey) == queueID {
+            return work()
+        }
+        return queue.sync(execute: work)
     }
 }
