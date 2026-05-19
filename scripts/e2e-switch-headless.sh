@@ -111,6 +111,33 @@ wait_for_switch_hosts() {
   done
 }
 
+wait_for_switch_hosts_or_marker() {
+  local expected="$1"
+  local timeout="$2"
+  local marker_file="$3"
+  local marker="$4"
+  local deadline=$((SECONDS + timeout))
+  local count="0"
+
+  while true; do
+    if grep -Fq "$marker" "$marker_file" 2>/dev/null; then
+      return 0
+    fi
+
+    count="$(switch_host_count 2>/dev/null || echo 0)"
+    if [[ "$count" -ge "$expected" ]]; then
+      return 0
+    fi
+
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+      printf 'Timed out waiting for %s switch host(s) or %s; last count=%s.\n' "$expected" "$marker" "$count" >&2
+      sed -n '1,240p' "$WORK_DIR/web-switch.log" >&2 || true
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
 write_host_config() {
   local home="$1"
   local cert_dir="$2"
@@ -282,7 +309,7 @@ if ! wait_for_log_marker "$WORK_DIR/client-host.log" OKRUN_E2E_PRIVATE_NETWORK_D
 fi
 
 start_web_switch "Restart web-switch"
-if ! wait_for_switch_hosts 2 90; then
+if ! wait_for_switch_hosts_or_marker 2 90 "$WORK_DIR/client-host.log" OKRUN_E2E_PRIVATE_NETWORK_RECONNECT_PASSED; then
   dump_runtime_logs
   exit 1
 fi

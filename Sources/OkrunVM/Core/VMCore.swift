@@ -633,10 +633,12 @@ enum NetworkDeviceFactory {
         }
         let dhcpRange = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier)
             .map { try PrivateNetworkDHCPLeaseRange(config: $0) }
+        let localSwitchConfig = try hostNetworkConfigStore.localSwitchConfigForPrivateNetwork(identifier: identifier)
         let switchConfig = try hostNetworkConfigStore.switchConfigForPrivateNetwork(identifier: identifier)
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
         try PrivateNetworkRuntimeRegistry.shared.retain(
             runtime,
+            localSwitchConfig: localSwitchConfig,
             switchConfig: switchConfig,
             dhcpRange: dhcpRange
         )
@@ -669,13 +671,17 @@ final class PrivateNetworkRuntimeRegistry {
 
     private var runtimes: [PrivateNetworkRuntime] = []
     private var switches: [String: PrivateNetworkSwitchTransport] = [:]
+    private var localSwitches: [String: PrivateNetworkSwitchTransport] = [:]
     private var switchFailures: [String: PrivateNetworkSwitchStatus] = [:]
+    private var localSwitchFailures: [String: PrivateNetworkSwitchStatus] = [:]
     private var routers: [String: PrivateNetworkTransportRouter] = [:]
+    private var nodeIDs: [String: UUID] = [:]
 
     private init() {}
 
     func retain(
         _ runtime: PrivateNetworkRuntime,
+        localSwitchConfig: PrivateNetworkLocalSwitchConfig? = nil,
         switchConfig: PrivateNetworkSwitchConfig? = nil,
         dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
     ) throws {
@@ -685,6 +691,20 @@ final class PrivateNetworkRuntimeRegistry {
 
         var retainedTransport = false
         var retainedError: Error?
+        if let localSwitchConfig {
+            do {
+                _ = try retainLocalSwitch(identifier: runtime.identifier, localSwitchConfig: localSwitchConfig, dhcpRange: dhcpRange)
+                retainedTransport = true
+            } catch {
+                localSwitchFailures[runtime.identifier] = .failed(
+                    identifier: runtime.identifier,
+                    server: localSwitchConfig.server,
+                    error: error.localizedDescription
+                )
+                retainedError = error
+            }
+        }
+
         if let switchConfig {
             do {
                 _ = try retainSwitch(identifier: runtime.identifier, switchConfig: switchConfig, dhcpRange: dhcpRange)
@@ -701,6 +721,41 @@ final class PrivateNetworkRuntimeRegistry {
 
         if !retainedTransport, let retainedError {
             throw retainedError
+        }
+    }
+
+    func configureLocalSwitch(
+        identifier: String,
+        localSwitchConfig: PrivateNetworkLocalSwitchConfig?,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) -> PrivateNetworkSwitchStatus {
+        guard let localSwitchConfig else {
+            localSwitches[identifier] = nil
+            localSwitchFailures[identifier] = nil
+            routers[identifier]?.setLocalSwitch(nil)
+            return .disabled(identifier: identifier)
+        }
+        if let existingSwitch = localSwitches[identifier],
+           canReuseLocalSwitch(existingSwitch, config: localSwitchConfig, dhcpRange: dhcpRange) {
+            router(for: identifier).setLocalSwitch(existingSwitch)
+            return existingSwitch.statusSnapshot()
+        }
+        localSwitches[identifier] = nil
+        router(for: identifier).setLocalSwitch(nil)
+        do {
+            let switchTransport = try makeLocalSwitch(identifier: identifier, localSwitchConfig: localSwitchConfig, dhcpRange: dhcpRange)
+            localSwitches[identifier] = switchTransport
+            router(for: identifier).setLocalSwitch(switchTransport)
+            localSwitchFailures[identifier] = nil
+            return switchTransport.statusSnapshot()
+        } catch {
+            let status = PrivateNetworkSwitchStatus.failed(
+                identifier: identifier,
+                server: localSwitchConfig.server,
+                error: error.localizedDescription
+            )
+            localSwitchFailures[identifier] = status
+            return status
         }
     }
 
@@ -743,9 +798,19 @@ final class PrivateNetworkRuntimeRegistry {
         switches[identifier] != nil
     }
 
+    func hasLocalSwitch(identifier: String) -> Bool {
+        localSwitches[identifier] != nil
+    }
+
     func switchStatus(identifier: String) -> PrivateNetworkSwitchStatus {
         switches[identifier]?.statusSnapshot()
             ?? switchFailures[identifier]
+            ?? .disabled(identifier: identifier)
+    }
+
+    func localSwitchStatus(identifier: String) -> PrivateNetworkSwitchStatus {
+        localSwitches[identifier]?.statusSnapshot()
+            ?? localSwitchFailures[identifier]
             ?? .disabled(identifier: identifier)
     }
 
@@ -755,7 +820,11 @@ final class PrivateNetworkRuntimeRegistry {
         }
         runtimes.removeAll()
         switches.removeAll()
+        localSwitches.removeAll()
+        switchFailures.removeAll()
+        localSwitchFailures.removeAll()
         routers.removeAll()
+        nodeIDs.removeAll()
     }
 
     func release(_ ownedRuntimes: [PrivateNetworkRuntime]) {
@@ -769,9 +838,37 @@ final class PrivateNetworkRuntimeRegistry {
         for identifier in Array(switches.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
             switches[identifier] = nil
         }
+        for identifier in Array(localSwitches.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
+            localSwitches[identifier] = nil
+        }
         for identifier in Array(routers.keys) where routers[identifier]?.hasRuntimes() != true {
             routers[identifier] = nil
         }
+        for identifier in Array(nodeIDs.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
+            nodeIDs[identifier] = nil
+        }
+    }
+
+    @discardableResult
+    private func retainLocalSwitch(
+        identifier: String,
+        localSwitchConfig: PrivateNetworkLocalSwitchConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) throws -> PrivateNetworkSwitchTransport {
+        let transportRouter = router(for: identifier)
+        if let existingSwitch = localSwitches[identifier],
+           canReuseLocalSwitch(existingSwitch, config: localSwitchConfig, dhcpRange: dhcpRange) {
+            transportRouter.setLocalSwitch(existingSwitch)
+            return existingSwitch
+        }
+
+        localSwitches[identifier] = nil
+        transportRouter.setLocalSwitch(nil)
+        let switchTransport = try makeLocalSwitch(identifier: identifier, localSwitchConfig: localSwitchConfig, dhcpRange: dhcpRange)
+        localSwitches[identifier] = switchTransport
+        localSwitchFailures[identifier] = nil
+        transportRouter.setLocalSwitch(switchTransport)
+        return switchTransport
     }
 
     @discardableResult
@@ -808,6 +905,35 @@ final class PrivateNetworkRuntimeRegistry {
         return state == .connecting || state == .connected
     }
 
+    private func canReuseLocalSwitch(
+        _ existingSwitch: PrivateNetworkSwitchTransport,
+        config localSwitchConfig: PrivateNetworkLocalSwitchConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) -> Bool {
+        guard existingSwitch.matches(localConfig: localSwitchConfig, dhcpRange: dhcpRange) else {
+            return false
+        }
+        let state = existingSwitch.statusSnapshot().state
+        return state == .connecting || state == .connected
+    }
+
+    private func makeLocalSwitch(
+        identifier: String,
+        localSwitchConfig: PrivateNetworkLocalSwitchConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?
+    ) throws -> PrivateNetworkSwitchTransport {
+        let transportRouter = router(for: identifier)
+        return try PrivateNetworkSwitchTransport(
+            identifier: identifier,
+            localConfig: localSwitchConfig,
+            dhcpRange: dhcpRange,
+            nodeID: nodeID(for: identifier),
+            onRemoteFrame: { [weak transportRouter] frame in
+                transportRouter?.receiveRemoteFrame(frame, via: .localSwitch)
+            }
+        )
+    }
+
     private func makeSwitch(
         identifier: String,
         switchConfig: PrivateNetworkSwitchConfig,
@@ -818,10 +944,20 @@ final class PrivateNetworkRuntimeRegistry {
             identifier: identifier,
             config: switchConfig,
             dhcpRange: dhcpRange,
+            nodeID: nodeID(for: identifier),
             onRemoteFrame: { [weak transportRouter] frame in
                 transportRouter?.receiveRemoteFrame(frame, via: .webSwitch)
             }
         )
+    }
+
+    private func nodeID(for identifier: String) -> UUID {
+        if let nodeID = nodeIDs[identifier] {
+            return nodeID
+        }
+        let nodeID = UUID()
+        nodeIDs[identifier] = nodeID
+        return nodeID
     }
 
     private func router(for identifier: String) -> PrivateNetworkTransportRouter {
@@ -829,6 +965,9 @@ final class PrivateNetworkRuntimeRegistry {
             return router
         }
         let router = PrivateNetworkTransportRouter(identifier: identifier)
+        if let localSwitchTransport = localSwitches[identifier] {
+            router.setLocalSwitch(localSwitchTransport)
+        }
         if let switchTransport = switches[identifier] {
             router.setWebSwitch(switchTransport)
         }

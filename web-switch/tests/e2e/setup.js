@@ -107,6 +107,7 @@ async function getUnusedPort() {
 
 async function startServer(certs, options = {}) {
   const tlsPort = await getUnusedPort();
+  const localPort = options.localPort === false ? null : await getUnusedPort();
   const statusPort = await getUnusedPort();
   const logs = [];
   const args = [
@@ -115,6 +116,10 @@ async function startServer(certs, options = {}) {
     '127.0.0.1',
     '--tls-port',
     String(tlsPort),
+    ...(localPort == null ? [] : [
+      '--local-port',
+      String(localPort)
+    ]),
     '--status-port',
     String(statusPort),
     '--server-bundle',
@@ -147,6 +152,7 @@ async function startServer(certs, options = {}) {
 
   return {
     tlsPort,
+    localPort,
     statusPort,
     logs,
     process: child,

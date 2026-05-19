@@ -42,11 +42,22 @@ class SwitchFabric {
     }
 
     let session = network.hosts.get(init.nodeID);
-    if (session && session.clientSerial !== identity.clientSerial) {
+    if (
+      session
+      && session.clientSerial !== identity.clientSerial
+      && session.identityKind !== 'local'
+      && identity.kind !== 'local'
+    ) {
       throw new AdmissionError(
         'same_node_different_certificate',
         'A host with this nodeID is already attached using a different certificate'
       );
+    }
+
+    if (session && session.identityKind === 'local' && identity.kind !== 'local') {
+      session.clientSerial = identity.clientSerial;
+      session.clientFingerprint = identity.clientFingerprint;
+      session.identityKind = identity.kind ?? 'tls';
     }
 
     if (!session) {
@@ -56,6 +67,7 @@ class SwitchFabric {
         nodeID: init.nodeID,
         clientSerial: identity.clientSerial,
         clientFingerprint: identity.clientFingerprint,
+        identityKind: identity.kind ?? 'tls',
         dhcpRange: init.dhcpRange,
         maxConnectionsPerHost: this.maxConnectionsPerHost
       });
@@ -88,6 +100,17 @@ class SwitchFabric {
     };
   }
 
+  broadcastMemberUpdate(networkKey) {
+    const network = this.networks.get(networkKey);
+    if (!network) {
+      return;
+    }
+
+    for (const host of network.hosts.values()) {
+      host.sendMemberUpdate(network.hosts.size);
+    }
+  }
+
   removeConnection(connection) {
     const session = connection.session;
     if (!session || !connection.networkKey) {
@@ -109,7 +132,10 @@ class SwitchFabric {
 
     if (network.hosts.size === 0) {
       this.networks.delete(connection.networkKey);
+      return;
     }
+
+    this.broadcastMemberUpdate(connection.networkKey);
   }
 
   handleData(connection, frame) {

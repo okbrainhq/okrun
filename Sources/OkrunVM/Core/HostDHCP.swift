@@ -11,13 +11,16 @@ struct HostNetworkConfig: Codable, Equatable {
 struct HostPrivateNetworkConfig: Codable, Equatable {
     var dhcp: PrivateNetworkDHCPConfig?
     var `switch`: PrivateNetworkSwitchConfig?
+    var localSwitch: PrivateNetworkLocalSwitchConfig?
 
     init(
         dhcp: PrivateNetworkDHCPConfig?,
-        switch switchConfig: PrivateNetworkSwitchConfig? = nil
+        switch switchConfig: PrivateNetworkSwitchConfig? = nil,
+        localSwitch: PrivateNetworkLocalSwitchConfig? = nil
     ) {
         self.dhcp = dhcp
         self.switch = switchConfig
+        self.localSwitch = localSwitch
     }
 }
 
@@ -112,6 +115,7 @@ final class HostNetworkConfigStore {
         for (_, privateNetwork) in config.privateNetworks {
             _ = try privateNetwork.dhcp?.validated()
             _ = try privateNetwork.switch?.validated()
+            _ = try privateNetwork.localSwitch?.validated()
         }
         return config
     }
@@ -139,10 +143,19 @@ final class HostNetworkConfigStore {
         return validated.enabled ? validated : nil
     }
 
+    func localSwitchConfigForPrivateNetwork(identifier: String) throws -> PrivateNetworkLocalSwitchConfig? {
+        guard let localSwitchConfig = try load().privateNetworks[identifier]?.localSwitch else {
+            return nil
+        }
+        let validated = try localSwitchConfig.validated()
+        return validated.enabled ? validated : nil
+    }
+
     func save(_ config: HostNetworkConfig) throws {
         for (_, privateNetwork) in config.privateNetworks {
             _ = try privateNetwork.dhcp?.validated()
             _ = try privateNetwork.switch?.validated()
+            _ = try privateNetwork.localSwitch?.validated()
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

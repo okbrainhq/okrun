@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "commonjs",
-  "description": "Plain Node.js mTLS layer-2 switch for OkRun private networks",
+  "description": "Plain Node.js layer-2 switch for OkRun private networks",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node src/index.js --tls-port 9443 --status-port 8080 --server-bundle .certs/server/okrun-switch-server-bundle.json --crl .ca/crl.txt",

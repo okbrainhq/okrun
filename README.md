@@ -201,6 +201,28 @@ Okrun stores DHCP leases under `~/.okrun/state/private-networks/okrun/`.
 `OKRUN_REGISTRY_PATH` still overrides only the project registry path.
 Set `"enabled": false` for the DHCP config to opt out.
 
+To prefer a no-TLS switch on a trusted LAN and fall back to Web Switch when that
+local listener is unavailable, add a `localSwitch` entry beside the existing
+Web Switch `switch` entry:
+
+```json
+{
+  "version": 1,
+  "privateNetworks": {
+    "okrun": {
+      "localSwitch": {
+        "enabled": true,
+        "server": "192.168.1.20:9444"
+      }
+    }
+  }
+}
+```
+
+When both are configured, Okrun routes private-network frames through Local
+Switch while it is connected and automatically falls back to Web Switch until
+the Local Switch connection returns.
+
 If a guest already has an Okrun-managed static private-network file, the default
 installer run leaves it unchanged. Pass `--private-dhcp` to replace that
 Okrun-managed static file with DHCP:

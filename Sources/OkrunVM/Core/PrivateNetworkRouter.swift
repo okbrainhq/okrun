@@ -1,7 +1,17 @@
 import Foundation
 
 enum PrivateNetworkTransportRoute: Equatable {
+    case localSwitch
     case webSwitch
+
+    var logName: String {
+        switch self {
+        case .localSwitch:
+            return "local-switch"
+        case .webSwitch:
+            return "web-switch"
+        }
+    }
 }
 
 protocol PrivateNetworkRoutableTransport: AnyObject {
@@ -22,10 +32,16 @@ final class PrivateNetworkTransportRouter {
 
     private struct LocalFrameSendPlan {
         var transport: PrivateNetworkRoutableTransport?
+        var route: PrivateNetworkTransportRoute?
+        var fallbackTransport: PrivateNetworkRoutableTransport?
+        var fallbackRoute: PrivateNetworkTransportRoute?
         var logsNoReachableTransport: Bool
 
         static let none = LocalFrameSendPlan(
             transport: nil,
+            route: nil,
+            fallbackTransport: nil,
+            fallbackRoute: nil,
             logsNoReachableTransport: false
         )
     }
@@ -36,6 +52,7 @@ final class PrivateNetworkTransportRouter {
     private let queueID = UUID()
     private let queue: DispatchQueue
     private var runtimes: [WeakRuntime] = []
+    private var localSwitch: PrivateNetworkRoutableTransport?
     private var webSwitch: PrivateNetworkRoutableTransport?
     private var localMACs = Set<EthernetAddress>()
     private var remoteRoutes: [EthernetAddress: PrivateNetworkTransportRoute] = [:]
@@ -50,7 +67,16 @@ final class PrivateNetworkTransportRouter {
         runOnQueue {
             self.webSwitch = webSwitch
             if webSwitch == nil {
-                self.remoteRoutes.removeAll()
+                self.removeRemoteRoutesOnQueue(.webSwitch)
+            }
+        }
+    }
+
+    func setLocalSwitch(_ localSwitch: PrivateNetworkRoutableTransport?) {
+        runOnQueue {
+            self.localSwitch = localSwitch
+            if localSwitch == nil {
+                self.removeRemoteRoutesOnQueue(.localSwitch)
             }
         }
     }
@@ -112,7 +138,7 @@ final class PrivateNetworkTransportRouter {
 
     private func localFrameSendPlanOnQueue(_ frame: Data) -> LocalFrameSendPlan {
         guard let header = EthernetFrameHeader.parse(frame) else {
-            return webSwitchSendPlanOnQueue(logsNoReachableTransport: true)
+            return remoteSendPlanOnQueue(logsNoReachableTransport: true)
         }
 
         localMACs.insert(header.source)
@@ -121,14 +147,14 @@ final class PrivateNetworkTransportRouter {
         }
 
         guard header.destination.isUnicast else {
-            return webSwitchSendPlanOnQueue(logsNoReachableTransport: true)
+            return remoteSendPlanOnQueue(logsNoReachableTransport: true)
         }
 
         guard remoteRoutes[header.destination] != nil else {
-            return webSwitchSendPlanOnQueue(logsNoReachableTransport: true)
+            return remoteSendPlanOnQueue(logsNoReachableTransport: true)
         }
 
-        return webSwitchSendPlanOnQueue(logsNoReachableTransport: false)
+        return remoteSendPlanOnQueue(logsNoReachableTransport: false)
     }
 
     private func remoteFrameActionOnQueue(_ frame: Data, via route: PrivateNetworkTransportRoute) -> RemoteFrameAction {
@@ -144,32 +170,51 @@ final class PrivateNetworkTransportRouter {
         return .inject(localGuestRuntimesOnQueue())
     }
 
-    private func webSwitchSendPlanOnQueue(logsNoReachableTransport: Bool) -> LocalFrameSendPlan {
+    private func remoteSendPlanOnQueue(logsNoReachableTransport: Bool) -> LocalFrameSendPlan {
         LocalFrameSendPlan(
-            transport: webSwitch,
+            transport: localSwitch,
+            route: .localSwitch,
+            fallbackTransport: webSwitch,
+            fallbackRoute: .webSwitch,
             logsNoReachableTransport: logsNoReachableTransport
         )
     }
 
     private func sendFrame(_ frame: Data, using plan: LocalFrameSendPlan) {
-        guard let transport = plan.transport else {
+        guard let transport = firstReachableTransport(in: plan) else {
             if plan.logsNoReachableTransport {
                 logNoReachableTransport()
             }
             return
         }
 
-        guard transport.canSendPrivateNetworkFrames else {
-            if plan.logsNoReachableTransport {
-                logNoReachableTransport()
-            }
-            return
-        }
-
+        let routeName = transport.route.logName
         AppLog.virtualMachine.debug(
-            "Private network router sending frame privateNetwork=\(self.identifier, privacy: .public) route=web-switch bytes=\(frame.count, privacy: .public)"
+            "Private network router sending frame privateNetwork=\(self.identifier, privacy: .public) route=\(routeName, privacy: .public) bytes=\(frame.count, privacy: .public)"
         )
-        transport.sendFrameToRemote(frame)
+        transport.transport.sendFrameToRemote(frame)
+    }
+
+    private func removeRemoteRoutesOnQueue(_ route: PrivateNetworkTransportRoute) {
+        remoteRoutes = remoteRoutes.filter { $0.value != route }
+    }
+
+    private func firstReachableTransport(
+        in plan: LocalFrameSendPlan
+    ) -> (transport: PrivateNetworkRoutableTransport, route: PrivateNetworkTransportRoute)? {
+        if let transport = plan.transport,
+           let route = plan.route,
+           transport.canSendPrivateNetworkFrames {
+            return (transport, route)
+        }
+
+        if let transport = plan.fallbackTransport,
+           let route = plan.fallbackRoute,
+           transport.canSendPrivateNetworkFrames {
+            return (transport, route)
+        }
+
+        return nil
     }
 
     private func logNoReachableTransport() {

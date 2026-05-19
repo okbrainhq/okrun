@@ -16,6 +16,7 @@ class HostSession {
     this.nodeID = options.nodeID;
     this.clientSerial = options.clientSerial;
     this.clientFingerprint = options.clientFingerprint;
+    this.identityKind = options.identityKind ?? 'tls';
     this.dhcpRange = options.dhcpRange ?? null;
     this.maxConnectionsPerHost = options.maxConnectionsPerHost;
     this.connections = new Map();
@@ -114,6 +115,13 @@ class HostSession {
 
   sendResetSeq(streams) {
     const encoded = encodeJsonFrame(FrameType.RESET_SEQ, { streams });
+    for (const connection of this.connections.values()) {
+      connection.writeEncodedFrame(encoded);
+    }
+  }
+
+  sendMemberUpdate(networkMemberCount) {
+    const encoded = encodeJsonFrame(FrameType.MEMBER_UPDATE, { networkMemberCount });
     for (const connection of this.connections.values()) {
       connection.writeEncodedFrame(encoded);
     }

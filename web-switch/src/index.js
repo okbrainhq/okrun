@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
-const { SwitchTLSServer } = require('./tls-server');
+const { SwitchLocalServer, SwitchTLSServer } = require('./tls-server');
 const { SwitchFabric } = require('./switch-fabric');
 const { DEFAULT_MAX_FRAME_SIZE } = require('./protocol');
 
@@ -40,15 +40,59 @@ function numberOption(value, fallback, name) {
   return parsed;
 }
 
+function optionalNumberOption(value, name) {
+  if (value == null || value === '') {
+    return null;
+  }
+
+  return numberOption(value, null, name);
+}
+
+function booleanOption(value, fallback, name) {
+  if (value == null || value === '') {
+    return fallback;
+  }
+
+  if (value === true || value === 'true' || value === '1' || value === 'yes') {
+    return true;
+  }
+
+  if (value === false || value === 'false' || value === '0' || value === 'no') {
+    return false;
+  }
+
+  throw new Error(`${name} must be true or false`);
+}
+
 function buildConfig(argv = process.argv.slice(2), env = process.env) {
   const args = parseArgs(argv);
   const root = path.resolve(__dirname, '..');
-  const serverBundlePath = args['server-bundle'] ?? env.OKRUN_SWITCH_SERVER_BUNDLE;
+  const tlsEnabled = booleanOption(
+    args['tls-enabled'] ?? env.OKRUN_SWITCH_TLS_ENABLED,
+    true,
+    'tls-enabled'
+  );
+  const localPort = optionalNumberOption(
+    args['local-port'] ?? env.OKRUN_SWITCH_LOCAL_PORT,
+    'local-port'
+  );
+  if (!tlsEnabled && localPort == null) {
+    throw new Error('At least one switch listener must be enabled');
+  }
+
+  const serverBundlePath = tlsEnabled
+    ? args['server-bundle'] ?? env.OKRUN_SWITCH_SERVER_BUNDLE
+    : null;
   const serverBundle = serverBundlePath ? readServerBundle(serverBundlePath) : {};
+  const tlsPort = tlsEnabled
+    ? numberOption(args['tls-port'] ?? env.OKRUN_SWITCH_TLS_PORT, 9443, 'tls-port')
+    : null;
 
   return {
     host: args.host ?? env.OKRUN_SWITCH_HOST ?? '0.0.0.0',
-    tlsPort: numberOption(args['tls-port'] ?? env.OKRUN_SWITCH_TLS_PORT, 9443, 'tls-port'),
+    tlsEnabled,
+    tlsPort,
+    localPort,
     statusPort: numberOption(
       args['status-port'] ?? env.OKRUN_SWITCH_STATUS_PORT,
       8080,
@@ -58,10 +102,10 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
     serverKeyPem: serverBundle.serverKeyPem,
     serverCertPem: serverBundle.serverCertPem,
     caCertPem: serverBundle.caCertPem,
-    serverKeyPath: serverBundlePath ? null : args['server-key'] ?? env.OKRUN_SWITCH_SERVER_KEY ?? path.join(root, '.certs/server/server-key.pem'),
-    serverCertPath: serverBundlePath ? null : args['server-cert'] ?? env.OKRUN_SWITCH_SERVER_CERT ?? path.join(root, '.certs/server/server-cert.pem'),
-    caCertPath: serverBundlePath ? null : args['ca-cert'] ?? env.OKRUN_SWITCH_CA_CERT ?? path.join(root, '.ca/ca-cert.pem'),
-    crlPath: args.crl ?? env.OKRUN_SWITCH_CRL ?? path.join(root, '.ca/crl.txt'),
+    serverKeyPath: !tlsEnabled || serverBundlePath ? null : args['server-key'] ?? env.OKRUN_SWITCH_SERVER_KEY ?? path.join(root, '.certs/server/server-key.pem'),
+    serverCertPath: !tlsEnabled || serverBundlePath ? null : args['server-cert'] ?? env.OKRUN_SWITCH_SERVER_CERT ?? path.join(root, '.certs/server/server-cert.pem'),
+    caCertPath: !tlsEnabled || serverBundlePath ? null : args['ca-cert'] ?? env.OKRUN_SWITCH_CA_CERT ?? path.join(root, '.ca/ca-cert.pem'),
+    crlPath: tlsEnabled ? args.crl ?? env.OKRUN_SWITCH_CRL ?? path.join(root, '.ca/crl.txt') : null,
     keepaliveIntervalMs: numberOption(
       args['keepalive-interval-ms'] ?? env.OKRUN_SWITCH_KEEPALIVE_INTERVAL_MS,
       10000,
@@ -133,25 +177,47 @@ function start(config) {
     macTtlMs: config.macTtlMs
   });
 
-  const tlsServer = new SwitchTLSServer({
-    ...config,
-    fabric
-  });
+  const tlsServer = config.tlsEnabled !== false
+    ? new SwitchTLSServer({
+      ...config,
+      fabric
+    })
+    : null;
+
+  const localServer = config.localPort == null
+    ? null
+    : new SwitchLocalServer({
+      ...config,
+      fabric
+    });
 
   const statusServer = createStatusServer(fabric);
 
-  tlsServer.listen(() => {
-    const address = tlsServer.address();
-    console.log(JSON.stringify({
-      event: 'tls_listening',
-      host: address.address,
-      port: address.port,
-      serverBundle: config.serverBundlePath,
-      serverCert: config.serverCertPath,
-      caCert: config.caCertPath,
-      crl: config.crlPath
-    }));
-  });
+  if (tlsServer) {
+    tlsServer.listen(() => {
+      const address = tlsServer.address();
+      console.log(JSON.stringify({
+        event: 'tls_listening',
+        host: address.address,
+        port: address.port,
+        serverBundle: config.serverBundlePath,
+        serverCert: config.serverCertPath,
+        caCert: config.caCertPath,
+        crl: config.crlPath
+      }));
+    });
+  }
+
+  if (localServer) {
+    localServer.listen(() => {
+      const address = localServer.address();
+      console.log(JSON.stringify({
+        event: 'local_listening',
+        host: address.address,
+        port: address.port
+      }));
+    });
+  }
 
   statusServer.listen(config.statusPort, config.host, () => {
     const address = statusServer.address();
@@ -165,17 +231,26 @@ function start(config) {
   return {
     fabric,
     tlsServer,
+    localServer,
     statusServer,
     close(callback) {
-      let pending = 2;
+      const servers = [tlsServer, localServer, statusServer].filter(Boolean);
+      let pending = servers.length;
+      if (pending === 0) {
+        if (callback) {
+          callback();
+        }
+        return;
+      }
       const done = () => {
         pending -= 1;
         if (pending === 0 && callback) {
           callback();
         }
       };
-      tlsServer.close(done);
-      statusServer.close(done);
+      for (const server of servers) {
+        server.close(done);
+      }
     }
   };
 }

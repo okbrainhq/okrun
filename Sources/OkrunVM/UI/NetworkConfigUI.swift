@@ -22,6 +22,7 @@ private final class NetworkConfigPanelActions: NSObject {
     var onRefresh: (() -> Void)?
     var onClose: (() -> Void)?
     var onSwitchToggle: (() -> Void)?
+    var onLocalSwitchToggle: (() -> Void)?
 
     @objc func apply() {
         onApply?()
@@ -37,6 +38,10 @@ private final class NetworkConfigPanelActions: NSObject {
 
     @objc func switchToggle() {
         onSwitchToggle?()
+    }
+
+    @objc func localSwitchToggle() {
+        onLocalSwitchToggle?()
     }
 }
 
@@ -86,6 +91,15 @@ extension AppDelegate {
         let rangeStartField = makeNetworkField(identifier: "okrun.network.dhcp.range-start")
         let rangeEndField = makeNetworkField(identifier: "okrun.network.dhcp.range-end")
         let leaseField = makeNetworkField(identifier: "okrun.network.dhcp.lease-seconds")
+
+        let localSwitchEnabled = makeNetworkCheckbox("Local Switch", identifier: "okrun.network.local-switch.enabled")
+        let localSwitchServerField = makeNetworkField(identifier: "okrun.network.local-switch.server")
+        setNetworkPlaceholder("127.0.0.1:9444", on: localSwitchServerField)
+        let localSwitchStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.local-switch")
+        let localSwitchServerStatusLabel = makeNetworkStatusLabel(identifier: "okrun.network.status.local-switch-server")
+        let localSwitchMessageLabel = makeNetworkStatusLabel(identifier: "okrun.network.local-switch.status.message")
+        localSwitchMessageLabel.lineBreakMode = .byWordWrapping
+        localSwitchMessageLabel.maximumNumberOfLines = 3
 
         let switchEnabled = makeNetworkCheckbox("Web Switch", identifier: "okrun.network.switch.enabled")
         let switchMultipath = makeNetworkCheckbox("Multipath", identifier: "okrun.network.switch.multipath")
@@ -137,6 +151,22 @@ extension AppDelegate {
             makeNetworkSettingsSection(title: "Lease Range", contentView: dhcpLeaseGrid)
         ])
 
+        let localSwitchConnectionGrid = NSGridView(views: [
+            [makeNetworkLabel("Enabled"), localSwitchEnabled],
+            [makeNetworkLabel("Server"), localSwitchServerField]
+        ])
+        configureNetworkGrid(localSwitchConnectionGrid)
+        let localSwitchStatusGrid = NSGridView(views: [
+            [makeNetworkLabel("Status"), localSwitchStatusLabel],
+            [makeNetworkLabel("Server"), localSwitchServerStatusLabel],
+            [makeNetworkLabel("Message"), localSwitchMessageLabel]
+        ])
+        configureNetworkGrid(localSwitchStatusGrid)
+        let localSwitchStack = makeNetworkSettingsStack([
+            makeNetworkSettingsSection(title: "Local Switch", contentView: localSwitchConnectionGrid),
+            makeNetworkSettingsSection(title: "Status", contentView: localSwitchStatusGrid)
+        ])
+
         let switchConnectionGrid = NSGridView(views: [
             [makeNetworkLabel("Enabled"), switchEnabled],
             [makeNetworkLabel("Multipath"), switchMultipath],
@@ -164,6 +194,7 @@ extension AppDelegate {
         tabView.setAccessibilityIdentifier("okrun.network.tabs")
         tabView.tabViewType = .topTabsBezelBorder
         tabView.addTabViewItem(makeNetworkTabItem(label: "DHCP", contentView: dhcpStack))
+        tabView.addTabViewItem(makeNetworkTabItem(label: "Local Switch", contentView: localSwitchStack))
         tabView.addTabViewItem(makeNetworkTabItem(label: "Web Switch", contentView: switchStack))
         tabView.selectTabViewItem(at: 0)
 
@@ -220,9 +251,12 @@ extension AppDelegate {
 
         func updateTransportControls() {
             let switchOn = switchEnabled.state == .on
+            let localSwitchOn = localSwitchEnabled.state == .on
 
             switchEnabled.isEnabled = true
+            localSwitchEnabled.isEnabled = true
 
+            localSwitchServerField.isEnabled = localSwitchOn
             switchMultipath.isEnabled = switchOn
             switchServerField.isEnabled = switchOn
             bundleTextView.isEditable = true
@@ -247,6 +281,14 @@ extension AppDelegate {
                 rangeEndField.stringValue = dhcp.rangeEnd
                 leaseField.stringValue = "\(dhcp.leaseSeconds)"
 
+                if let localSwitchConfig = privateNetwork?.localSwitch {
+                    localSwitchEnabled.state = localSwitchConfig.enabled ? .on : .off
+                    localSwitchServerField.stringValue = localSwitchConfig.server
+                } else {
+                    localSwitchEnabled.state = .off
+                    localSwitchServerField.stringValue = ""
+                }
+
                 if let switchConfig = privateNetwork?.switch {
                     switchEnabled.state = switchConfig.enabled ? .on : .off
                     switchMultipath.state = switchConfig.multipath ? .on : .off
@@ -269,10 +311,10 @@ extension AppDelegate {
             }
         }
 
-        func normalizedSwitchServer(_ rawValue: String) throws -> String {
+        func normalizedSwitchServer(_ rawValue: String, displayName: String = "Web Switch") throws -> String {
             let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else {
-                throw AppError("Web Switch server URL must not be empty.")
+                throw AppError("\(displayName) server URL must not be empty.")
             }
 
             let server: String
@@ -280,19 +322,19 @@ extension AppDelegate {
                 guard let url = URL(string: trimmed),
                       let host = url.host,
                       let port = url.port else {
-                    throw AppError("Web Switch server URL must include a host and port.")
+                    throw AppError("\(displayName) server URL must include a host and port.")
                 }
                 guard url.path.isEmpty || url.path == "/",
                       url.query == nil,
                       url.fragment == nil else {
-                    throw AppError("Web Switch server URL must not include a path, query, or fragment.")
+                    throw AppError("\(displayName) server URL must not include a path, query, or fragment.")
                 }
                 server = "\(host):\(port)"
             } else {
                 server = trimmed
             }
 
-            _ = try PrivateNetworkSwitchConfig(server: server).endpoint()
+            _ = try PrivateNetworkSwitchEndpoint.parse(server, label: displayName.lowercased())
             return server
         }
 
@@ -373,6 +415,20 @@ extension AppDelegate {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
 
             return (caURL.path, certURL.path, keyURL.path)
+        }
+
+        func readLocalSwitchConfig() throws -> PrivateNetworkLocalSwitchConfig? {
+            guard localSwitchEnabled.state == .on else { return nil }
+
+            let server = try normalizedSwitchServer(
+                localSwitchServerField.stringValue,
+                displayName: "Local Switch"
+            )
+            localSwitchServerField.stringValue = server
+            return try PrivateNetworkLocalSwitchConfig(
+                enabled: true,
+                server: server
+            ).validated()
         }
 
         func readSwitchConfig() throws -> PrivateNetworkSwitchConfig? {
@@ -462,12 +518,30 @@ extension AppDelegate {
                 leaseSeconds: leaseSeconds
             ).validated()
 
-            return HostPrivateNetworkConfig(dhcp: dhcp, switch: try readSwitchConfig())
+            return HostPrivateNetworkConfig(
+                dhcp: dhcp,
+                switch: try readSwitchConfig(),
+                localSwitch: try readLocalSwitchConfig()
+            )
         }
 
         func updateStatus(
+            localSwitchStatus: PrivateNetworkSwitchStatus = PrivateNetworkRuntimeRegistry.shared.localSwitchStatus(identifier: identifier),
             switchStatus: PrivateNetworkSwitchStatus = PrivateNetworkRuntimeRegistry.shared.switchStatus(identifier: identifier)
         ) {
+            localSwitchStatusLabel.stringValue = localSwitchStatus.state.rawValue.capitalized
+            localSwitchStatusLabel.textColor = switchStatusColor(localSwitchStatus.state)
+            localSwitchServerStatusLabel.stringValue = localSwitchStatus.server ?? "Not configured"
+            localSwitchServerStatusLabel.textColor = localSwitchStatus.isConnected ? .systemGreen : NetworkConfigPalette.secondaryText
+
+            let localSwitchMessage = localSwitchStatus.state == .disabled
+                ? (localSwitchEnabled.state == .on ? "Apply to connect Local Switch." : "Local Switch disabled.")
+                : (localSwitchStatus.errorMessage ?? localSwitchStatus.message)
+            localSwitchMessageLabel.stringValue = localSwitchMessage
+            localSwitchMessageLabel.textColor = localSwitchStatus.errorMessage == nil
+                ? switchStatusColor(localSwitchStatus.state)
+                : .systemRed
+
             switchStatusLabel.stringValue = switchStatus.state.rawValue.capitalized
             switchStatusLabel.textColor = switchStatusColor(switchStatus.state)
             switchServerStatusLabel.stringValue = switchStatus.server ?? "Not configured"
@@ -492,6 +566,11 @@ extension AppDelegate {
                 let dhcpRange = try privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                     dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
                 }
+                let localSwitchStatus = PrivateNetworkRuntimeRegistry.shared.configureLocalSwitch(
+                    identifier: identifier,
+                    localSwitchConfig: privateNetwork.localSwitch,
+                    dhcpRange: dhcpRange
+                )
                 let switchStatus = PrivateNetworkRuntimeRegistry.shared.configureSwitch(
                     identifier: identifier,
                     switchConfig: privateNetwork.switch,
@@ -499,7 +578,7 @@ extension AppDelegate {
                 )
                 setPanelMessage("Saved network config.")
                 updateTransportControls()
-                updateStatus(switchStatus: switchStatus)
+                updateStatus(localSwitchStatus: localSwitchStatus, switchStatus: switchStatus)
             } catch {
                 setPanelMessage(error.localizedDescription, isError: true)
             }
@@ -517,6 +596,15 @@ extension AppDelegate {
             updateTransportControls()
             updateStatus()
         }
+        actions.onLocalSwitchToggle = {
+            if localSwitchEnabled.state == .on {
+                setPanelMessage("Local Switch enabled.")
+            } else {
+                setPanelMessage("Local Switch disabled.")
+            }
+            updateTransportControls()
+            updateStatus()
+        }
         actions.onClose = { [weak panel] in
             panel?.close()
             NSApp.stopModal()
@@ -529,6 +617,8 @@ extension AppDelegate {
         closeButton.action = #selector(NetworkConfigPanelActions.close)
         switchEnabled.target = actions
         switchEnabled.action = #selector(NetworkConfigPanelActions.switchToggle)
+        localSwitchEnabled.target = actions
+        localSwitchEnabled.action = #selector(NetworkConfigPanelActions.localSwitchToggle)
 
         loadFields()
         do {
@@ -536,6 +626,14 @@ extension AppDelegate {
             let dhcpRange = try savedPrivateNetwork?.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                 dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
             }
+            let localSwitchStatus = !PrivateNetworkRuntimeRegistry.shared.hasLocalSwitch(identifier: identifier)
+                && savedPrivateNetwork?.localSwitch?.enabled == true
+                ? PrivateNetworkRuntimeRegistry.shared.configureLocalSwitch(
+                    identifier: identifier,
+                    localSwitchConfig: savedPrivateNetwork?.localSwitch,
+                    dhcpRange: dhcpRange ?? nil
+                )
+                : PrivateNetworkRuntimeRegistry.shared.localSwitchStatus(identifier: identifier)
             let switchStatus = !PrivateNetworkRuntimeRegistry.shared.hasSwitch(identifier: identifier)
                 && savedPrivateNetwork?.switch?.enabled == true
                 ? PrivateNetworkRuntimeRegistry.shared.configureSwitch(
@@ -544,7 +642,7 @@ extension AppDelegate {
                     dhcpRange: dhcpRange ?? nil
                 )
                 : PrivateNetworkRuntimeRegistry.shared.switchStatus(identifier: identifier)
-            updateStatus(switchStatus: switchStatus)
+            updateStatus(localSwitchStatus: localSwitchStatus, switchStatus: switchStatus)
         } catch {
             updateStatus()
         }

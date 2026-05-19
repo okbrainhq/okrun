@@ -11,7 +11,8 @@ const FrameType = Object.freeze({
   INIT: 0x05,
   PING: 0x06,
   PONG: 0x07,
-  RESET_SEQ: 0x09
+  RESET_SEQ: 0x09,
+  MEMBER_UPDATE: 0x0a
 });
 
 class ProtocolError extends Error {

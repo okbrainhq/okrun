@@ -49,6 +49,15 @@ function client(server, certs, certName, options = {}) {
   });
 }
 
+function localClient(server, options = {}) {
+  return new TestSwitchClient({
+    name: options.name ?? 'local-client',
+    port: server.localPort,
+    transport: 'tcp',
+    ...options
+  });
+}
+
 function dhcp(start, end, cidr = '10.77.0.0/24') {
   return {
     cidr,
@@ -79,6 +88,95 @@ test('valid mTLS client can INIT and join', async ({ server, certs }) => {
     assert.equal(status.connectionCount, 1);
   } finally {
     await closeAll([a]);
+  }
+});
+
+test('local switch client can INIT without TLS credentials', async ({ server }) => {
+  const a = localClient(server, {
+    networkIdentifier: networkName('local-init')
+  });
+
+  try {
+    const ack = await a.connect();
+    assert.equal(ack.protocol, 'okrun-switch/1');
+    assert.equal(ack.maxFrameSize, 70000);
+
+    const status = await server.status();
+    assert.equal(status.hostCount, 1);
+    assert.equal(status.connectionCount, 1);
+  } finally {
+    await closeAll([a]);
+  }
+});
+
+test('local switch clients exchange frames without certificates', async ({ server }) => {
+  const net = networkName('local-broadcast');
+  const a = localClient(server, { name: 'local-a', networkIdentifier: net });
+  const b = localClient(server, { name: 'local-b', networkIdentifier: net });
+
+  try {
+    await a.connect();
+    await b.connect();
+
+    const frame = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:10:01', 'hello-local');
+    a.sendData(frame);
+
+    assert.deepEqual((await b.waitForData()).payload, frame);
+    await a.expectNoData();
+  } finally {
+    await closeAll([a, b]);
+  }
+});
+
+test('local switch and mTLS clients share the same fabric', async ({ server, certs }) => {
+  const net = networkName('mixed-fabric');
+  const local = localClient(server, { name: 'mixed-local', networkIdentifier: net });
+  const remote = client(server, certs, 'hostA', { name: 'mixed-tls', networkIdentifier: net });
+
+  try {
+    await local.connect();
+    await remote.connect();
+
+    const frame = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:20:01', 'hello-mixed');
+    local.sendData(frame);
+
+    assert.deepEqual((await remote.waitForData()).payload, frame);
+  } finally {
+    await closeAll([local, remote]);
+  }
+});
+
+test('same host can attach over local switch and mTLS without DHCP overlap', async ({ server, certs }) => {
+  const net = networkName('same-host-mixed');
+  const nodeID = '33333333-3333-4333-8333-333333333333';
+  const dhcpRange = dhcp('10.77.0.20', '10.77.0.30');
+  const local = localClient(server, {
+    name: 'same-host-local',
+    networkIdentifier: net,
+    nodeID,
+    interfaceName: 'local',
+    dhcpRange
+  });
+  const remote = client(server, certs, 'hostA', {
+    name: 'same-host-tls',
+    networkIdentifier: net,
+    nodeID,
+    interfaceName: 'web',
+    dhcpRange
+  });
+
+  try {
+    await local.connect();
+    await remote.connect();
+
+    await eventually(async () => {
+      const status = await server.status();
+      const network = status.networks.find((candidate) => candidate.identifier === net);
+      assert.equal(network.hostCount, 1);
+      assert.equal(network.connectionCount, 2);
+    });
+  } finally {
+    await closeAll([local, remote]);
   }
 });
 

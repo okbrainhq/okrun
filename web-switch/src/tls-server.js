@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const net = require('node:net');
 const tls = require('node:tls');
 
 const { SwitchFabric, AdmissionError } = require('./switch-fabric');
@@ -118,7 +119,8 @@ class SwitchTLSServer {
     const peer = socket.getPeerCertificate();
     const identity = {
       clientSerial: normalizeSerial(peer.serialNumber),
-      clientFingerprint: peer.fingerprint256 ?? ''
+      clientFingerprint: peer.fingerprint256 ?? '',
+      kind: 'tls'
     };
 
     if (!socket.authorized) {
@@ -145,6 +147,71 @@ class SwitchTLSServer {
     const connection = new SwitchConnection({
       socket,
       identity,
+      fabric: this.fabric,
+      options: this.options,
+      logger: this.options.logger
+    });
+    connection.start();
+  }
+
+  log(event, fields) {
+    if (!this.options.logger || typeof this.options.logger.log !== 'function') {
+      return;
+    }
+
+    this.options.logger.log(JSON.stringify({
+      event,
+      ...fields
+    }));
+  }
+}
+
+class SwitchLocalServer {
+  constructor(options) {
+    this.options = {
+      host: options.host ?? '0.0.0.0',
+      localPort: options.localPort,
+      keepaliveIntervalMs: options.keepaliveIntervalMs ?? 10000,
+      keepaliveTimeoutMs: options.keepaliveTimeoutMs ?? 25000,
+      initTimeoutMs: options.initTimeoutMs ?? 10000,
+      maxFrameSize: options.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE,
+      logger: options.logger ?? console
+    };
+
+    this.fabric = options.fabric ?? new SwitchFabric({
+      maxFrameSize: this.options.maxFrameSize,
+      maxConnectionsPerHost: options.maxConnectionsPerHost,
+      macTtlMs: options.macTtlMs
+    });
+
+    this.server = net.createServer((socket) => this.handleSocket(socket));
+    this.server.on('error', (error) => {
+      this.log('local_error', { code: error.code, message: error.message });
+    });
+  }
+
+  listen(callback) {
+    this.server.listen(this.options.localPort, this.options.host, callback);
+  }
+
+  close(callback) {
+    this.server.close(callback);
+  }
+
+  address() {
+    return this.server.address();
+  }
+
+  handleSocket(socket) {
+    socket.setNoDelay(true);
+
+    const connection = new SwitchConnection({
+      socket,
+      identity: {
+        clientSerial: 'local-switch',
+        clientFingerprint: '',
+        kind: 'local'
+      },
       fabric: this.fabric,
       options: this.options,
       logger: this.options.logger
@@ -272,6 +339,10 @@ class SwitchConnection {
       return;
     }
 
+    if (frame.type === FrameType.MEMBER_UPDATE) {
+      return;
+    }
+
     throw new ProtocolError('unsupported_frame_type', `Unsupported frame type ${frame.type}`);
   }
 
@@ -319,6 +390,7 @@ class SwitchConnection {
       network: this.networkKey
     });
 
+    this.fabric.broadcastMemberUpdate(this.networkKey);
     this.startKeepalive();
   }
 
@@ -444,6 +516,8 @@ function normalizeSerial(serial) {
 
 module.exports = {
   RevocationList,
+  SwitchConnection,
+  SwitchLocalServer,
   SwitchTLSServer,
   normalizeSerial
 };

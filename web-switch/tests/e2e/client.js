@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const net = require('node:net');
 const tls = require('node:tls');
 const { EventEmitter } = require('node:events');
 
@@ -23,6 +24,7 @@ class TestSwitchClient extends EventEmitter {
     super();
     this.name = options.name ?? 'client';
     this.port = options.port;
+    this.transport = options.transport ?? 'tls';
     this.cert = options.cert;
     this.key = options.key;
     this.ca = options.ca;
@@ -41,7 +43,11 @@ class TestSwitchClient extends EventEmitter {
   }
 
   async connect() {
-    await this.connectTls();
+    if (this.transport === 'tcp') {
+      await this.connectTcp();
+    } else {
+      await this.connectTls();
+    }
     return this.sendInit();
   }
 
@@ -62,6 +68,21 @@ class TestSwitchClient extends EventEmitter {
       this.socket.once('error', reject);
       this.socket.on('data', (chunk) => this.handleChunk(chunk));
       this.socket.on('close', () => this.handleClose());
+    });
+  }
+
+  connectTcp() {
+    return new Promise((resolve, reject) => {
+      const socket = net.connect({
+        host: '127.0.0.1',
+        port: this.port
+      });
+
+      this.socket = socket;
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+      socket.on('data', (chunk) => this.handleChunk(chunk));
+      socket.on('close', () => this.handleClose());
     });
   }
 

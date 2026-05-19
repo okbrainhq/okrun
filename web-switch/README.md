@@ -1,6 +1,9 @@
 # OkRun Web Switch
 
-`web-switch` is the mTLS layer-2 switch used by OkRun private networks. Hosts connect outbound with client certificates, join a named private network, and exchange raw Ethernet frames through the switch.
+`web-switch` is the layer-2 switch used by OkRun private networks. Web Switch
+hosts connect outbound with mTLS client certificates. Local Switch hosts can
+connect to a plain TCP listener on a trusted local network without TLS
+credentials. Both listeners use the same switch protocol and fabric.
 
 ## Certificate Scripts
 
@@ -82,10 +85,25 @@ npm run cert:local -- --certs-dir .certs/local
 npm run start -- \
   --host 127.0.0.1 \
   --tls-port 9443 \
+  --local-port 9444 \
   --status-port 8080 \
   --server-bundle .certs/server/okrun-switch-server-bundle.json \
   --crl .ca/crl.txt
 ```
+
+For a Local Switch only listener, disable the TLS listener and provide a local
+port:
+
+```bash
+npm run start -- \
+  --host 127.0.0.1 \
+  --tls-enabled false \
+  --local-port 9444 \
+  --status-port 8080
+```
+
+The equivalent environment variables are `OKRUN_SWITCH_TLS_ENABLED=false` and
+`OKRUN_SWITCH_LOCAL_PORT=9444`.
 
 Health and status:
 

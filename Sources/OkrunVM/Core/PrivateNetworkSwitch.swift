@@ -9,6 +9,7 @@ enum SwitchFrameType: UInt8, Equatable {
     case ping = 0x06
     case pong = 0x07
     case resetSeq = 0x09
+    case memberUpdate = 0x0a
 }
 
 struct SwitchFrame: Equatable {
@@ -205,6 +206,31 @@ struct PrivateNetworkSwitchEndpoint: Equatable {
     var description: String {
         "\(host):\(port)"
     }
+
+    static func parse(_ server: String, label: String) throws -> PrivateNetworkSwitchEndpoint {
+        let trimmed = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw AppError("\(label) server must not be empty when enabled.")
+        }
+        guard trimmed.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
+            throw AppError("\(label) server must not contain NUL.")
+        }
+
+        let parts = trimmed.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              !parts[0].isEmpty,
+              let port = UInt16(parts[1]),
+              port > 0 else {
+            throw AppError("\(label) server must be host:port with port between 1 and 65535.")
+        }
+
+        let host = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else {
+            throw AppError("\(label) server host must not be empty.")
+        }
+
+        return PrivateNetworkSwitchEndpoint(host: host, port: port)
+    }
 }
 
 struct PrivateNetworkSwitchConfig: Codable, Equatable {
@@ -278,28 +304,83 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
     }
 
     func endpoint() throws -> PrivateNetworkSwitchEndpoint {
-        let trimmed = server.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw AppError("private network switch server must not be empty when enabled.")
-        }
-        guard trimmed.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
-            throw AppError("private network switch server must not contain NUL.")
-        }
+        try PrivateNetworkSwitchEndpoint.parse(server, label: "private network switch")
+    }
+}
 
-        let parts = trimmed.split(separator: ":", omittingEmptySubsequences: false)
-        guard parts.count == 2,
-              !parts[0].isEmpty,
-              let port = UInt16(parts[1]),
-              port > 0 else {
-            throw AppError("private network switch server must be host:port with port between 1 and 65535.")
-        }
+struct PrivateNetworkLocalSwitchConfig: Codable, Equatable {
+    var enabled: Bool
+    var server: String
 
-        let host = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !host.isEmpty else {
-            throw AppError("private network switch server host must not be empty.")
-        }
+    init(
+        enabled: Bool = false,
+        server: String = ""
+    ) {
+        self.enabled = enabled
+        self.server = server
+    }
 
-        return PrivateNetworkSwitchEndpoint(host: host, port: port)
+    func validated() throws -> PrivateNetworkLocalSwitchConfig {
+        guard enabled else { return self }
+        _ = try endpoint()
+        return self
+    }
+
+    func endpoint() throws -> PrivateNetworkSwitchEndpoint {
+        try PrivateNetworkSwitchEndpoint.parse(server, label: "private network local switch")
+    }
+}
+
+struct SwitchTLSCredentials: Equatable {
+    var caCert: String
+    var clientCert: String
+    var clientKey: String
+}
+
+enum SwitchConnectionSecurity: Equatable {
+    case tls(SwitchTLSCredentials)
+    case none
+}
+
+struct PrivateNetworkSwitchConnectionConfig: Equatable {
+    var server: String
+    var credentialFingerprint: String
+    var multipath: Bool
+    var security: SwitchConnectionSecurity
+
+    static func webSwitch(_ config: PrivateNetworkSwitchConfig) throws -> PrivateNetworkSwitchConnectionConfig {
+        let validated = try config.validated()
+        return PrivateNetworkSwitchConnectionConfig(
+            server: validated.server,
+            credentialFingerprint: validated.credentialFingerprint,
+            multipath: validated.multipath,
+            security: .tls(SwitchTLSCredentials(
+                caCert: validated.caCert,
+                clientCert: validated.clientCert,
+                clientKey: validated.clientKey
+            ))
+        )
+    }
+
+    static func localSwitch(_ config: PrivateNetworkLocalSwitchConfig) throws -> PrivateNetworkSwitchConnectionConfig {
+        let validated = try config.validated()
+        return PrivateNetworkSwitchConnectionConfig(
+            server: validated.server,
+            credentialFingerprint: "",
+            multipath: false,
+            security: .none
+        )
+    }
+
+    func endpoint() throws -> PrivateNetworkSwitchEndpoint {
+        let label: String
+        switch security {
+        case .tls:
+            label = "private network switch"
+        case .none:
+            label = "private network local switch"
+        }
+        return try PrivateNetworkSwitchEndpoint.parse(server, label: label)
     }
 }
 
@@ -374,6 +455,10 @@ private struct SwitchResetSeqPayload: Codable {
     var streams: [UInt32]
 }
 
+private struct SwitchMemberUpdatePayload: Codable {
+    var networkMemberCount: Int
+}
+
 private enum SwitchDebug {
     static let enabled = ProcessInfo.processInfo.environment["OKRUN_SWITCH_DEBUG"] == "1"
 
@@ -389,26 +474,30 @@ final class PrivateNetworkSwitchClient {
     var onStatusChange: ((PrivateNetworkSwitchConnectionState, String, Int, String?) -> Void)?
 
     private let identifier: String
-    private let config: PrivateNetworkSwitchConfig
+    private let config: PrivateNetworkSwitchConnectionConfig
     private let dhcpRange: PrivateNetworkDHCPLeaseRange?
     private let nodeID: UUID
+    private let interfaceName: String
     private let socket: VirtualSwitchSocket
 
     init(
         identifier: String,
-        config: PrivateNetworkSwitchConfig,
+        config: PrivateNetworkSwitchConnectionConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange?,
+        interfaceName: String,
         nodeID: UUID = UUID()
     ) throws {
         self.identifier = identifier
-        self.config = try config.validated()
+        self.config = config
         self.dhcpRange = dhcpRange
         self.nodeID = nodeID
+        self.interfaceName = interfaceName
         socket = try VirtualSwitchSocket(
             identifier: identifier,
             config: self.config,
             dhcpRange: dhcpRange,
-            nodeID: nodeID
+            nodeID: nodeID,
+            interfaceName: interfaceName
         )
 
         socket.onFrame = { [weak self] frame in
@@ -431,8 +520,8 @@ final class PrivateNetworkSwitchClient {
         socket.send(frame)
     }
 
-    func matches(config: PrivateNetworkSwitchConfig, dhcpRange: PrivateNetworkDHCPLeaseRange?) -> Bool {
-        (try? config.validated()) == self.config && dhcpRange == self.dhcpRange
+    func matches(config: PrivateNetworkSwitchConnectionConfig, dhcpRange: PrivateNetworkDHCPLeaseRange?) -> Bool {
+        config == self.config && dhcpRange == self.dhcpRange
     }
 }
 
@@ -448,9 +537,10 @@ private final class VirtualSwitchSocket {
 
     init(
         identifier: String,
-        config: PrivateNetworkSwitchConfig,
+        config: PrivateNetworkSwitchConnectionConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange?,
-        nodeID: UUID
+        nodeID: UUID,
+        interfaceName: String
     ) throws {
         self.identifier = identifier
         realSocket = try RealSwitchSocket(
@@ -458,7 +548,7 @@ private final class VirtualSwitchSocket {
             config: config,
             dhcpRange: dhcpRange,
             nodeID: nodeID,
-            interfaceName: "default"
+            interfaceName: interfaceName
         )
 
         realSocket.onFrame = { [weak self] frame in
@@ -529,7 +619,7 @@ private final class RealSwitchSocket {
     var onStatusChange: ((PrivateNetworkSwitchConnectionState, String, Int, String?) -> Void)?
 
     private let identifier: String
-    private let config: PrivateNetworkSwitchConfig
+    private let config: PrivateNetworkSwitchConnectionConfig
     private let endpoint: PrivateNetworkSwitchEndpoint
     private let dhcpRange: PrivateNetworkDHCPLeaseRange?
     private let nodeID: UUID
@@ -551,13 +641,13 @@ private final class RealSwitchSocket {
 
     init(
         identifier: String,
-        config: PrivateNetworkSwitchConfig,
+        config: PrivateNetworkSwitchConnectionConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange?,
         nodeID: UUID,
         interfaceName: String
     ) throws {
         self.identifier = identifier
-        self.config = try config.validated()
+        self.config = config
         endpoint = try self.config.endpoint()
         self.dhcpRange = dhcpRange
         self.nodeID = nodeID
@@ -612,14 +702,19 @@ private final class RealSwitchSocket {
         report(.connecting, "Connecting to \(endpoint.description).", connections: 0, error: nil)
 
         do {
-            let identity = try SwitchTLSIdentity.load(config: config)
-            let caCertificate = try SwitchTLSIdentity.loadCertificate(path: config.caCert)
-            let tlsOptions = NWProtocolTLS.Options()
-            configureTLSOptions(tlsOptions, identity: identity, caCertificate: caCertificate)
-
             let tcpOptions = NWProtocolTCP.Options()
             tcpOptions.noDelay = true
-            let parameters = NWParameters(tls: tlsOptions, tcp: tcpOptions)
+            let parameters: NWParameters
+            switch config.security {
+            case .tls(let credentials):
+                let identity = try SwitchTLSIdentity.load(credentials: credentials)
+                let caCertificate = try SwitchTLSIdentity.loadCertificate(path: credentials.caCert)
+                let tlsOptions = NWProtocolTLS.Options()
+                configureTLSOptions(tlsOptions, identity: identity, caCertificate: caCertificate)
+                parameters = NWParameters(tls: tlsOptions, tcp: tcpOptions)
+            case .none:
+                parameters = NWParameters(tls: nil, tcp: tcpOptions)
+            }
             parameters.allowLocalEndpointReuse = true
             let connection = NWConnection(
                 host: NWEndpoint.Host(endpoint.host),
@@ -906,7 +1001,12 @@ private final class RealSwitchSocket {
                 )
                 onInitialized?()
                 flushPendingWrites()
-                report(.connected, "Connected to \(endpoint.description).", connections: 1, error: nil)
+                report(
+                    .connected,
+                    "Connected to \(endpoint.description).",
+                    connections: max(1, ack.networkMemberCount ?? 1),
+                    error: nil
+                )
             } catch {
                 AppLog.webSwitch.error(
                     "invalid init ack network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
@@ -945,6 +1045,17 @@ private final class RealSwitchSocket {
             if let reset = try? JSONDecoder().decode(SwitchResetSeqPayload.self, from: frame.payload) {
                 onResetSeq?(reset.streams)
             }
+        case .memberUpdate:
+            guard initialized,
+                  let update = try? JSONDecoder().decode(SwitchMemberUpdatePayload.self, from: frame.payload) else {
+                return
+            }
+            report(
+                .connected,
+                "Connected to \(endpoint.description).",
+                connections: max(1, update.networkMemberCount),
+                error: nil
+            )
         }
     }
 
@@ -1122,13 +1233,13 @@ private final class RealSwitchSocket {
 }
 
 private enum SwitchTLSIdentity {
-    static func load(config: PrivateNetworkSwitchConfig) throws -> sec_identity_t {
+    static func load(credentials: SwitchTLSCredentials) throws -> sec_identity_t {
         let password = UUID().uuidString
         let p12URL = FileManager.default.temporaryDirectory
             .appendingPathComponent("okrun-switch-\(UUID().uuidString).p12")
         defer { try? FileManager.default.removeItem(at: p12URL) }
 
-        try exportPKCS12(config: config, output: p12URL, password: password)
+        try exportPKCS12(credentials: credentials, output: p12URL, password: password)
         let data = try Data(contentsOf: p12URL)
         let identity = try importPKCS12(data: data, password: password)
         guard let protocolIdentity = sec_identity_create(identity) else {
@@ -1146,7 +1257,7 @@ private enum SwitchTLSIdentity {
     }
 
     private static func exportPKCS12(
-        config: PrivateNetworkSwitchConfig,
+        credentials: SwitchTLSCredentials,
         output: URL,
         password: String
     ) throws {
@@ -1160,8 +1271,8 @@ private enum SwitchTLSIdentity {
         process.arguments = [
             "pkcs12",
             "-export",
-            "-inkey", config.clientKey,
-            "-in", config.clientCert,
+            "-inkey", credentials.clientKey,
+            "-in", credentials.clientCert,
             "-out", output.path,
             "-passout", "pass:\(password)"
         ]
@@ -1219,31 +1330,82 @@ final class PrivateNetworkSwitchTransport {
         weak var runtime: PrivateNetworkRuntime?
     }
 
+    enum RouteAvailability {
+        case allowConnecting
+        case connectedOnly
+    }
+
     private let identifier: String
-    private let config: PrivateNetworkSwitchConfig
+    private let config: PrivateNetworkSwitchConnectionConfig
     private let dhcpRange: PrivateNetworkDHCPLeaseRange?
     private let onRemoteFrame: ((Data) -> Void)?
+    private let routeAvailability: RouteAvailability
+    private let interfaceName: String
     private let queue: DispatchQueue
     private let client: PrivateNetworkSwitchClient
     private var runtimes: [WeakRuntime] = []
     private var localMACs = Set<EthernetAddress>()
     private var status: PrivateNetworkSwitchStatus
+    private var hasReceivedRemoteFrame = false
 
-    init(
+    convenience init(
         identifier: String,
         config: PrivateNetworkSwitchConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange? = nil,
+        nodeID: UUID = UUID(),
         onRemoteFrame: ((Data) -> Void)? = nil
     ) throws {
+        try self.init(
+            identifier: identifier,
+            connectionConfig: .webSwitch(config),
+            dhcpRange: dhcpRange,
+            routeAvailability: .allowConnecting,
+            interfaceName: "web",
+            nodeID: nodeID,
+            onRemoteFrame: onRemoteFrame
+        )
+    }
+
+    convenience init(
+        identifier: String,
+        localConfig: PrivateNetworkLocalSwitchConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil,
+        nodeID: UUID = UUID(),
+        onRemoteFrame: ((Data) -> Void)? = nil
+    ) throws {
+        try self.init(
+            identifier: identifier,
+            connectionConfig: .localSwitch(localConfig),
+            dhcpRange: dhcpRange,
+            routeAvailability: .connectedOnly,
+            interfaceName: "local",
+            nodeID: nodeID,
+            onRemoteFrame: onRemoteFrame
+        )
+    }
+
+    private init(
+        identifier: String,
+        connectionConfig: PrivateNetworkSwitchConnectionConfig,
+        dhcpRange: PrivateNetworkDHCPLeaseRange?,
+        routeAvailability: RouteAvailability,
+        interfaceName: String,
+        nodeID: UUID,
+        onRemoteFrame: ((Data) -> Void)?
+    ) throws {
         self.identifier = identifier
-        self.config = try config.validated()
+        self.config = connectionConfig
         self.dhcpRange = dhcpRange
         self.onRemoteFrame = onRemoteFrame
+        self.routeAvailability = routeAvailability
+        self.interfaceName = interfaceName
         queue = DispatchQueue(label: "okrun.private-network-switch.\(identifier).\(UUID().uuidString)")
         client = try PrivateNetworkSwitchClient(
             identifier: identifier,
             config: self.config,
-            dhcpRange: dhcpRange
+            dhcpRange: dhcpRange,
+            interfaceName: interfaceName,
+            nodeID: nodeID
         )
         status = PrivateNetworkSwitchStatus(
             identifier: identifier,
@@ -1256,12 +1418,16 @@ final class PrivateNetworkSwitchTransport {
 
         client.onFrame = { [weak self] frame in
             self?.queue.async {
+                self?.hasReceivedRemoteFrame = true
                 self?.injectFrameToLocalGuests(frame)
             }
         }
         client.onStatusChange = { [weak self] state, message, activeConnections, error in
             self?.queue.async {
                 guard let self else { return }
+                if state != .connected || activeConnections <= 1 {
+                    self.hasReceivedRemoteFrame = false
+                }
                 self.status = PrivateNetworkSwitchStatus(
                     identifier: self.identifier,
                     server: self.config.server,
@@ -1308,12 +1474,29 @@ final class PrivateNetworkSwitchTransport {
     }
 
     func matches(config switchConfig: PrivateNetworkSwitchConfig, dhcpRange: PrivateNetworkDHCPLeaseRange?) -> Bool {
-        client.matches(config: switchConfig, dhcpRange: dhcpRange)
+        guard let connectionConfig = try? PrivateNetworkSwitchConnectionConfig.webSwitch(switchConfig) else {
+            return false
+        }
+        return client.matches(config: connectionConfig, dhcpRange: dhcpRange)
+    }
+
+    func matches(localConfig: PrivateNetworkLocalSwitchConfig, dhcpRange: PrivateNetworkDHCPLeaseRange?) -> Bool {
+        guard let connectionConfig = try? PrivateNetworkSwitchConnectionConfig.localSwitch(localConfig) else {
+            return false
+        }
+        return client.matches(config: connectionConfig, dhcpRange: dhcpRange)
     }
 
     func canSendFrames() -> Bool {
-        let state = statusSnapshot().state
-        return state == .connecting || state == .connected
+        queue.sync {
+            switch routeAvailability {
+            case .allowConnecting:
+                return status.state == .connecting || status.state == .connected
+            case .connectedOnly:
+                return status.state == .connected
+                    && (status.activeConnections > 1 || hasReceivedRemoteFrame)
+            }
+        }
     }
 
     func sendFrameToRemote(_ frame: Data) {

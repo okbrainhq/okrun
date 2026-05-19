@@ -1113,6 +1113,22 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRouterInjectsLocalSwitchFramesIntoLocalRuntimes() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let runtime = try PrivateNetworkRuntime(identifier: "router-runtime-\(UUID().uuidString)")
+        router.addRuntime(runtime)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x11]
+        let remoteMAC: [UInt8] = [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x11]
+        let switchFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+
+        router.receiveRemoteFrame(switchFrame, via: .localSwitch)
+
+        #expect(try waitForFrame(on: runtime.fileHandle.fileDescriptor, timeout: 1) == switchFrame)
+        withExtendedLifetime((router, runtime)) {}
+    }
+
+    @Test
     func privateNetworkRouterSendsDiscoveryFramesToWebSwitch() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let webSwitch = MockRoutableTransport()
@@ -1127,6 +1143,95 @@ struct OkrunVMTests {
         router.routeLocalFrame(frame)
 
         #expect(webSwitch.sentFrames == [frame])
+    }
+
+    @Test
+    func privateNetworkRouterPrefersLocalSwitchOverWebSwitch() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let localSwitch = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setLocalSwitch(localSwitch)
+        router.setWebSwitch(webSwitch)
+
+        let frame = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x03],
+            payload: [0x07]
+        )
+
+        router.routeLocalFrame(frame)
+
+        #expect(localSwitch.sentFrames == [frame])
+        #expect(webSwitch.sentFrames.isEmpty)
+    }
+
+    @Test
+    func privateNetworkRouterFallsBackToWebSwitchWhenLocalSwitchIsUnavailable() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let localSwitch = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        localSwitch.canSendPrivateNetworkFrames = false
+        router.setLocalSwitch(localSwitch)
+        router.setWebSwitch(webSwitch)
+
+        let frame = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x04],
+            payload: [0x08]
+        )
+
+        router.routeLocalFrame(frame)
+
+        #expect(localSwitch.sentFrames.isEmpty)
+        #expect(webSwitch.sentFrames == [frame])
+    }
+
+    @Test
+    func privateNetworkRouterMovesBackToLocalSwitchWhenItReturns() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let localSwitch = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        localSwitch.canSendPrivateNetworkFrames = false
+        router.setLocalSwitch(localSwitch)
+        router.setWebSwitch(webSwitch)
+
+        let whileLocalDown = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x05],
+            payload: [0x09]
+        )
+        router.routeLocalFrame(whileLocalDown)
+
+        localSwitch.canSendPrivateNetworkFrames = true
+        let afterLocalReturn = ethernetFrame(
+            destination: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            source: [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x06],
+            payload: [0x0a]
+        )
+        router.routeLocalFrame(afterLocalReturn)
+
+        #expect(webSwitch.sentFrames == [whileLocalDown])
+        #expect(localSwitch.sentFrames == [afterLocalReturn])
+    }
+
+    @Test
+    func privateNetworkRouterMovesKnownRemoteFramesToLocalSwitchWhenAvailable() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let localSwitch = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setLocalSwitch(localSwitch)
+        router.setWebSwitch(webSwitch)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x20]
+        let remoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x20]
+        let remoteFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+        router.receiveRemoteFrame(remoteFrame, via: .webSwitch)
+
+        let reply = ethernetFrame(destination: remoteMAC, source: localMAC, payload: [0x03])
+        router.routeLocalFrame(reply)
+
+        #expect(localSwitch.sentFrames == [reply])
+        #expect(webSwitch.sentFrames.isEmpty)
     }
 
     @Test
@@ -1202,12 +1307,18 @@ struct OkrunVMTests {
             credentialFingerprint: "bundle-a",
             multipath: false
         )
+        let localSwitchConfig = PrivateNetworkLocalSwitchConfig(
+            enabled: true,
+            server: "127.0.0.1:9444"
+        )
         try store.save(HostNetworkConfig(version: 1, privateNetworks: [
-            "okrun": HostPrivateNetworkConfig(dhcp: nil, switch: switchConfig)
+            "okrun": HostPrivateNetworkConfig(dhcp: nil, switch: switchConfig, localSwitch: localSwitchConfig)
         ]))
 
         #expect(try store.switchConfigForPrivateNetwork(identifier: "okrun") == switchConfig)
+        #expect(try store.localSwitchConfigForPrivateNetwork(identifier: "okrun") == localSwitchConfig)
         #expect(try store.load().privateNetworks["okrun"]?.switch == switchConfig)
+        #expect(try store.load().privateNetworks["okrun"]?.localSwitch == localSwitchConfig)
 
         let changedCredentials = PrivateNetworkSwitchConfig(
             enabled: true,
