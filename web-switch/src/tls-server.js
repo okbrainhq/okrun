@@ -171,8 +171,8 @@ class SwitchLocalServer {
     this.options = {
       host: options.host ?? '0.0.0.0',
       localPort: options.localPort,
-      keepaliveIntervalMs: options.keepaliveIntervalMs ?? 10000,
-      keepaliveTimeoutMs: options.keepaliveTimeoutMs ?? 25000,
+      keepaliveIntervalMs: options.localKeepaliveIntervalMs ?? 500,
+      keepaliveTimeoutMs: options.localKeepaliveTimeoutMs ?? 1500,
       initTimeoutMs: options.initTimeoutMs ?? 10000,
       maxFrameSize: options.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE,
       logger: options.logger ?? console

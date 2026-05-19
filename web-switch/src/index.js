@@ -116,6 +116,16 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
       25000,
       'keepalive-timeout-ms'
     ),
+    localKeepaliveIntervalMs: numberOption(
+      args['local-keepalive-interval-ms'] ?? env.OKRUN_SWITCH_LOCAL_KEEPALIVE_INTERVAL_MS,
+      500,
+      'local-keepalive-interval-ms'
+    ),
+    localKeepaliveTimeoutMs: numberOption(
+      args['local-keepalive-timeout-ms'] ?? env.OKRUN_SWITCH_LOCAL_KEEPALIVE_TIMEOUT_MS,
+      1500,
+      'local-keepalive-timeout-ms'
+    ),
     initTimeoutMs: numberOption(
       args['init-timeout-ms'] ?? env.OKRUN_SWITCH_INIT_TIMEOUT_MS,
       10000,

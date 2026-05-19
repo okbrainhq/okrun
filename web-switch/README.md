@@ -105,6 +105,11 @@ npm run start -- \
 The equivalent environment variables are `OKRUN_SWITCH_TLS_ENABLED=false` and
 `OKRUN_SWITCH_LOCAL_PORT=9444`.
 
+Local Switch uses shorter keepalives by default so clients can fall back quickly
+when a LAN peer disappears. Tune them with
+`OKRUN_SWITCH_LOCAL_KEEPALIVE_INTERVAL_MS` and
+`OKRUN_SWITCH_LOCAL_KEEPALIVE_TIMEOUT_MS`.
+
 Health and status:
 
 ```bash

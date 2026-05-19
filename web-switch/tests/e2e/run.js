@@ -128,6 +128,69 @@ test('local switch clients exchange frames without certificates', async ({ serve
   }
 });
 
+test('local switch sends member updates when peers leave', async ({ server }) => {
+  const net = networkName('local-member-update');
+  const a = localClient(server, { name: 'member-a', networkIdentifier: net });
+  const b = localClient(server, { name: 'member-b', networkIdentifier: net });
+
+  try {
+    await a.connect();
+    await b.connect();
+
+    const joined = await a.waitForFrame(
+      (candidate) => candidate.type === FrameType.MEMBER_UPDATE
+        && JSON.parse(candidate.payload.toString('utf8')).networkMemberCount === 2,
+      1000,
+      'member join update'
+    );
+    assert.equal(JSON.parse(joined.payload.toString('utf8')).networkMemberCount, 2);
+
+    b.close();
+    const left = await a.waitForFrame(
+      (candidate) => candidate.type === FrameType.MEMBER_UPDATE
+        && JSON.parse(candidate.payload.toString('utf8')).networkMemberCount === 1,
+      1000,
+      'member leave update'
+    );
+    assert.equal(JSON.parse(left.payload.toString('utf8')).networkMemberCount, 1);
+  } finally {
+    await closeAll([a, b]);
+  }
+});
+
+test('local switch removes silent peers on local keepalive timeout', async ({ server }) => {
+  const net = networkName('local-keepalive-timeout');
+  const a = localClient(server, { name: 'keepalive-a', networkIdentifier: net });
+  const b = localClient(server, {
+    name: 'keepalive-b',
+    networkIdentifier: net,
+    autoPong: false
+  });
+
+  try {
+    await a.connect();
+    await b.connect();
+
+    await a.waitForFrame(
+      (candidate) => candidate.type === FrameType.MEMBER_UPDATE
+        && JSON.parse(candidate.payload.toString('utf8')).networkMemberCount === 2,
+      1000,
+      'member join update'
+    );
+
+    await b.waitForClose(1500);
+    const left = await a.waitForFrame(
+      (candidate) => candidate.type === FrameType.MEMBER_UPDATE
+        && JSON.parse(candidate.payload.toString('utf8')).networkMemberCount === 1,
+      1500,
+      'keepalive member leave update'
+    );
+    assert.equal(JSON.parse(left.payload.toString('utf8')).networkMemberCount, 1);
+  } finally {
+    await closeAll([a, b]);
+  }
+});
+
 test('local switch and mTLS clients share the same fabric', async ({ server, certs }) => {
   const net = networkName('mixed-fabric');
   const local = localClient(server, { name: 'mixed-local', networkIdentifier: net });

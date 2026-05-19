@@ -612,6 +612,8 @@ private final class RealSwitchSocket {
     private static let maxReconnectDelay: TimeInterval = 3
     private static let connectionTimeout: TimeInterval = 25
     private static let initResponseTimeout: TimeInterval = 10
+    private static let defaultLocalKeepaliveInterval: TimeInterval = 0.5
+    private static let defaultLocalKeepaliveTimeout: TimeInterval = 1.5
 
     var onFrame: ((SwitchFrame) -> Void)?
     var onResetSeq: (([UInt32]) -> Void)?
@@ -636,6 +638,10 @@ private final class RealSwitchSocket {
     private var reconnectWorkItem: DispatchWorkItem?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var initResponseWorkItem: DispatchWorkItem?
+    private var clientKeepaliveWorkItem: DispatchWorkItem?
+    private var lastPongAt: Date?
+    private var clientKeepaliveInterval = RealSwitchSocket.defaultLocalKeepaliveInterval
+    private var clientKeepaliveTimeout = RealSwitchSocket.defaultLocalKeepaliveTimeout
     private var pathMonitor: NWPathMonitor?
     private var pathSnapshot: NetworkPathSnapshot?
 
@@ -678,6 +684,7 @@ private final class RealSwitchSocket {
             cancelReconnect()
             cancelConnectionTimeout()
             cancelInitResponseTimeout()
+            cancelClientKeepalive()
             stopNetworkPathMonitorOnQueue()
             connection?.cancel()
             connection = nil
@@ -695,6 +702,8 @@ private final class RealSwitchSocket {
         guard !stopped else { return }
         initialized = false
         maxFrameSize = SwitchFrame.defaultMaxFrameSize
+        clientKeepaliveInterval = Self.defaultLocalKeepaliveInterval
+        clientKeepaliveTimeout = Self.defaultLocalKeepaliveTimeout
         decoder = SwitchFrameDecoder(maxPayloadLength: maxFrameSize)
         AppLog.webSwitch.info(
             "connect start network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) attempt=\(self.reconnectAttempts, privacy: .public)"
@@ -814,6 +823,7 @@ private final class RealSwitchSocket {
         cancelReconnect()
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
+        cancelClientKeepalive()
         initialized = false
         if let activeConnection = connection {
             connection = nil
@@ -833,6 +843,7 @@ private final class RealSwitchSocket {
         cancelReconnect()
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
+        cancelClientKeepalive()
         initialized = false
         if let activeConnection = connection {
             connection = nil
@@ -1000,6 +1011,7 @@ private final class RealSwitchSocket {
                     "init complete network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) reconnectAttempts=\(completedAttempts, privacy: .public) maxFrameSize=\(self.maxFrameSize, privacy: .public)"
                 )
                 onInitialized?()
+                startClientKeepaliveIfNeeded(ack: ack)
                 flushPendingWrites()
                 report(
                     .connected,
@@ -1040,7 +1052,7 @@ private final class RealSwitchSocket {
         case .ping:
             sendPong()
         case .pong:
-            break
+            lastPongAt = Date()
         case .resetSeq:
             if let reset = try? JSONDecoder().decode(SwitchResetSeqPayload.self, from: frame.payload) {
                 onResetSeq?(reset.streams)
@@ -1064,6 +1076,20 @@ private final class RealSwitchSocket {
             let encoded = try SwitchFrameProtocol.encode(SwitchFrame(
                 streamID: SwitchFrame.controlStreamID,
                 type: .pong,
+                sequenceNumber: 0,
+                payload: Data()
+            ))
+            sendNow(encoded)
+        } catch {
+            report(.failed, error.localizedDescription, connections: initialized ? 1 : 0, error: error.localizedDescription)
+        }
+    }
+
+    private func sendPing() {
+        do {
+            let encoded = try SwitchFrameProtocol.encode(SwitchFrame(
+                streamID: SwitchFrame.controlStreamID,
+                type: .ping,
                 sequenceNumber: 0,
                 payload: Data()
             ))
@@ -1169,6 +1195,61 @@ private final class RealSwitchSocket {
         initResponseWorkItem = nil
     }
 
+    private func startClientKeepaliveIfNeeded(ack: SwitchInitAckPayload) {
+        guard case .none = config.security else { return }
+        clientKeepaliveInterval = Self.seconds(
+            fromMilliseconds: ack.keepaliveIntervalMs,
+            fallback: Self.defaultLocalKeepaliveInterval
+        )
+        clientKeepaliveTimeout = Self.seconds(
+            fromMilliseconds: ack.keepaliveTimeoutMs,
+            fallback: Self.defaultLocalKeepaliveTimeout
+        )
+        lastPongAt = Date()
+        scheduleClientKeepalive()
+    }
+
+    private func scheduleClientKeepalive() {
+        cancelClientKeepalive(resetLastPong: false)
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.stopped, self.initialized else { return }
+
+            let age = Date().timeIntervalSince(self.lastPongAt ?? .distantPast)
+            guard age <= self.clientKeepaliveTimeout else {
+                if let connection = self.connection {
+                    AppLog.webSwitch.warning(
+                        "local keepalive timeout network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) timeoutMs=\(Int(self.clientKeepaliveTimeout * 1000), privacy: .public)"
+                    )
+                    self.closeConnection(
+                        connection,
+                        message: "Local Switch keepalive timed out.",
+                        error: "Local Switch keepalive timed out.",
+                        retry: true
+                    )
+                }
+                return
+            }
+
+            self.sendPing()
+            self.scheduleClientKeepalive()
+        }
+        clientKeepaliveWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + clientKeepaliveInterval, execute: workItem)
+    }
+
+    private func cancelClientKeepalive(resetLastPong: Bool = true) {
+        clientKeepaliveWorkItem?.cancel()
+        clientKeepaliveWorkItem = nil
+        if resetLastPong {
+            lastPongAt = nil
+        }
+    }
+
+    private static func seconds(fromMilliseconds milliseconds: Int?, fallback: TimeInterval) -> TimeInterval {
+        guard let milliseconds, milliseconds > 0 else { return fallback }
+        return TimeInterval(milliseconds) / 1000
+    }
+
     private func closeConnection(
         _ activeConnection: NWConnection,
         message: String,
@@ -1180,6 +1261,7 @@ private final class RealSwitchSocket {
         initialized = false
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
+        cancelClientKeepalive()
         connection = nil
         activeConnection.cancel()
 
