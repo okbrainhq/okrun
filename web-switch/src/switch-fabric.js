@@ -96,7 +96,7 @@ class SwitchFabric {
     return {
       init,
       session,
-      networkMemberCount: network.hosts.size
+      memberCounts: memberCounts(network)
     };
   }
 
@@ -106,8 +106,9 @@ class SwitchFabric {
       return;
     }
 
+    const payload = memberCounts(network);
     for (const host of network.hosts.values()) {
-      host.sendMemberUpdate(network.hosts.size);
+      host.sendMemberUpdate(payload);
     }
   }
 
@@ -118,12 +119,17 @@ class SwitchFabric {
     }
 
     const removed = session.removeConnection(connection);
-    if (!removed || session.connectionCount > 0) {
+    if (!removed) {
       return;
     }
 
     const network = this.networks.get(connection.networkKey);
     if (!network) {
+      return;
+    }
+
+    if (session.connectionCount > 0) {
+      this.broadcastMemberUpdate(connection.networkKey);
       return;
     }
 
@@ -406,6 +412,20 @@ function assertNoDhcpOverlap(network, nodeID, candidateRange) {
 
 function rangesOverlap(left, right) {
   return left.startInt <= right.endInt && right.startInt <= left.endInt;
+}
+
+function memberCounts(network) {
+  let localMemberCount = 0;
+  for (const host of network.hosts.values()) {
+    if (host.hasConnectionKind('local')) {
+      localMemberCount += 1;
+    }
+  }
+
+  return {
+    networkMemberCount: network.hosts.size,
+    localMemberCount
+  };
 }
 
 function chooseTargets(network, sourceHost, payload) {

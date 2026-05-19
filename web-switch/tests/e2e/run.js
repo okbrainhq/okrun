@@ -66,6 +66,22 @@ function dhcp(start, end, cidr = '10.77.0.0/24') {
   };
 }
 
+function memberUpdatePredicate({ networkMemberCount, localMemberCount }) {
+  return (candidate) => {
+    if (candidate.type !== FrameType.MEMBER_UPDATE) {
+      return false;
+    }
+
+    const update = JSON.parse(candidate.payload.toString('utf8'));
+    return update.networkMemberCount === networkMemberCount
+      && update.localMemberCount === localMemberCount;
+  };
+}
+
+function parseMemberUpdate(frame) {
+  return JSON.parse(frame.payload.toString('utf8'));
+}
+
 async function closeAll(clients) {
   for (const current of clients) {
     current.close();
@@ -82,6 +98,8 @@ test('valid mTLS client can INIT and join', async ({ server, certs }) => {
     const ack = await a.connect();
     assert.equal(ack.protocol, 'okrun-switch/1');
     assert.equal(ack.maxFrameSize, 70000);
+    assert.equal(ack.networkMemberCount, 1);
+    assert.equal(ack.localMemberCount, 0);
 
     const status = await server.status();
     assert.equal(status.hostCount, 1);
@@ -100,6 +118,8 @@ test('local switch client can INIT without TLS credentials', async ({ server }) 
     const ack = await a.connect();
     assert.equal(ack.protocol, 'okrun-switch/1');
     assert.equal(ack.maxFrameSize, 70000);
+    assert.equal(ack.networkMemberCount, 1);
+    assert.equal(ack.localMemberCount, 1);
 
     const status = await server.status();
     assert.equal(status.hostCount, 1);
@@ -138,21 +158,25 @@ test('local switch sends member updates when peers leave', async ({ server }) =>
     await b.connect();
 
     const joined = await a.waitForFrame(
-      (candidate) => candidate.type === FrameType.MEMBER_UPDATE
-        && JSON.parse(candidate.payload.toString('utf8')).networkMemberCount === 2,
+      memberUpdatePredicate({ networkMemberCount: 2, localMemberCount: 2 }),
       1000,
       'member join update'
     );
-    assert.equal(JSON.parse(joined.payload.toString('utf8')).networkMemberCount, 2);
+    assert.deepEqual(parseMemberUpdate(joined), {
+      networkMemberCount: 2,
+      localMemberCount: 2
+    });
 
     b.close();
     const left = await a.waitForFrame(
-      (candidate) => candidate.type === FrameType.MEMBER_UPDATE
-        && JSON.parse(candidate.payload.toString('utf8')).networkMemberCount === 1,
+      memberUpdatePredicate({ networkMemberCount: 1, localMemberCount: 1 }),
       1000,
       'member leave update'
     );
-    assert.equal(JSON.parse(left.payload.toString('utf8')).networkMemberCount, 1);
+    assert.deepEqual(parseMemberUpdate(left), {
+      networkMemberCount: 1,
+      localMemberCount: 1
+    });
   } finally {
     await closeAll([a, b]);
   }
@@ -172,20 +196,21 @@ test('local switch removes silent peers on local keepalive timeout', async ({ se
     await b.connect();
 
     await a.waitForFrame(
-      (candidate) => candidate.type === FrameType.MEMBER_UPDATE
-        && JSON.parse(candidate.payload.toString('utf8')).networkMemberCount === 2,
+      memberUpdatePredicate({ networkMemberCount: 2, localMemberCount: 2 }),
       1000,
       'member join update'
     );
 
     await b.waitForClose(1500);
     const left = await a.waitForFrame(
-      (candidate) => candidate.type === FrameType.MEMBER_UPDATE
-        && JSON.parse(candidate.payload.toString('utf8')).networkMemberCount === 1,
+      memberUpdatePredicate({ networkMemberCount: 1, localMemberCount: 1 }),
       1500,
       'keepalive member leave update'
     );
-    assert.equal(JSON.parse(left.payload.toString('utf8')).networkMemberCount, 1);
+    assert.deepEqual(parseMemberUpdate(left), {
+      networkMemberCount: 1,
+      localMemberCount: 1
+    });
   } finally {
     await closeAll([a, b]);
   }
@@ -206,6 +231,75 @@ test('local switch and mTLS clients share the same fabric', async ({ server, cer
     assert.deepEqual((await remote.waitForData()).payload, frame);
   } finally {
     await closeAll([local, remote]);
+  }
+});
+
+test('local member count ignores WebSwitch-only peers', async ({ server, certs }) => {
+  const net = networkName('local-count-web-peer');
+  const local = localClient(server, { name: 'count-local', networkIdentifier: net });
+  const remote = client(server, certs, 'hostA', { name: 'count-tls', networkIdentifier: net });
+
+  try {
+    const ack = await local.connect();
+    assert.equal(ack.networkMemberCount, 1);
+    assert.equal(ack.localMemberCount, 1);
+
+    await remote.connect();
+    const update = await local.waitForFrame(
+      memberUpdatePredicate({ networkMemberCount: 2, localMemberCount: 1 }),
+      1000,
+      'local count update for web-only peer'
+    );
+    assert.deepEqual(parseMemberUpdate(update), {
+      networkMemberCount: 2,
+      localMemberCount: 1
+    });
+  } finally {
+    await closeAll([local, remote]);
+  }
+});
+
+test('local member count drops when local interface leaves but host stays on mTLS', async ({ server, certs }) => {
+  const net = networkName('local-count-interface-leave');
+  const remoteNodeID = '44444444-4444-4444-8444-444444444444';
+  const local = localClient(server, { name: 'interface-local-a', networkIdentifier: net });
+  const remoteLocal = localClient(server, {
+    name: 'interface-local-b',
+    networkIdentifier: net,
+    nodeID: remoteNodeID,
+    interfaceName: 'local'
+  });
+  const remoteTls = client(server, certs, 'hostA', {
+    name: 'interface-tls-b',
+    networkIdentifier: net,
+    nodeID: remoteNodeID,
+    interfaceName: 'web'
+  });
+
+  try {
+    await local.connect();
+    await remoteLocal.connect();
+
+    await local.waitForFrame(
+      memberUpdatePredicate({ networkMemberCount: 2, localMemberCount: 2 }),
+      1000,
+      'local peer join update'
+    );
+
+    await remoteTls.connect();
+    remoteLocal.close();
+
+    const update = await local.waitForFrame(
+      memberUpdatePredicate({ networkMemberCount: 2, localMemberCount: 1 }),
+      1000,
+      'local interface leave update'
+    );
+    assert.deepEqual(parseMemberUpdate(update), {
+      networkMemberCount: 2,
+      localMemberCount: 1
+    });
+  } finally {
+    await closeAll([local, remoteLocal, remoteTls]);
   }
 });
 

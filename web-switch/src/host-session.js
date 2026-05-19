@@ -29,6 +29,16 @@ class HostSession {
     return this.connections.size;
   }
 
+  hasConnectionKind(kind) {
+    for (const connection of this.connections.values()) {
+      if ((connection.identity?.kind ?? 'tls') === kind) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   canAddInterface(interfaceName) {
     return this.connections.has(interfaceName)
       || this.connections.size < this.maxConnectionsPerHost;
@@ -120,8 +130,8 @@ class HostSession {
     }
   }
 
-  sendMemberUpdate(networkMemberCount) {
-    const encoded = encodeJsonFrame(FrameType.MEMBER_UPDATE, { networkMemberCount });
+  sendMemberUpdate(payload) {
+    const encoded = encodeJsonFrame(FrameType.MEMBER_UPDATE, payload);
     for (const connection of this.connections.values()) {
       connection.writeEncodedFrame(encoded);
     }

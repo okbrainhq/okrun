@@ -444,6 +444,7 @@ private struct SwitchInitAckPayload: Codable {
     var keepaliveIntervalMs: Int?
     var keepaliveTimeoutMs: Int?
     var networkMemberCount: Int?
+    var localMemberCount: Int?
 }
 
 private struct SwitchErrorPayload: Codable {
@@ -457,6 +458,7 @@ private struct SwitchResetSeqPayload: Codable {
 
 private struct SwitchMemberUpdatePayload: Codable {
     var networkMemberCount: Int
+    var localMemberCount: Int?
 }
 
 private enum SwitchDebug {
@@ -610,7 +612,8 @@ private final class VirtualSwitchSocket {
 private final class RealSwitchSocket {
     private static let initialReconnectDelay: TimeInterval = 0.5
     private static let maxReconnectDelay: TimeInterval = 3
-    private static let connectionTimeout: TimeInterval = 25
+    private static let webConnectionTimeout: TimeInterval = 25
+    private static let localConnectionTimeout: TimeInterval = 3
     private static let initResponseTimeout: TimeInterval = 10
     private static let defaultLocalKeepaliveInterval: TimeInterval = 0.5
     private static let defaultLocalKeepaliveTimeout: TimeInterval = 1.5
@@ -1016,7 +1019,7 @@ private final class RealSwitchSocket {
                 report(
                     .connected,
                     "Connected to \(endpoint.description).",
-                    connections: max(1, ack.networkMemberCount ?? 1),
+                    connections: memberCount(network: ack.networkMemberCount, local: ack.localMemberCount),
                     error: nil
                 )
             } catch {
@@ -1065,7 +1068,7 @@ private final class RealSwitchSocket {
             report(
                 .connected,
                 "Connected to \(endpoint.description).",
-                connections: max(1, update.networkMemberCount),
+                connections: memberCount(network: update.networkMemberCount, local: update.localMemberCount),
                 error: nil
             )
         }
@@ -1143,6 +1146,7 @@ private final class RealSwitchSocket {
 
     private func scheduleConnectionTimeout(for connection: NWConnection) {
         cancelConnectionTimeout()
+        let timeout = connectionTimeout
         let workItem = DispatchWorkItem { [weak self, weak connection] in
             guard let self,
                   let connection,
@@ -1150,17 +1154,17 @@ private final class RealSwitchSocket {
                   connection === self.connection,
                   !self.initialized else { return }
             AppLog.webSwitch.warning(
-                "connection timeout network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) timeoutSeconds=\(Int(Self.connectionTimeout), privacy: .public)"
+                "connection timeout network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) timeoutSeconds=\(Int(timeout), privacy: .public)"
             )
             self.closeConnection(
                 connection,
-                message: "Switch connection timed out after \(Int(Self.connectionTimeout))s.",
+                message: "Switch connection timed out after \(Int(timeout))s.",
                 error: "Switch connection timed out.",
                 retry: true
             )
         }
         connectionTimeoutWorkItem = workItem
-        queue.asyncAfter(deadline: .now() + Self.connectionTimeout, execute: workItem)
+        queue.asyncAfter(deadline: .now() + timeout, execute: workItem)
     }
 
     private func cancelConnectionTimeout() {
@@ -1248,6 +1252,24 @@ private final class RealSwitchSocket {
     private static func seconds(fromMilliseconds milliseconds: Int?, fallback: TimeInterval) -> TimeInterval {
         guard let milliseconds, milliseconds > 0 else { return fallback }
         return TimeInterval(milliseconds) / 1000
+    }
+
+    private var connectionTimeout: TimeInterval {
+        switch config.security {
+        case .none:
+            return Self.localConnectionTimeout
+        case .tls:
+            return Self.webConnectionTimeout
+        }
+    }
+
+    private func memberCount(network: Int?, local: Int?) -> Int {
+        switch config.security {
+        case .none:
+            return max(1, local ?? network ?? 1)
+        case .tls:
+            return max(1, network ?? 1)
+        }
     }
 
     private func closeConnection(
@@ -1428,7 +1450,6 @@ final class PrivateNetworkSwitchTransport {
     private var runtimes: [WeakRuntime] = []
     private var localMACs = Set<EthernetAddress>()
     private var status: PrivateNetworkSwitchStatus
-    private var hasReceivedRemoteFrame = false
 
     convenience init(
         identifier: String,
@@ -1500,16 +1521,12 @@ final class PrivateNetworkSwitchTransport {
 
         client.onFrame = { [weak self] frame in
             self?.queue.async {
-                self?.hasReceivedRemoteFrame = true
                 self?.injectFrameToLocalGuests(frame)
             }
         }
         client.onStatusChange = { [weak self] state, message, activeConnections, error in
             self?.queue.async {
                 guard let self else { return }
-                if state != .connected || activeConnections <= 1 {
-                    self.hasReceivedRemoteFrame = false
-                }
                 self.status = PrivateNetworkSwitchStatus(
                     identifier: self.identifier,
                     server: self.config.server,
@@ -1575,8 +1592,7 @@ final class PrivateNetworkSwitchTransport {
             case .allowConnecting:
                 return status.state == .connecting || status.state == .connected
             case .connectedOnly:
-                return status.state == .connected
-                    && (status.activeConnections > 1 || hasReceivedRemoteFrame)
+                return status.state == .connected && status.activeConnections > 1
             }
         }
     }

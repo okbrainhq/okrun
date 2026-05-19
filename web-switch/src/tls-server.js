@@ -380,7 +380,8 @@ class SwitchConnection {
       maxConnectionsPerHost: this.fabric.maxConnectionsPerHost,
       keepaliveIntervalMs: this.options.keepaliveIntervalMs,
       keepaliveTimeoutMs: this.options.keepaliveTimeoutMs,
-      networkMemberCount: result.networkMemberCount
+      networkMemberCount: result.memberCounts.networkMemberCount,
+      localMemberCount: result.memberCounts.localMemberCount
     }));
 
     this.log('connect', {
