@@ -1,0 +1,13 @@
+# Required
+REPO_URL=https://github.com/okbrainhq/okrun.git
+
+# Optional
+DEPLOY_HOST=arun@macbook.local
+SSH_PORT=22
+LOCAL_PORT=9444
+STATUS_PORT=8080
+HOST=127.0.0.1
+APP_DIR=~/okrun-switch
+
+# Optional custom Node.js path
+# OKRUN_SWITCH_NODE_PATH=/opt/homebrew/bin/node

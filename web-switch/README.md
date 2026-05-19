@@ -149,6 +149,47 @@ The setup installs Node.js, clones/updates the repo under
 to allow only SSH plus the switch mTLS port. The status HTTP port is for local
 health checks and SSH access; it is not opened in the firewall.
 
+## Deploying a Local Switch to a Mac
+
+For a trusted local network, deploy a non-TLS `okrun-switch` as a macOS
+LaunchAgent. Create the deploy config:
+
+```bash
+cp .deploy.local.example .deploy.local
+```
+
+Edit `.deploy.local` with the Mac SSH target, repo URL, and listener ports:
+
+```
+REPO_URL=https://github.com/okbrainhq/okrun.git
+DEPLOY_HOST=arun@macbook.local
+LOCAL_PORT=9444
+STATUS_PORT=8080
+HOST=127.0.0.1
+```
+
+Deploy:
+
+```bash
+./scripts/deploy/setup-local.sh
+```
+
+Or pass the host on the command line:
+
+```bash
+./scripts/deploy/setup-local.sh arun@macbook.local
+```
+
+The setup installs Node.js to `~/.local`, clones/updates the repo under
+`~/okrun-switch`, and runs the local switch as a LaunchAgent. It listens on a
+plain TCP port (no mTLS), so it should only be used on a trusted LAN.
+
+Later code updates can be redeployed the same way:
+
+```bash
+./scripts/deploy/setup-local.sh
+```
+
 ## Revoking A Host
 
 ```bash
