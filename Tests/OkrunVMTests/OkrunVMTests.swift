@@ -625,6 +625,48 @@ struct OkrunVMTests {
     }
 
     @Test
+    func dhcpLeaseAllocatorCoordinatesConcurrentInstances() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let config = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.80",
+            leaseSeconds: 3600
+        )
+        let store = DHCPLeaseStore(stateDirectory: root)
+        let allocationCount = 32
+        var leases = Array<DHCPLease?>(repeating: nil, count: allocationCount)
+        var failures: [any Error] = []
+        let resultLock = NSLock()
+
+        DispatchQueue.concurrentPerform(iterations: allocationCount) { index in
+            do {
+                let allocator = try DHCPLeaseAllocator(config: config, store: store)
+                let lease = try allocator.lease(for: "client-\(index)", requestedIP: nil)
+                resultLock.lock()
+                leases[index] = lease
+                resultLock.unlock()
+            } catch {
+                resultLock.lock()
+                failures.append(error)
+                resultLock.unlock()
+            }
+        }
+
+        if let failure = failures.first {
+            throw failure
+        }
+
+        let addresses = leases.compactMap { $0?.ipAddress }
+        #expect(addresses.count == allocationCount)
+        #expect(Set(addresses).count == allocationCount)
+        #expect(try store.load().count == allocationCount)
+    }
+
+    @Test
     func dhcpLeaseAllocatorRejectsConflictsAndReservesDeclines() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
@@ -649,6 +691,39 @@ struct OkrunVMTests {
         let expectedReplacement = try IPv4Address("10.77.0.21")
 
         #expect(replacement.ipAddress == expectedReplacement)
+    }
+
+    @Test
+    func dhcpLeaseIdentityUsesHardwareAddressForClonedGuests() throws {
+        let sharedClientIdentifier = Data([1, 2, 3, 4])
+        let first = DHCPMessage(
+            messageType: .discover,
+            transactionID: 1,
+            flags: 0x8000,
+            clientHardwareAddress: EthernetAddress([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01]),
+            clientIPAddress: IPv4Address(value: 0),
+            yourIPAddress: IPv4Address(value: 0),
+            requestedIPAddress: nil,
+            serverIdentifier: nil,
+            clientIdentifier: sharedClientIdentifier,
+            options: []
+        )
+        let second = DHCPMessage(
+            messageType: .discover,
+            transactionID: 2,
+            flags: 0x8000,
+            clientHardwareAddress: EthernetAddress([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x02]),
+            clientIPAddress: IPv4Address(value: 0),
+            yourIPAddress: IPv4Address(value: 0),
+            requestedIPAddress: nil,
+            serverIdentifier: nil,
+            clientIdentifier: sharedClientIdentifier,
+            options: []
+        )
+
+        #expect(first.identity == "mac:02:aa:bb:cc:dd:01")
+        #expect(second.identity == "mac:02:aa:bb:cc:dd:02")
+        #expect(first.identity != second.identity)
     }
 
     @Test

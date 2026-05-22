@@ -286,6 +286,8 @@ final class DHCPLeaseStore {
         var leases: [DHCPLease]
     }
 
+    private static let processLock = NSLock()
+
     private let url: URL
     private let lockURL: URL
 
@@ -329,6 +331,9 @@ final class DHCPLeaseStore {
     }
 
     private func withFileLock<T>(_ body: () throws -> T) throws -> T {
+        Self.processLock.lock()
+        defer { Self.processLock.unlock() }
+
         try FileManager.default.createDirectory(at: lockURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let descriptor = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else {
@@ -668,10 +673,7 @@ struct DHCPMessage {
     }
 
     var identity: String {
-        if let clientIdentifier, !clientIdentifier.isEmpty {
-            return clientIdentifier.map { String(format: "%02x", $0) }.joined()
-        }
-        return clientHardwareAddress.description
+        "mac:\(clientHardwareAddress.description)"
     }
 
     static func parse(fromEthernetFrame frame: Data) -> DHCPMessage? {
