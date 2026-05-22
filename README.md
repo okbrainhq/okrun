@@ -223,11 +223,12 @@ When both are configured, Okrun routes private-network frames through Local
 Switch while it is connected and automatically falls back to Web Switch until
 the Local Switch connection returns.
 
-If a guest already has an Okrun-managed static private-network file, the default
-installer run leaves it unchanged. Pass `--private-dhcp` to replace that
-Okrun-managed static file with DHCP:
+DHCP is the default for the private-network interface. If a guest already has
+an Okrun-managed static private-network file, the default installer run replaces
+that file with DHCP. `--private-dhcp` is accepted when you want to be explicit:
 
 ```sh
+./scripts/install-guest-tools.sh <hostname-or-ip>
 ./scripts/install-guest-tools.sh --private-dhcp <hostname-or-ip>
 ./scripts/install-guest-tools.sh --private-dhcp --private-iface enp0s2 <hostname-or-ip>
 ```

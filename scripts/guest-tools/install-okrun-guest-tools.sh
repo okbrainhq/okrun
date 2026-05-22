@@ -31,8 +31,8 @@ Usage: sudo install-okrun-guest-tools.sh [options]
 Installs generic Okrun guest support inside a Linux VM.
 
 Options:
-  --private-dhcp           Configure the private-network interface with DHCP, replacing
-                           an existing Okrun-managed static private config.
+  --private-dhcp           Configure the private-network interface with DHCP. This is
+                           the default when --private-ip is not supplied.
   --private-ip CIDR        Persist a private-network address, for example 10.77.0.3/24.
   --private-iface IFACE    Interface for private networking. Defaults to auto-detect.
   --no-virtiofs-mount      Do not install the /mnt/okrun VirtioFS mount unit.
@@ -350,17 +350,52 @@ detect_private_iface() {
     fi
   fi
 
-  local candidate
-  candidate="$(
+  local ifaces iface_count default_ifaces candidate
+  ifaces="$(
     ip -o link show 2>/dev/null |
-      awk -F': ' '$2 != "lo" { print $2 }' |
+      awk -F': ' '$2 != "lo" { sub(/@.*/, "", $2); print $2 }'
+  )"
+  iface_count="$(printf '%s\n' "$ifaces" | awk 'NF { count++ } END { print count + 0 }')"
+  if [[ "$iface_count" -lt 2 ]]; then
+    printf '\n'
+    return
+  fi
+
+  default_ifaces="$(
+    ip -4 route show default 2>/dev/null |
+      awk '{ for (i = 1; i <= NF; i++) if ($i == "dev" && i < NF) print $(i + 1) }'
+  )"
+
+  candidate="$(
+    printf '%s\n' "$ifaces" |
       while IFS= read -r iface; do
+        [[ -n "$iface" ]] || continue
+        if [[ -n "$default_ifaces" ]] && printf '%s\n' "$default_ifaces" | grep -Fxq "$iface"; then
+          continue
+        fi
         if ! ip -4 -o addr show dev "$iface" 2>/dev/null | grep -q 'inet '; then
           printf '%s\n' "$iface"
           break
         fi
       done
   )"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return
+  fi
+
+  if [[ -n "$default_ifaces" ]]; then
+    candidate="$(
+      printf '%s\n' "$ifaces" |
+        while IFS= read -r iface; do
+          [[ -n "$iface" ]] || continue
+          if ! printf '%s\n' "$default_ifaces" | grep -Fxq "$iface"; then
+            printf '%s\n' "$iface"
+            break
+          fi
+        done
+    )"
+  fi
 
   printf '%s\n' "$candidate"
 }
@@ -382,12 +417,6 @@ private_network_config_exists() {
 
 private_managed_network_config() {
   guest_path /etc/systemd/network/20-okrun-private.network
-}
-
-private_managed_network_config_exists() {
-  local config_file
-  config_file="$(private_managed_network_config)"
-  [[ -f "$config_file" ]] && grep -qs '^# Managed by Okrun guest tools\.$' "$config_file"
 }
 
 private_managed_network_config_is_dhcp() {
@@ -444,8 +473,6 @@ else
     echo "No Okrun private network interface detected; leaving network config unchanged. Enable privateNetwork for this VM, reboot it, then rerun this installer."
   elif private_managed_network_config_is_dhcp; then
     echo "Okrun DHCP private network config already exists; leaving it unchanged."
-  elif private_managed_network_config_exists && [[ "$PRIVATE_DHCP_EXPLICIT" != "1" ]]; then
-    echo "Okrun static private network config already exists; leaving it unchanged. Rerun with --private-dhcp to replace it with DHCP."
   else
     install_private_network_dhcp_config "$private_iface"
     installed_private_network_config="1"

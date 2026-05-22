@@ -25,8 +25,8 @@ Options:
   --user USER              SSH user. Defaults to current local user or OKRUN_GUEST_USER.
   --port PORT              SSH port. Defaults to 22 or OKRUN_GUEST_PORT.
   --identity PATH          SSH identity file. Defaults to OKRUN_GUEST_IDENTITY.
-  --private-dhcp           Configure the private-network interface with DHCP, replacing
-                           an existing Okrun-managed static private config.
+  --private-dhcp           Configure the private-network interface with DHCP. This is
+                           the default when --private-ip is not supplied.
   --private-ip CIDR        Persist a private-network address, for example 10.77.0.3/24.
   --private-iface IFACE    Interface for private networking. Defaults to auto-detect in the guest.
   --no-virtiofs-mount      Do not install the /mnt/okrun VirtioFS mount unit.
@@ -37,7 +37,7 @@ Options:
 
 Examples:
   scripts/install-guest-tools.sh 192.168.64.16
-  scripts/install-guest-tools.sh --user arunoda --private-dhcp devbox-sandbox.local
+  scripts/install-guest-tools.sh --user arunoda devbox-sandbox.local
   scripts/install-guest-tools.sh --user arunoda --private-ip 10.77.0.3/24 devbox-sandbox.local
 EOF
 }
@@ -139,7 +139,7 @@ fi
 if [[ "$RESIZE_ROOT" == "1" ]]; then
   INSTALL_ARGS+=(--resize-root)
 fi
-if [[ "$PRIVATE_DHCP_EXPLICIT" == "1" ]]; then
+if [[ -z "$PRIVATE_IP_CIDR" || "$PRIVATE_DHCP_EXPLICIT" == "1" ]]; then
   INSTALL_ARGS+=(--private-dhcp)
 fi
 if [[ -n "$PRIVATE_IP_CIDR" ]]; then

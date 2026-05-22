@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/okrun-guest-tools-e2e.XXXXXX")"
 BIN_DIR="$WORK_DIR/bin"
 LOG_FILE="$WORK_DIR/commands.log"
+DEFAULT_LOG_FILE="$WORK_DIR/default-commands.log"
 
 cleanup() {
   rm -rf "$WORK_DIR"
@@ -76,6 +77,25 @@ fi
 if ! grep -q 'sudo.*install-okrun-guest-tools.sh.*--health-interval.*5.*--log-share.*okrun-guest-logs.*--resize-root.*--private-dhcp.*--private-ip.*10.77.0.9/24.*--private-iface.*auto' "$LOG_FILE"; then
   echo "Expected remote install command was not recorded." >&2
   cat "$LOG_FILE" >&2
+  exit 1
+fi
+
+run_step "Record default remote guest tools install command" \
+  env OKRUN_E2E_LOG="$DEFAULT_LOG_FILE" PATH="$BIN_DIR:$PATH" "$ROOT/scripts/install-guest-tools.sh" \
+  --user tester \
+  --port 2222 \
+  --identity "$WORK_DIR/id_ed25519" \
+  example-default.test
+
+if ! grep -q 'sudo.*install-okrun-guest-tools.sh.*--health-interval.*60.*--log-share.*okrun-guest-logs.*--private-dhcp' "$DEFAULT_LOG_FILE"; then
+  echo "Expected default remote install command to request DHCP." >&2
+  cat "$DEFAULT_LOG_FILE" >&2
+  exit 1
+fi
+
+if grep -q -- '--private-ip' "$DEFAULT_LOG_FILE"; then
+  echo "Default remote install command should not request a static private IP." >&2
+  cat "$DEFAULT_LOG_FILE" >&2
   exit 1
 fi
 
@@ -167,17 +187,27 @@ Name=enp0s2
 Address=10.77.0.55/24
 EOF
 
-run_step "Preserve existing static private config by default" \
+run_step "Replace existing static private config with DHCP by default" \
   env OKRUN_GUEST_ROOT="$STATIC_TO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --health-interval 7
 
-assert_file_contains "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.55/24"
-if grep -q "DHCP=ipv4" "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network"; then
-  echo "Default installer run should preserve existing Okrun-managed static private config." >&2
+assert_file_contains "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "DHCP=ipv4"
+assert_file_contains "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "UseRoutes=false"
+if grep -q "^Address=" "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network"; then
+  echo "Default installer run should replace an existing Okrun-managed static private config with DHCP." >&2
   exit 1
 fi
 
-run_step "Replace static private config with DHCP" \
+cat >"$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" <<'EOF'
+# Managed by Okrun guest tools.
+[Match]
+Name=enp0s2
+
+[Network]
+Address=10.77.0.55/24
+EOF
+
+run_step "Accept explicit DHCP option" \
   env OKRUN_GUEST_ROOT="$STATIC_TO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
   --private-dhcp \
   --health-interval 7
@@ -226,18 +256,35 @@ fi
 cat >"$BIN_DIR/ip" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+scenario="${OKRUN_FAKE_IP_SCENARIO:-nat-only}"
 if [[ "$*" == "-o link show" ]]; then
   printf '1: lo: <LOOPBACK,UP> mtu 65536\n'
   printf '2: enp0s1: <BROADCAST,MULTICAST,UP> mtu 1500\n'
+  if [[ "$scenario" == "private-with-dhcp-lease" ]]; then
+    printf '3: enp0s2: <BROADCAST,MULTICAST,UP> mtu 1500\n'
+  fi
 elif [[ "$*" == "-4 -o addr show dev enp0s1" ]]; then
   printf '2: enp0s1 inet 192.168.64.16/24 brd 192.168.64.255 scope global enp0s1\n'
+elif [[ "$*" == "-4 -o addr show dev enp0s2" && "$scenario" == "private-with-dhcp-lease" ]]; then
+  printf '3: enp0s2 inet 10.77.0.20/24 brd 10.77.0.255 scope global enp0s2\n'
 elif [[ "$*" == "-4 -o addr show dev lo" ]]; then
   printf '1: lo inet 127.0.0.1/8 scope host lo\n'
+elif [[ "$*" == "-4 route show default" ]]; then
+  printf 'default via 192.168.64.1 dev enp0s1 proto dhcp src 192.168.64.16 metric 100\n'
 elif [[ "$1" == "link" && "$2" == "show" && "$3" == "dev" ]]; then
   printf '2: %s: <BROADCAST,MULTICAST,UP> mtu 1500\n' "$4"
 fi
 EOF
 chmod +x "$BIN_DIR/ip"
+
+AUTO_DHCP_ROOT="$WORK_DIR/auto-dhcp-root"
+mkdir -p "$AUTO_DHCP_ROOT/mnt/okrun/okrun-guest-logs"
+run_step "Auto-detect private interface with existing DHCP lease" \
+  env PATH="$BIN_DIR:$PATH" OKRUN_FAKE_IP_SCENARIO=private-with-dhcp-lease OKRUN_GUEST_ROOT="$AUTO_DHCP_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+  --health-interval 11
+
+assert_file_contains "$AUTO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "Name=enp0s2"
+assert_file_contains "$AUTO_DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "DHCP=ipv4"
 
 NO_PRIVATE_ROOT="$WORK_DIR/no-private-root"
 mkdir -p "$NO_PRIVATE_ROOT/mnt/okrun/okrun-guest-logs"
