@@ -130,6 +130,29 @@ automatically.
 best durability; `fsync` and especially `none` can improve disk-heavy throwaway
 workloads at the cost of weaker crash and power-loss safety.
 
+## Imported VM Bootstrap
+
+After importing an Ubuntu VM for the first time, use the interactive bootstrap
+helper to turn the generic imported guest into a unique, SSH-ready VM:
+
+```sh
+./scripts/bootstrap-imported-vm.sh <hostname-or-ip>
+```
+
+The helper is intended for imported Ubuntu guests that are reachable over SSH
+with the default `user` / `password` login. It asks for the new Linux username,
+hostname, and SSH public key first, prints the full plan, and only then connects
+to the VM.
+
+On the guest, it runs `apt-get update` and `apt-get upgrade`, creates or updates
+the selected login user, installs the selected SSH key, enables passwordless
+sudo for that user, regenerates cloned machine identity, DHCP lease state, and
+SSH host keys, changes the hostname, disables SSH password authentication, and
+reboots the VM.
+
+After the reboot, log in with the new user and hostname, then install the Okrun
+guest tools if needed.
+
 ## Guest Tools
 
 After installing Linux and enabling SSH inside any Okrun VM, install the generic
