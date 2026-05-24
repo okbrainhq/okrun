@@ -1,90 +1,70 @@
 # Okrun VM
 
-Small native macOS Virtualization.framework app for running Linux projects.
+Okrun VM is a small native macOS app for running Linux VMs with
+Virtualization.framework. The app is organized around VM projects: each project
+is a folder with its own config, disk, EFI store, and machine identity.
 
-## Build
+## Clone & Build It
+
+Install Xcode Command Line Tools first if Swift is not already available:
 
 ```sh
+xcode-select --install
+```
+
+Then clone and build the app:
+
+```sh
+git clone https://github.com/okbrainhq/okrun.git
+cd okrun
 ./scripts/build.sh
 ```
 
-## Run
+The build script creates `OkrunVM.app`, copies the app resources, and ad-hoc
+signs the bundle with the virtualization entitlement needed for local use.
+
+Okrun runs on macOS 13 or later. New ASIF disks and ASIF imports require macOS
+26 Tahoe or later; older hosts use RAW disks.
+
+## Run It
 
 ```sh
 ./scripts/run.sh
 ```
 
-## Test
+`run.sh` builds the app if needed and opens `OkrunVM.app`.
 
-Run fast unit and integration-style tests:
+Okrun remembers known VM projects in `~/.okrun/registry.json`. The sidebar shows
+one tab per VM project. Use the plus button for a new VM, the import button for
+an ASIF import, and the network button for private network settings.
 
-```sh
-swift test
-```
+## Create a New VM
 
-Run the real headless VM boot E2E:
+1. Click **New VM**.
+2. Choose a VM folder. This folder becomes the Okrun project.
+3. Choose a Linux installer ISO. On Apple silicon, use an arm64/aarch64 ISO.
+4. Pick CPU, memory, disk size, and disk format.
+5. Click **Create**.
+6. Click **Boot Installer** and install Linux to the virtual disk.
+7. Shut Linux down cleanly.
+8. Click **Start** for normal installed boots.
 
-```sh
-./scripts/e2e-headless-boot.sh
-```
+After installation, log in to Linux through the Okrun VM display. You need the
+VM's network name or IP address before you can SSH in or install guest tools.
 
-The E2E script downloads Alpine Linux aarch64 netboot artifacts into `.e2e/`,
-builds a tiny initramfs that prints `OKRUN_E2E_BOOTED`, builds the signed app,
-and boots that Linux image with Virtualization.framework headlessly.
-
-Run the critical GUI smoke suite without booting a VM:
-
-```sh
-./scripts/ui-test.sh
-```
-
-This builds the app, launches it with an isolated registry at
-`.e2e/ui-add-delete`, drives the Add VM, validation, multi-VM selection,
-private network config, settings, delete, and fake running shutdown flows with
-macOS Accessibility automation, and saves screenshots under
-`.e2e/ui-add-delete/screenshots`. If macOS blocks the script, allow the current
-terminal or Codex app in System Settings > Privacy & Security > Accessibility
-and rerun it.
-
-## Projects
-
-An Okrun project is a directory that owns one VM:
-
-- `okrun-vm.json` is the project config.
-- `vm/linux.raw` or `vm/linux.asif` is the sparse virtual disk.
-- `vm/efi.variables` is the EFI variable store.
-- `vm/machine.identifier` is the stable Virtualization.framework machine ID.
-
-Keep the project on a local volume with plenty of free space. The virtual disk is
-sparse, so the Mac may allocate much less than the guest-visible disk size at
-first, but guest writes still need real host space later.
-
-Known projects are stored in:
+The project folder will look like this:
 
 ```text
-~/.okrun
+my-vm/
+  okrun-vm.json
+  vm/
+    linux.asif        # or linux.raw
+    efi.variables
+    machine.identifier
 ```
 
-One app instance can keep multiple VM projects in tabs. Use the project selector
-to choose an existing project, **New** to create a project, and **Delete** to
-remove the selected project. Delete shows a destructive confirmation and removes
-the entire project folder.
-
-## Safe Shutdown
-
-Use the Okrun **Shutdown** control or shut down from inside Linux. Okrun asks the
-guest to power off and waits for the guest-stopped callback before closing after
-Quit or window close.
-
-Avoid force quitting Okrun or force-stopping the VM while Linux is writing to the
-disk. Force stop is only for a stuck VM; it is equivalent to cutting power to a
-machine and can leave the ext4 filesystem needing repair.
-
-If Linux reports `EXT4-fs error` or `iget: checksum invalid`, stop the VM and run
-`e2fsck` from a rescue environment or installer shell against the unmounted root
-filesystem before booting it for normal use again.
-
-## Config
+`okrun-vm.json` is the file to edit for VM resources, startup behavior, shared
+folders, and per-VM private networking:
 
 ```json
 {
@@ -92,18 +72,104 @@ filesystem before booting it for normal use again.
   "memoryGB": 4,
   "diskGB": 64,
   "diskFormat": "asif",
-  "diskIO": {
-    "caching": "cached",
-    "synchronization": "full"
-  },
   "installerISOPath": "/path/to/linux.iso",
   "privateNetwork": {
     "enabled": true
   },
+  "sharedDirectories": [],
+  "diskIO": {
+    "caching": "cached",
+    "synchronization": "full"
+  },
   "startup": {
     "startOnAppLaunch": false,
     "mode": "installed"
-  },
+  }
+}
+```
+
+Use **VM > Edit VM Config** to open the selected VM's config. Stop the VM before
+changing config that affects devices, disks, or shared directories.
+
+## Find the VM IP
+
+Option 1: log in through the Okrun GUI and print the IP addresses:
+
+```sh
+ip -br addr
+hostname -I
+```
+
+Look for the NAT address, usually `192.168.64.x`. Use that from your Mac:
+
+```sh
+ssh <linux-user>@192.168.64.x
+```
+
+Option 2: log in through the Okrun GUI and install Avahi for `.local` hostnames
+on Debian/Ubuntu guests:
+
+```sh
+sudo apt update
+sudo apt install -y avahi-daemon avahi-utils
+sudo systemctl enable --now avahi-daemon
+hostnamectl
+```
+
+Then use the VM hostname from your Mac:
+
+```sh
+ssh <linux-user>@<hostname>.local
+```
+
+## Install Guest Tools
+
+After Linux is installed and SSH is enabled inside the VM, install the guest
+tools from your Mac:
+
+```sh
+./scripts/install-guest-tools.sh --user <linux-user> <hostname-or-ip>
+```
+
+Examples:
+
+```sh
+./scripts/install-guest-tools.sh --user ubuntu 192.168.64.16
+./scripts/install-guest-tools.sh --user arunoda --port 22 devbox.local
+./scripts/install-guest-tools.sh --user ubuntu --identity ~/.ssh/id_ed25519 192.168.64.16
+```
+
+Fully stop and restart the VM once before running the installer so the managed
+guest log share is present.
+
+The installer copies scripts over SSH and installs:
+
+- `okrun-guest-health.service` for periodic guest health logs.
+- `okrun-guest-diagnose` for one-shot guest diagnostics.
+- `/mnt/okrun` VirtioFS mount support.
+- DHCP setup for the Okrun private network interface.
+
+Guest health logs are written to the Mac side at `vm/guest-logs` and exposed to
+Linux as `/mnt/okrun/okrun-guest-logs`. Check them inside the VM with:
+
+```sh
+tail -f /mnt/okrun/okrun-guest-logs/guest-health.log
+sudo okrun-guest-diagnose
+systemctl status okrun-guest-health.service
+```
+
+To grow the guest filesystem after increasing `diskGB`, run:
+
+```sh
+./scripts/install-guest-tools.sh --user <linux-user> --resize-root <hostname-or-ip>
+```
+
+## Shared Folders
+
+Add shared folders to `okrun-vm.json`:
+
+```json
+{
   "sharedDirectories": [
     {
       "name": "projects",
@@ -119,186 +185,30 @@ filesystem before booting it for normal use again.
 }
 ```
 
-`diskFormat` accepts `raw` or `asif`. ASIF uses Apple Sparse Image Format and is
-used by default for new projects on macOS 26 Tahoe or later. Older hosts and
-legacy configs use `raw`. Existing disks are never converted automatically; if a
-project already has `vm/linux.raw`, keep `diskFormat` as `raw`, and if it has
-`vm/linux.asif`, keep `diskFormat` as `asif`.
-
-Increasing `diskGB` expands the virtual disk. Existing disks are not shrunk
-automatically.
-
-`diskIO.caching` accepts `automatic`, `cached`, or `uncached`. Okrun defaults to
-`cached` for the writable Linux disk, matching Tart's Linux disk default.
-`diskIO.synchronization` accepts `full`, `fsync`, or `none`. Keep `full` for the
-best durability; `fsync` and especially `none` can improve disk-heavy throwaway
-workloads at the cost of weaker crash and power-loss safety.
-
-Set `startup.startOnAppLaunch` to `true` to start that VM automatically when
-Okrun launches. `startup.mode` accepts `installed` or `installer`; installer
-startup uses `installerISOPath` and is skipped if the ISO path is missing.
-
-## Imported VM Bootstrap
-
-After importing an Ubuntu VM for the first time, use the interactive bootstrap
-helper to turn the generic imported guest into a unique, SSH-ready VM:
+Restart the VM after changing shared directories. Inside Linux, mount the Okrun
+VirtioFS share:
 
 ```sh
-./scripts/bootstrap-imported-vm.sh <hostname-or-ip>
+sudo mkdir -p /mnt/okrun
+sudo mount -t virtiofs okrun /mnt/okrun
+ls /mnt/okrun
 ```
 
-The helper is intended for imported Ubuntu guests that are reachable over SSH
-with the default `user` / `password` login. It asks for the new Linux username,
-hostname, and SSH public key first, prints the full plan, and only then connects
-to the VM.
+Each configured folder appears below `/mnt/okrun` by its `name`:
 
-On the guest, it runs `apt-get update` and `apt-get upgrade`, creates or updates
-the selected login user, installs the selected SSH key, enables passwordless
-sudo for that user, regenerates cloned machine identity, DHCP lease state, and
-SSH host keys, changes the hostname, disables SSH password authentication, and
-reboots the VM.
-
-After the reboot, log in with the new user and hostname, then install the Okrun
-guest tools if needed.
-
-## Guest Tools
-
-After installing Linux and enabling SSH inside any Okrun VM, install the generic
-guest tools from the Mac:
-
-```sh
-./scripts/install-guest-tools.sh <hostname-or-ip>
+```text
+/mnt/okrun/projects
+/mnt/okrun/downloads
 ```
 
-Use `--user`, `--port`, or `--identity` for SSH options:
+Guest tools install a systemd mount unit for `/mnt/okrun`. Without guest tools,
+create one manually if you want the share mounted on boot.
 
-```sh
-./scripts/install-guest-tools.sh --user arunoda --port 22 192.168.64.16
-```
+## VM Networking
 
-The installer copies scripts into the guest with `scp`, then uses `sudo` over
-SSH to install:
+Every VM gets a regular NAT interface for internet access.
 
-- `okrun-guest-health.service`, which logs memory, disk, network, swap, mount,
-  and recent kernel alert snapshots to a writable project-mounted share.
-- `okrun-guest-diagnose`, a one-shot guest diagnostic command.
-- `/mnt/okrun` VirtioFS mount support via `mnt-okrun.mount`.
-- DHCP configuration for the Okrun private network interface when one is present.
-
-Guest health logs are intentionally written to the Mac side instead of only the
-guest disk. On every VM start, Okrun creates `vm/guest-logs` inside the project
-if needed and exposes it as a writable `okrun-guest-logs` share under
-`/mnt/okrun`. Any `sharedDirectories` entry with that name is ignored so the
-host-managed log share always wins.
-
-Fully stop and restart the VM before running the installer. If the writable
-`/mnt/okrun/okrun-guest-logs` mount is missing, the guest installer exits with a
-setup error that asks you to restart the VM with an updated Okrun build.
-
-The health log rotates in place at 10 MB and keeps 5 old files by default:
-`guest-health.log`, `guest-health.log.1`, and so on. Override this with
-`OKRUN_LOG_MAX_BYTES` and `OKRUN_LOG_KEEP` in `/etc/okrun/guest-tools.env`.
-
-The private network is enabled by default. When a VM has
-`privateNetwork.enabled` in `okrun-vm.json`, the installer auto-detects the
-private interface and configures it for IPv4 DHCP. The private NIC intentionally
-does not install DNS or routes, so internet access keeps using the NAT
-interface.
-
-Okrun creates host DHCP config automatically the first time a VM starts with the
-`okrun` private network. The generated default is written to
-`~/.okrun/private-networks.json` like this:
-
-```json
-{
-  "version": 1,
-  "privateNetworks": {
-    "okrun": {
-      "dhcp": {
-        "enabled": true,
-        "mode": "range",
-        "cidr": "10.77.0.0/24",
-        "rangeStart": "10.77.0.20",
-        "rangeEnd": "10.77.0.200",
-        "leaseSeconds": 3600
-      }
-    }
-  }
-}
-```
-
-Okrun stores DHCP leases under `~/.okrun/state/private-networks/okrun/`.
-`OKRUN_HOME` can point Okrun at a different state directory, and
-`OKRUN_REGISTRY_PATH` still overrides only the project registry path.
-Set `"enabled": false` for the DHCP config to opt out.
-
-To prefer a no-TLS switch on a trusted LAN and fall back to Web Switch when that
-local listener is unavailable, add a `localSwitch` entry beside the existing
-Web Switch `switch` entry:
-
-```json
-{
-  "version": 1,
-  "privateNetworks": {
-    "okrun": {
-      "localSwitch": {
-        "enabled": true,
-        "server": "192.168.1.20:9444"
-      }
-    }
-  }
-}
-```
-
-When both are configured, Okrun routes private-network frames through Local
-Switch while it is connected and automatically falls back to Web Switch until
-the Local Switch connection returns.
-
-DHCP is the default for the private-network interface. If a guest already has
-an Okrun-managed static private-network file, the default installer run replaces
-that file with DHCP. `--private-dhcp` is accepted when you want to be explicit:
-
-```sh
-./scripts/install-guest-tools.sh <hostname-or-ip>
-./scripts/install-guest-tools.sh --private-dhcp <hostname-or-ip>
-./scripts/install-guest-tools.sh --private-dhcp --private-iface enp0s2 <hostname-or-ip>
-```
-
-For advanced static setups, pass a CIDR address. Static config wins if both
-`--private-ip` and `--private-dhcp` are supplied:
-
-```sh
-./scripts/install-guest-tools.sh --private-ip 10.77.0.3/24 <hostname-or-ip>
-./scripts/install-guest-tools.sh --private-ip 10.77.0.3/24 --private-iface enp0s2 <hostname-or-ip>
-```
-
-To try growing the guest root filesystem after increasing `diskGB`, pass
-`--resize-root`. This uses `growpart` when available and only works when free
-space is adjacent to the root partition:
-
-```sh
-./scripts/install-guest-tools.sh --resize-root <hostname-or-ip>
-```
-
-Inside the guest, inspect logs and state with:
-
-```sh
-tail -f /mnt/okrun/okrun-guest-logs/guest-health.log
-sudo okrun-guest-diagnose
-systemctl status okrun-guest-health.service
-```
-
-## Private VM Network
-
-`privateNetwork` adds a second virtual NIC backed by the `okrun` Ethernet bus.
-Keep the regular NAT NIC for internet access, and use this private NIC for
-VM-to-VM traffic. By default, the bus is local to one Mac. You can optionally
-bridge it to other Macs on the same LAN through `~/.okrun/private-networks.json`.
-
-### Enable the Network
-
-The private network is enabled by default. To be explicit, set this in each VM's
-`okrun-vm.json`:
+Okrun also enables a second private network interface by default:
 
 ```json
 {
@@ -308,20 +218,21 @@ The private network is enabled by default. To be explicit, set this in each VM's
 }
 ```
 
-Set `"enabled": false` to remove the private NIC from a VM. Older configs with a
-`privateNetwork.identifier` field are still accepted, but Okrun now uses the
-single `okrun` network for normal VM config.
+Set `"enabled": false` to remove the private NIC from that VM. Fully stop and
+restart the VM after changing this setting.
 
-Fully stop and restart the VMs after changing the config.
+The private network is named `okrun`. It is meant for VM-to-VM traffic and does
+not install DNS or a default route, so internet access stays on the NAT
+interface.
 
-### Bridge Multiple Hosts
+Host-side private network settings live in:
 
-To extend the `okrun` bus across Macs on the same LAN, add a `bridge` section to
-the global config. `bind` is optional: use it on hosts that should accept
-incoming peers, and use `peers` on hosts that should connect out. Once connected,
-the bridge connection carries traffic both ways.
+```text
+~/.okrun/private-networks.json
+```
 
-Host A, listening on `192.168.1.10:7777`:
+Okrun creates the default DHCP range automatically the first time a private
+network VM starts:
 
 ```json
 {
@@ -335,313 +246,139 @@ Host A, listening on `192.168.1.10:7777`:
         "rangeStart": "10.77.0.20",
         "rangeEnd": "10.77.0.200",
         "leaseSeconds": 3600
-      },
-      "bridge": {
-        "bind": {
-          "host": "192.168.1.10",
-          "port": 7777
-        },
-        "peers": [
-          {
-            "host": "192.168.1.11",
-            "port": 7777
-          }
-        ]
       }
     }
   }
 }
 ```
 
-Host B can either bind on its own IP or omit `bind` and only list Host A in
-`peers`. Local guest traffic still reaches guests on the same Mac directly.
-Okrun forwards local guest frames to connected hosts and injects remote frames
-into local guests, but it does not relay remote frames onward to other hosts.
-
-For a client-only host, omit `bind`:
-
-```json
-{
-  "version": 1,
-  "privateNetworks": {
-    "okrun": {
-      "bridge": {
-        "peers": [
-          {
-            "host": "192.168.1.10",
-            "port": 7777
-          }
-        ]
-      }
-    }
-  }
-}
-```
-
-### Find the Private Interface
-
-Inside each Linux VM, list the network interfaces:
+Inside Linux, guest tools configure the private NIC with DHCP. To inspect it:
 
 ```sh
 ip -br link
 ip -br addr
 ```
 
-You should see the NAT interface with a `192.168.64.x` address and another
-interface with no IP address. The interface with no IP address is usually the
-OkRUn private network. For example:
+You should see one `192.168.64.x` NAT address and one private `10.77.0.x`
+address when DHCP is working. Test VM-to-VM traffic with `ping` between private
+addresses.
 
-```text
-lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>
-enp0s1           UP             5a:94:ef:12:34:56 <BROADCAST,MULTICAST,UP,LOWER_UP>
-enp0s2           DOWN           5a:94:ef:65:43:21 <BROADCAST,MULTICAST>
-```
-
-And:
-
-```text
-lo               UNKNOWN        127.0.0.1/8 ::1/128
-enp0s1           UP             192.168.64.16/24
-enp0s2           DOWN
-```
-
-In this example, `<private-iface>` is `enp0s2`.
-
-### Test with Temporary Static IPs
-
-On `devbox`:
+For static private addresses, pass a CIDR to the guest tools installer:
 
 ```sh
-sudo ip link set <private-iface> up
-sudo ip addr add 10.77.0.2/24 dev <private-iface>
+./scripts/install-guest-tools.sh --user <linux-user> --private-ip 10.77.0.3/24 <hostname-or-ip>
 ```
 
-On `devbox-sandbox`:
+## Importing a VM
+
+Okrun imports `.asif` Linux disks into new VM projects.
+
+1. Click **Import VM**.
+2. Choose the source `.asif` disk.
+3. Choose a project name and destination folder.
+4. Pick CPU and memory.
+5. Click **Import**.
+6. Start the imported VM.
+
+The importer copies the ASIF disk, detects its virtual disk size, writes
+`okrun-vm.json`, and creates fresh Okrun EFI and machine identifier files. The
+imported project uses `diskFormat: "asif"` and has private networking enabled.
+
+For Ubuntu VMs imported from a generic image or clone, run the bootstrap helper
+after the first boot:
 
 ```sh
-sudo ip link set <private-iface> up
-sudo ip addr add 10.77.0.3/24 dev <private-iface>
+./scripts/bootstrap-imported-vm.sh <hostname-or-ip>
 ```
 
-Then test both directions:
+The bootstrap helper assumes the imported VM is reachable by SSH with the
+default `user` / `password` login. It asks for the new Linux username, hostname,
+and SSH public key, prints a full plan, and only runs remote commands after you
+confirm.
+
+On the guest it updates packages, creates or updates the chosen login user,
+installs your SSH key, enables passwordless sudo, regenerates cloned machine
+identity and SSH host keys, clears DHCP lease state, changes the hostname,
+disables SSH password authentication, and reboots.
+
+After the reboot, log in with the new user and install guest tools.
+
+## Web Switch & Local Switch
+
+The Okrun private network is local to one Mac by default. Web Switch and Local
+Switch let the same layer-2 private network span multiple Macs.
+
+**Web Switch** is the secure remote option. Hosts connect outbound to a switch
+server with mTLS client certificates. Use it when Macs are not on the same
+trusted LAN or when you want certificate-based host identity.
+
+Quick Web Switch certificate flow:
 
 ```sh
-ping -c 3 10.77.0.2
-ping -c 3 10.77.0.3
+cd web-switch
+npm install
+npm run cert:init
+npm run cert:server -- switch.example.com
+npm run cert:host -- my-mac switch.example.com:9443
 ```
 
-Then add hostnames in `/etc/hosts` if desired:
+Paste the printed host bundle JSON into Okrun's **Private Network > Web Switch >
+Host Bundle JSON** field, enable Web Switch, and click **Apply & Connect**.
 
-```text
-10.77.0.2 devbox.okrun devbox
-10.77.0.3 devbox-sandbox.okrun devbox-sandbox
-```
+**Local Switch** is the trusted-LAN option. It uses the same switch protocol but
+listens on plain TCP without TLS. Use it only on a trusted local network.
 
-### Persist with systemd-networkd
-
-The `ip addr add` commands are temporary. To keep the private IP after reboot,
-configure the interface inside Linux. On a system using `systemd-networkd`,
-create one `.network` file per VM.
-
-On `devbox`, create `/etc/systemd/network/20-okrun-private.network`:
-
-```ini
-[Match]
-Name=<private-iface>
-
-[Network]
-Address=10.77.0.2/24
-```
-
-On `devbox-sandbox`, use:
-
-```ini
-[Match]
-Name=<private-iface>
-
-[Network]
-Address=10.77.0.3/24
-```
-
-Then enable and restart `systemd-networkd`:
+Start a local switch listener:
 
 ```sh
-sudo systemctl enable systemd-networkd
-sudo systemctl restart systemd-networkd
+cd web-switch
+npm install
+npm run start -- \
+  --host 127.0.0.1 \
+  --tls-enabled false \
+  --local-port 9444 \
+  --status-port 8080
 ```
 
-Verify:
+Then open Okrun's **Private Network > Local Switch**, enable it, set the server
+to `127.0.0.1:9444` or another trusted LAN host, and click **Apply & Connect**.
 
-```sh
-ip -br addr
-ping -c 3 10.77.0.2
-ping -c 3 10.77.0.3
-```
+When both Local Switch and Web Switch are configured, Okrun uses Local Switch
+while it is connected and falls back to Web Switch if the local listener is not
+available.
 
-Do not add a gateway for this private interface. Keep the default route on the
-NAT interface so internet access continues to use OkRUn's regular NAT network.
+See [web-switch/README.md](web-switch/README.md) for full server deployment,
+certificate, revocation, and LaunchAgent setup.
 
-## Shared Directories
+## Other Useful Stuff
 
-`sharedDirectories` exposes Mac directories to the Linux VM with VirtioFS. Each
-entry needs a unique `name`, a Mac `hostPath`, and a `readOnly` flag.
+Use Okrun's **Shutdown** control or shut down from inside Linux. Force stop is
+for stuck VMs only; it is equivalent to cutting power and can leave the guest
+filesystem needing repair.
 
-Start the VM, then mount the Okrun share inside Linux:
+Increasing `diskGB` expands the virtual disk image, but Linux still needs its
+partition and filesystem expanded. Guest tools can try this with
+`--resize-root`; otherwise use tools such as `growpart` and `resize2fs` inside
+the guest.
 
-```sh
-sudo mkdir -p /mnt/okrun
-sudo mount -t virtiofs okrun /mnt/okrun
-```
+`OKRUN_HOME` points Okrun at a different state directory. `OKRUN_REGISTRY_PATH`
+overrides only the project registry path.
 
-Each configured directory appears below the mount point by name:
-
-```text
-/mnt/okrun/projects
-/mnt/okrun/downloads
-```
-
-Linux must have VirtioFS support available. Shared directories are mounted
-manually by default.
-
-### Mount on Boot with systemd
-
-To mount the Okrun share automatically on boot, create a systemd mount unit
-inside the Linux VM.
-
-1. Create the mount point:
-
-```sh
-sudo mkdir -p /mnt/okrun
-```
-
-2. Create `/etc/systemd/system/mnt-okrun.mount`:
-
-```sh
-sudo tee /etc/systemd/system/mnt-okrun.mount >/dev/null <<'EOF'
-[Unit]
-Description=Okrun shared directories
-
-[Mount]
-What=okrun
-Where=/mnt/okrun
-Type=virtiofs
-Options=defaults
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
-
-The unit filename must match the mount path: `/mnt/okrun` becomes
-`mnt-okrun.mount`.
-
-3. Reload systemd and start the mount:
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now mnt-okrun.mount
-```
-
-4. Confirm the shared directories are visible:
-
-```sh
-findmnt /mnt/okrun
-ls /mnt/okrun
-```
-
-To stop mounting it automatically:
-
-```sh
-sudo systemctl disable --now mnt-okrun.mount
-```
-
-## Disk Resizing
-
-After increasing `diskGB`, Linux still needs its partition/filesystem expanded.
-Check devices with:
-
-```sh
-lsblk -f
-df -h
-```
-
-For a simple ext4 install:
-
-```sh
-sudo growpart /dev/vda 2
-sudo resize2fs /dev/vda2
-```
-
-Shrinking must be done manually: shrink the guest filesystem and partition first,
-then shut down the VM. For RAW disks, shrink `vm/linux.raw` on macOS with
-`truncate`. ASIF shrinking should be handled with `diskutil image resize` on
-macOS 26 or later.
-
-## Memory Allocation
-
-`memoryGB` is the guest RAM size at VM startup. Linux sees a fixed amount of RAM.
-Run fewer or smaller VMs when macOS shows sustained memory pressure or swap use;
-guest performance can degrade sharply once the host starts compressing and
-swapping VM memory.
-
-## Diagnostics
-
-Okrun writes host-side lifecycle, storage, and VM start/stop events to macOS
-Unified Logging under the `local.okrun.vm` subsystem. The easiest way to tail
-logs while reproducing an issue is:
-
-```sh
-./scripts/logs
-```
-
-By default this streams only the Web Switch logs, including connection attempts,
-connection-refused waits, reconnect scheduling, server rejections, TLS ready
-events, and successful INIT handshakes. When the server is unavailable, expect
-retry logs to settle into this cadence:
-
-```text
-delayMs=500
-delayMs=1000
-delayMs=2000
-delayMs=3000
-delayMs=3000
-```
-
-Stream every Okrun category:
+Useful diagnostics:
 
 ```sh
 ./scripts/logs all
-```
-
-Stream a specific category:
-
-```sh
-./scripts/logs virtual-machine
-./scripts/logs lifecycle
-./scripts/logs storage
-```
-
-The helper wraps `log stream`; the equivalent raw command for Web Switch logs is:
-
-```sh
-log stream --style compact --level debug --predicate '(subsystem == "local.okrun.vm" || subsystem == "com.okrun.vm") && category == "web-switch"'
-```
-
-Show recent Okrun logs after a VM hangs or stops:
-
-```sh
-log show --last 2h --style compact --predicate 'subsystem == "local.okrun.vm" || subsystem == "com.okrun.vm"'
-```
-
-These logs include the app bundle path, selected project, CPU/RAM/disk config,
-disk image apparent and allocated sizes, disk expansion warnings, and VM
-start/stop errors. Web Switch logs are in the `web-switch` category.
-
-For a broader host-side snapshot, run:
-
-```sh
 ./scripts/diagnose.sh
 ```
 
-This prints Okrun processes, VM service CPU/memory, disk image ownership, host
-memory pressure, GPT layouts, and recent Okrun logs.
+Useful tests:
+
+```sh
+swift test
+./scripts/test.sh
+./scripts/ui-test.sh
+```
+
+`./scripts/test.sh` runs Swift tests plus the guest tools, headless boot, and
+headless switch E2E checks. `./scripts/ui-test.sh` drives the app UI without
+booting a VM.
