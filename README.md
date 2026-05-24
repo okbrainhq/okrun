@@ -65,10 +65,10 @@ Known projects are stored in:
 ~/.okrun
 ```
 
-One app instance runs one VM at a time. Use the project selector to choose an
-existing project, **New** to create a project, and **Delete** to remove the
-selected project. Delete shows a destructive confirmation and removes the entire
-project folder.
+One app instance can keep multiple VM projects in tabs. Use the project selector
+to choose an existing project, **New** to create a project, and **Delete** to
+remove the selected project. Delete shows a destructive confirmation and removes
+the entire project folder.
 
 ## Safe Shutdown
 
@@ -100,6 +100,10 @@ filesystem before booting it for normal use again.
   "privateNetwork": {
     "enabled": true
   },
+  "startup": {
+    "startOnAppLaunch": false,
+    "mode": "installed"
+  },
   "sharedDirectories": [
     {
       "name": "projects",
@@ -129,6 +133,10 @@ automatically.
 `diskIO.synchronization` accepts `full`, `fsync`, or `none`. Keep `full` for the
 best durability; `fsync` and especially `none` can improve disk-heavy throwaway
 workloads at the cost of weaker crash and power-loss safety.
+
+Set `startup.startOnAppLaunch` to `true` to start that VM automatically when
+Okrun launches. `startup.mode` accepts `installed` or `installer`; installer
+startup uses `installerISOPath` and is skipped if the ISO path is missing.
 
 ## Imported VM Bootstrap
 

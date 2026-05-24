@@ -388,6 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         do {
             registry = try projectStore.load(defaultProject: ProjectStore.defaultProjectRoot())
             try reloadSessionsFromRegistry()
+            startLaunchConfiguredSessions()
         } catch {
             setStatus("Setup failed", detail: error.localizedDescription)
             window?.toolbar?.validateVisibleItems()
@@ -767,7 +768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             session.detail = statusDetail(paths: paths, config: config)
             sessions.append(session)
             AppLog.lifecycle.info(
-                "Loaded VM tab path=\(paths.root.path, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count)"
+                "Loaded VM tab path=\(paths.root.path, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count) startOnAppLaunch=\(config.startup.startOnAppLaunch) startupMode=\(config.startup.mode.rawValue, privacy: .public)"
             )
         }
 
@@ -782,6 +783,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 
         rebuildTabButtons()
         showSelectedSession()
+    }
+
+    private func startLaunchConfiguredSessions() {
+        for session in sessions where session.config.startup.startOnAppLaunch {
+            guard !session.isRunning else { continue }
+
+            switch session.config.startup.mode {
+            case .installed:
+                AppLog.lifecycle.info("Auto-starting VM project=\(session.paths.root.path, privacy: .public) mode=installed")
+                start(session: session, mode: .installed)
+            case .installer:
+                guard let isoPath = session.config.installerISOPath,
+                      FileManager.default.fileExists(atPath: isoPath) else {
+                    AppLog.lifecycle.warning("Skipping VM auto-start project=\(session.paths.root.path, privacy: .public) reason=missing-installer-iso")
+                    setStatus(
+                        for: session,
+                        status: "Auto start skipped",
+                        detail: "startup.mode is installer but installerISOPath is missing or unavailable."
+                    )
+                    continue
+                }
+
+                AppLog.lifecycle.info("Auto-starting VM project=\(session.paths.root.path, privacy: .public) mode=installer iso=\(isoPath, privacy: .public)")
+                start(session: session, mode: .installer(URL(fileURLWithPath: isoPath)))
+            }
+        }
     }
 
     private func rebuildTabButtons() {
@@ -1369,7 +1396,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 diskFormat: currentConfig.diskFormat,
                 privateNetwork: currentConfig.privateNetwork,
                 sharedDirectories: currentConfig.sharedDirectories,
-                diskIO: currentConfig.diskIO
+                diskIO: currentConfig.diskIO,
+                startup: currentConfig.startup
             )
             try updatedConfig.save(to: session.paths.config)
             session.config = updatedConfig
@@ -1634,6 +1662,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             setStatus("Not ready", detail: "VM paths were not prepared.")
             return
         }
+        start(session: session, mode: mode)
+    }
+
+    private func start(session: VMTabSession, mode: VMMode) {
         guard !session.isRunning else { return }
 
         do {
@@ -1667,7 +1699,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             setControlsEnabled(for: session, canStart: false, canStop: true)
 
             setStatus(
-                "Starting \(modeText)",
+                for: session,
+                status: "Starting \(modeText)",
                 detail: statusDetail(paths: session.paths, config: loaded.config, preparation: loaded.preparation)
             )
 

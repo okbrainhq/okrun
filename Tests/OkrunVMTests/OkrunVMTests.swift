@@ -102,6 +102,7 @@ struct OkrunVMTests {
         #expect(config.privateNetwork == .enabled)
         #expect(config.sharedDirectories == [])
         #expect(config.diskIO == .defaults)
+        #expect(config.startup == .disabled)
 
         let migratedData = try Data(contentsOf: configURL)
         let migratedJSON = try #require(JSONSerialization.jsonObject(with: migratedData) as? [String: Any])
@@ -112,6 +113,9 @@ struct OkrunVMTests {
         let diskIO = try #require(migratedJSON["diskIO"] as? [String: Any])
         #expect(diskIO["caching"] as? String == "cached")
         #expect(diskIO["synchronization"] as? String == "full")
+        let startup = try #require(migratedJSON["startup"] as? [String: Any])
+        #expect(startup["startOnAppLaunch"] as? Bool == false)
+        #expect(startup["mode"] as? String == "installed")
     }
 
     @Test
@@ -138,6 +142,48 @@ struct OkrunVMTests {
         try config.save(to: configURL)
 
         #expect(try VMConfig.load(from: configURL) == config)
+    }
+
+    @Test
+    func vmConfigSavesAndLoadsStartupConfig() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let configURL = project.appendingPathComponent("okrun-vm.json")
+        let config = VMConfig(
+            cpuCount: 4,
+            memoryGB: 4,
+            diskGB: 64,
+            installerISOPath: "/tmp/debian.iso",
+            startup: VMStartupConfig(startOnAppLaunch: true, mode: .installer)
+        )
+
+        try config.save(to: configURL)
+
+        #expect(try VMConfig.load(from: configURL) == config)
+    }
+
+    @Test
+    func vmConfigLoadsPartialStartupConfigWithInstalledMode() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let configURL = project.appendingPathComponent("okrun-vm.json")
+        try Data("""
+        {
+          "cpuCount": 2,
+          "memoryGB": 3,
+          "diskGB": 20,
+          "installerISOPath": null,
+          "startup": {
+            "startOnAppLaunch": true
+          }
+        }
+        """.utf8).write(to: configURL)
+
+        let config = try VMConfig.load(from: configURL)
+
+        #expect(config.startup == VMStartupConfig(startOnAppLaunch: true, mode: .installed))
     }
 
     @Test
@@ -192,6 +238,7 @@ struct OkrunVMTests {
             #expect(config.installerISOPath == nil)
             #expect(config.privateNetwork == .enabled)
             #expect(config.sharedDirectories == [])
+            #expect(config.startup == .disabled)
         }
     }
 

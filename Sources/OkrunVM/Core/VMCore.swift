@@ -382,6 +382,34 @@ struct DiskIOConfig: Codable, Equatable {
     let synchronization: DiskSynchronizationMode
 }
 
+enum VMStartupMode: String, Codable, Equatable {
+    case installed
+    case installer
+}
+
+struct VMStartupConfig: Codable, Equatable {
+    static let disabled = VMStartupConfig(startOnAppLaunch: false, mode: .installed)
+
+    let startOnAppLaunch: Bool
+    let mode: VMStartupMode
+
+    enum CodingKeys: String, CodingKey {
+        case startOnAppLaunch
+        case mode
+    }
+
+    init(startOnAppLaunch: Bool, mode: VMStartupMode = .installed) {
+        self.startOnAppLaunch = startOnAppLaunch
+        self.mode = mode
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        startOnAppLaunch = try container.decodeIfPresent(Bool.self, forKey: .startOnAppLaunch) ?? false
+        mode = try container.decodeIfPresent(VMStartupMode.self, forKey: .mode) ?? .installed
+    }
+}
+
 struct VMConfig: Codable, Equatable {
     static var defaults: VMConfig {
         VMConfig(
@@ -402,6 +430,7 @@ struct VMConfig: Codable, Equatable {
     let privateNetwork: PrivateNetworkConfig
     let sharedDirectories: [SharedDirectoryConfig]
     let diskIO: DiskIOConfig
+    let startup: VMStartupConfig
 
     enum CodingKeys: String, CodingKey {
         case cpuCount
@@ -412,6 +441,7 @@ struct VMConfig: Codable, Equatable {
         case privateNetwork
         case sharedDirectories
         case diskIO
+        case startup
     }
 
     init(
@@ -422,7 +452,8 @@ struct VMConfig: Codable, Equatable {
         diskFormat: DiskImageFormat = .raw,
         privateNetwork: PrivateNetworkConfig = .enabled,
         sharedDirectories: [SharedDirectoryConfig] = [],
-        diskIO: DiskIOConfig = .defaults
+        diskIO: DiskIOConfig = .defaults,
+        startup: VMStartupConfig = .disabled
     ) {
         self.cpuCount = cpuCount
         self.memoryGB = memoryGB
@@ -432,6 +463,7 @@ struct VMConfig: Codable, Equatable {
         self.privateNetwork = privateNetwork
         self.sharedDirectories = sharedDirectories
         self.diskIO = diskIO
+        self.startup = startup
     }
 
     init(from decoder: Decoder) throws {
@@ -444,6 +476,7 @@ struct VMConfig: Codable, Equatable {
         privateNetwork = try container.decodeIfPresent(PrivateNetworkConfig.self, forKey: .privateNetwork) ?? .enabled
         sharedDirectories = try container.decodeIfPresent([SharedDirectoryConfig].self, forKey: .sharedDirectories) ?? []
         diskIO = try container.decodeIfPresent(DiskIOConfig.self, forKey: .diskIO) ?? .defaults
+        startup = try container.decodeIfPresent(VMStartupConfig.self, forKey: .startup) ?? .disabled
     }
 
     func encode(to encoder: Encoder) throws {
@@ -460,6 +493,7 @@ struct VMConfig: Codable, Equatable {
         try container.encode(privateNetwork, forKey: .privateNetwork)
         try container.encode(sharedDirectories, forKey: .sharedDirectories)
         try container.encode(diskIO, forKey: .diskIO)
+        try container.encode(startup, forKey: .startup)
     }
 
     static func load(from url: URL) throws -> VMConfig {
@@ -477,7 +511,8 @@ struct VMConfig: Codable, Equatable {
         let config = try JSONDecoder().decode(VMConfig.self, from: data).validated()
         if !Self.configDataContainsDiskFormat(data)
             || !Self.configDataContainsDiskIO(data)
-            || !Self.configDataContainsPrivateNetwork(data) {
+            || !Self.configDataContainsPrivateNetwork(data)
+            || !Self.configDataContainsStartup(data) {
             try config.save(to: url)
         }
         return config
@@ -518,6 +553,10 @@ struct VMConfig: Codable, Equatable {
 
     private static func configDataContainsPrivateNetwork(_ data: Data) -> Bool {
         configData(data, contains: CodingKeys.privateNetwork.rawValue)
+    }
+
+    private static func configDataContainsStartup(_ data: Data) -> Bool {
+        configData(data, contains: CodingKeys.startup.rawValue)
     }
 
     private static func configData(_ data: Data, contains key: String) -> Bool {
