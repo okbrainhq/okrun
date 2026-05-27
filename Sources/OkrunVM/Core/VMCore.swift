@@ -512,6 +512,7 @@ struct VMConfig: Codable, Equatable {
         )
     }
 
+    let name: String?
     let guestOS: GuestOS
     let cpuCount: Int
     let memoryGB: Int
@@ -524,6 +525,7 @@ struct VMConfig: Codable, Equatable {
     let startup: VMStartupConfig
 
     enum CodingKeys: String, CodingKey {
+        case name
         case guestOS
         case cpuCount
         case memoryGB
@@ -537,6 +539,7 @@ struct VMConfig: Codable, Equatable {
     }
 
     init(
+        name: String? = nil,
         cpuCount: Int,
         memoryGB: Int,
         diskGB: Int,
@@ -548,6 +551,7 @@ struct VMConfig: Codable, Equatable {
         startup: VMStartupConfig = .disabled,
         guestOS: GuestOS = .linux
     ) {
+        self.name = name
         self.guestOS = guestOS
         self.cpuCount = cpuCount
         self.memoryGB = memoryGB
@@ -562,6 +566,7 @@ struct VMConfig: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
         guestOS = try container.decodeIfPresent(GuestOS.self, forKey: .guestOS) ?? .linux
         cpuCount = try container.decode(Int.self, forKey: .cpuCount)
         memoryGB = try container.decode(Int.self, forKey: .memoryGB)
@@ -576,6 +581,7 @@ struct VMConfig: Codable, Equatable {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(name, forKey: .name)
         try container.encode(guestOS, forKey: .guestOS)
         try container.encode(cpuCount, forKey: .cpuCount)
         try container.encode(memoryGB, forKey: .memoryGB)
@@ -604,8 +610,10 @@ struct VMConfig: Codable, Equatable {
         }
 
         let data = try Data(contentsOf: url)
-        let config = try JSONDecoder().decode(VMConfig.self, from: data).validated()
-        if !Self.configDataContainsGuestOS(data)
+        let decodedConfig = try JSONDecoder().decode(VMConfig.self, from: data)
+        let config = try decodedConfig.validated()
+        if decodedConfig != config
+            || !Self.configDataContainsGuestOS(data)
             || !Self.configDataContainsDiskFormat(data)
             || !Self.configDataContainsDiskIO(data)
             || !Self.configDataContainsPrivateNetwork(data)
@@ -623,6 +631,15 @@ struct VMConfig: Codable, Equatable {
     }
 
     func validated() throws -> VMConfig {
+        let normalizedName = Self.normalizedName(name)
+        if let normalizedName {
+            guard normalizedName.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
+                throw AppError("name must not contain NUL.")
+            }
+            guard normalizedName.utf8.count <= 128 else {
+                throw AppError("name must be 128 bytes or fewer.")
+            }
+        }
         guard cpuCount > 0 else {
             throw AppError("cpuCount must be greater than 0.")
         }
@@ -638,7 +655,41 @@ struct VMConfig: Codable, Equatable {
         try GuestOSValidator.validate(guestOS)
         try PrivateNetworkValidator.validate(privateNetwork)
         try SharedDirectoryValidator.validate(sharedDirectories)
-        return self
+        return normalizedName == name ? self : withName(normalizedName)
+    }
+
+    static func normalizedName(_ name: String?) -> String? {
+        guard let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    func displayName(fallbackProjectPath: String) -> String {
+        if let name = Self.normalizedName(name) {
+            return name
+        }
+
+        let url = URL(fileURLWithPath: fallbackProjectPath, isDirectory: true)
+        let lastPathComponent = url.lastPathComponent
+        return lastPathComponent.isEmpty ? fallbackProjectPath : lastPathComponent
+    }
+
+    func withName(_ name: String?) -> VMConfig {
+        VMConfig(
+            name: name,
+            cpuCount: cpuCount,
+            memoryGB: memoryGB,
+            diskGB: diskGB,
+            installerISOPath: installerISOPath,
+            diskFormat: diskFormat,
+            privateNetwork: privateNetwork,
+            sharedDirectories: sharedDirectories,
+            diskIO: diskIO,
+            startup: startup,
+            guestOS: guestOS
+        )
     }
 
     private static func configDataContainsGuestOS(_ data: Data) -> Bool {

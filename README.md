@@ -41,13 +41,14 @@ an ASIF import, and the network button for private network settings.
 ## Create a New VM
 
 1. Click **New VM**.
-2. Choose a VM folder. This folder becomes the Okrun project.
-3. Choose the guest OS and installer image. Linux uses an ISO; macOS uses an IPSW restore image.
-4. Pick CPU, memory, disk size, and disk format.
-5. Click **Create**.
-6. Click **Boot Installer** and install the guest OS to the virtual disk.
-7. Shut the guest down cleanly.
-8. Click **Start** for normal installed boots.
+2. Enter a VM name.
+3. Choose a VM folder. This folder becomes the Okrun project.
+4. Choose the guest OS and installer image. Linux uses an ISO; macOS uses an IPSW restore image.
+5. Pick CPU, memory, disk size, and disk format.
+6. Click **Create**.
+7. Click **Boot Installer** and install the guest OS to the virtual disk.
+8. Shut the guest down cleanly.
+9. Click **Start** for normal installed boots.
 
 After installation, log in through the Okrun VM display. For Linux, you need the
 VM's network name or IP address before you can SSH in or install guest tools.
@@ -72,6 +73,7 @@ folders, and per-VM private networking:
 
 ```json
 {
+  "name": "my-vm",
   "guestOS": "linux",
   "cpuCount": 4,
   "memoryGB": 4,
@@ -100,7 +102,8 @@ require Apple silicon. Okrun configures both the Mac trackpad device and a USB
 screen-coordinate pointing device, so mouse and trackpad input work across newer
 and older guests.
 
-Use **VM > Edit VM Config** to open the selected VM's config. Stop the VM before
+Use **VM > Rename VM...** to change the selected VM's display name. Use
+**VM > Edit VM Config** to open the selected VM's config. Stop the VM before
 changing config that affects devices, disks, or shared directories.
 
 ## Find the VM IP

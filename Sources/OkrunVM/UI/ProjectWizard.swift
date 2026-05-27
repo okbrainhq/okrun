@@ -16,7 +16,7 @@ struct ImportVMRequest {
     let config: VMConfig
 }
 
-private final class DialogActions: NSObject {
+private final class DialogActions: NSObject, NSTextFieldDelegate {
     var onChooseProject: (() -> Void)?
     var onChooseInstaller: (() -> Void)?
     var onGuestOSChange: (() -> Void)?
@@ -24,6 +24,7 @@ private final class DialogActions: NSObject {
     var onCopyLatestMacOSDownload: (() -> Void)?
     var onCreate: (() -> Void)?
     var onCancel: (() -> Void)?
+    var onTextChange: (() -> Void)?
 
     @objc func chooseProject() {
         onChooseProject?()
@@ -51,6 +52,10 @@ private final class DialogActions: NSObject {
 
     @objc func cancel() {
         onCancel?()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        onTextChange?()
     }
 }
 
@@ -290,7 +295,7 @@ extension AppDelegate {
 
             let name = self.sanitizedImportName(nameField.stringValue)
             guard !name.isEmpty,
-                  let config = try? ASIFImporter.importedConfig(diskGB: diskGB, cpuCount: cpu, memoryGB: memory) else {
+                  let config = try? ASIFImporter.importedConfig(diskGB: diskGB, cpuCount: cpu, memoryGB: memory, name: name) else {
                 NSSound.beep()
                 return
             }
@@ -366,6 +371,11 @@ extension AppDelegate {
         var projectURL = environmentURL("OKRUN_UI_E2E_PROJECT_PATH")
         var installerURL = environmentURL("OKRUN_UI_E2E_INSTALLER_PATH") ?? environmentURL("OKRUN_UI_E2E_ISO_PATH")
         var guestOS = GuestOS(rawValue: environmentValue("OKRUN_UI_E2E_GUEST_OS", default: GuestOS.linux.rawValue)) ?? .linux
+        let environmentVMName = VMConfig.normalizedName(ProcessInfo.processInfo.environment["OKRUN_UI_E2E_VM_NAME"])
+        var nameWasEdited = environmentVMName != nil
+        let initialVMName = environmentVMName
+            ?? projectURL.map { displayName(for: $0) }
+            ?? "New VM"
         var result: NewProjectRequest?
         let labelColumnWidth: CGFloat = 116
         let fieldColumnWidth: CGFloat = 360
@@ -376,7 +386,7 @@ extension AppDelegate {
         let macOSDownloadActionButtonWidth = (macOSDownloadContentWidth - macOSDownloadButtonSpacing) / 2
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 650),
             styleMask: [.titled],
             backing: .buffered,
             defer: false
@@ -396,11 +406,18 @@ extension AppDelegate {
         title.font = .systemFont(ofSize: 20, weight: .semibold)
         title.alignment = .center
 
-        let subtitle = NSTextField(labelWithString: "Choose the VM folder, guest OS, installer image, and starter resources.")
+        let subtitle = NSTextField(labelWithString: "Name the VM, choose its project folder, then pick the guest OS, installer image, and starter resources.")
         subtitle.translatesAutoresizingMaskIntoConstraints = false
         subtitle.font = .systemFont(ofSize: 13, weight: .regular)
         subtitle.textColor = .secondaryLabelColor
         subtitle.alignment = .center
+
+        let nameField = NSTextField(string: initialVMName)
+        nameField.setAccessibilityIdentifier("okrun.add.name")
+        nameField.controlSize = .large
+        nameField.font = .systemFont(ofSize: 13)
+        nameField.widthAnchor.constraint(equalToConstant: fieldColumnWidth).isActive = true
+        nameField.placeholderString = "VM name"
 
         let projectButton = makeChooserButton(
             title: projectURL.map { displayName(for: $0) } ?? "Choose VM Folder...",
@@ -617,11 +634,16 @@ extension AppDelegate {
         }
 
         let actions = DialogActions()
-        actions.onChooseProject = { [weak self, weak projectButton] in
-            guard let url = self?.chooseProjectDirectory() else { return }
+        actions.onChooseProject = { [weak self, weak projectButton, weak nameField] in
+            guard let self, let url = self.chooseProjectDirectory() else { return }
             projectURL = url
-            projectButton?.title = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+            let projectDisplayName = self.displayName(for: url)
+            projectButton?.title = projectDisplayName
             projectButton?.toolTip = url.path
+            if !nameWasEdited || VMConfig.normalizedName(nameField?.stringValue) == nil || nameField?.stringValue == "New VM" {
+                nameField?.stringValue = projectDisplayName
+                nameWasEdited = false
+            }
         }
         actions.onChooseInstaller = { [weak self, weak installerButton] in
             guard let url = self?.chooseInstallerImage(for: guestOS) else { return }
@@ -652,17 +674,22 @@ extension AppDelegate {
         actions.onCopyLatestMacOSDownload = {
             fetchLatestMacOSDownload(open: false, copy: true)
         }
-        actions.onCreate = { [weak panel, weak cpuField, weak memoryField, weak diskField, weak diskFormatPopup, weak guestOSPopup] in
+        actions.onTextChange = {
+            nameWasEdited = true
+        }
+        actions.onCreate = { [weak panel, weak nameField, weak cpuField, weak memoryField, weak diskField, weak diskFormatPopup, weak guestOSPopup] in
             let selectedGuestOSRaw = guestOSPopup?.selectedItem?.representedObject as? String
             let selectedGuestOS = selectedGuestOSRaw.flatMap(GuestOS.init(rawValue:)) ?? guestOS
             let diskFormatRaw = diskFormatPopup?.selectedItem?.representedObject as? String
             let diskFormat = diskFormatRaw.flatMap(DiskImageFormat.init(rawValue:)) ?? .raw
-            guard let projectURL,
+            guard let name = VMConfig.normalizedName(nameField?.stringValue),
+                  let projectURL,
                   let installerURL,
                   let cpu = Int(cpuField?.stringValue ?? ""),
                   let memory = Int(memoryField?.stringValue ?? ""),
                   let disk = Int(diskField?.stringValue ?? ""),
                   let config = try? VMConfig(
+                    name: name,
                     cpuCount: cpu,
                     memoryGB: memory,
                     diskGB: disk,
@@ -685,6 +712,7 @@ extension AppDelegate {
         }
         projectButton.target = actions
         projectButton.action = #selector(DialogActions.chooseProject)
+        nameField.delegate = actions
         guestOSPopup.target = actions
         guestOSPopup.action = #selector(DialogActions.guestOSChanged)
         installerButton.target = actions
@@ -699,6 +727,7 @@ extension AppDelegate {
         cancelButton.action = #selector(DialogActions.cancel)
 
         let topGrid = NSGridView(views: [
+            [makeFieldLabel("Name"), nameField],
             [makeFieldLabel("VM Folder"), projectButton],
             [makeFieldLabel("Guest OS"), guestOSPopup]
         ])

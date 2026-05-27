@@ -155,6 +155,24 @@ private final class DeleteConfirmationActions: NSObject, NSTextFieldDelegate {
     }
 }
 
+private final class RenameDialogActions: NSObject, NSTextFieldDelegate {
+    var onRename: (() -> Void)?
+    var onCancel: (() -> Void)?
+    var onTextChange: (() -> Void)?
+
+    @objc func rename() {
+        onRename?()
+    }
+
+    @objc func cancel() {
+        onCancel?()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        onTextChange?()
+    }
+}
+
 private final class VMTabSession {
     let id = UUID()
     let projectPath: String
@@ -188,9 +206,7 @@ private final class VMTabSession {
     }
 
     var title: String {
-        let url = URL(fileURLWithPath: projectPath, isDirectory: true)
-        let lastPathComponent = url.lastPathComponent
-        return lastPathComponent.isEmpty ? projectPath : lastPathComponent
+        config.displayName(fallbackProjectPath: projectPath)
     }
 
     var isRunning: Bool {
@@ -225,6 +241,7 @@ private final class VMTabItemView: NSControl {
     private let numberLabel = NSTextField(labelWithString: "")
     private let titleLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
+    private let renameButton: VMTabActionButton
     private let settingsButton: VMTabActionButton
     private let deleteButton: VMTabActionButton
     private static let activeColor = NSColor(calibratedRed: 0.02, green: 0.48, blue: 0.95, alpha: 1)
@@ -235,12 +252,21 @@ private final class VMTabItemView: NSControl {
         title: String,
         target: AnyObject?,
         action: Selector,
+        renameTarget: AnyObject?,
+        renameAction: Selector,
         settingsTarget: AnyObject?,
         settingsAction: Selector,
         deleteTarget: AnyObject?,
         deleteAction: Selector
     ) {
         self.sessionID = sessionID
+        renameButton = VMTabActionButton(
+            sessionID: sessionID,
+            symbolName: "pencil",
+            label: "Rename VM",
+            target: renameTarget,
+            action: renameAction
+        )
         settingsButton = VMTabActionButton(
             sessionID: sessionID,
             symbolName: "gearshape",
@@ -260,6 +286,7 @@ private final class VMTabItemView: NSControl {
         setAccessibilityRole(.button)
         setAccessibilityLabel(title)
         setAccessibilityIdentifier("okrun.vm-tab.item")
+        renameButton.setAccessibilityIdentifier("okrun.vm-tab.rename")
         settingsButton.setAccessibilityIdentifier("okrun.vm-tab.settings")
         deleteButton.setAccessibilityIdentifier("okrun.vm-tab.delete")
         self.target = target
@@ -298,7 +325,7 @@ private final class VMTabItemView: NSControl {
         textStack.alignment = .leading
         textStack.spacing = 3
 
-        let actionStack = NSStackView(views: [settingsButton, deleteButton])
+        let actionStack = NSStackView(views: [renameButton, settingsButton, deleteButton])
         actionStack.translatesAutoresizingMaskIntoConstraints = false
         actionStack.orientation = .horizontal
         actionStack.alignment = .centerY
@@ -339,6 +366,8 @@ private final class VMTabItemView: NSControl {
         layer?.backgroundColor = isSelected ? Self.activeColor.cgColor : NSColor.clear.cgColor
         titleLabel.textColor = isSelected ? .white : .labelColor
         statusLabel.textColor = isSelected ? NSColor.white.withAlphaComponent(0.88) : .secondaryLabelColor
+        renameButton.isHidden = !isSelected
+        renameButton.isEnabled = isSelected
         settingsButton.isHidden = !isSelected
         settingsButton.isEnabled = isSelected && !isRunning
         deleteButton.isHidden = !isSelected
@@ -686,6 +715,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         editConfigItem.target = self
         vmMenu.addItem(editConfigItem)
 
+        let renameItem = NSMenuItem(title: "Rename VM...", action: #selector(renameProject), keyEquivalent: "")
+        renameItem.target = self
+        vmMenu.addItem(renameItem)
+
         let deleteItem = NSMenuItem(title: "Delete VM", action: #selector(deleteProject), keyEquivalent: "")
         deleteItem.target = self
         vmMenu.addItem(deleteItem)
@@ -835,6 +868,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 title: session.title,
                 target: self,
                 action: #selector(tabButtonPressed(_:)),
+                renameTarget: self,
+                renameAction: #selector(renameTabButtonPressed(_:)),
                 settingsTarget: self,
                 settingsAction: #selector(settingsTabButtonPressed(_:)),
                 deleteTarget: self,
@@ -908,6 +943,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 
         selectSession(session)
         deleteProject()
+    }
+
+    @objc private func renameTabButtonPressed(_ sender: NSButton) {
+        guard let sender = sender as? VMTabActionButton,
+              let session = sessions.first(where: { $0.id == sender.sessionID }) else {
+            return
+        }
+
+        selectSession(session)
+        renameProject()
     }
 
     @objc private func settingsTabButtonPressed(_ sender: NSButton) {
@@ -1023,6 +1068,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         }
     }
 
+    @objc private func renameProject() {
+        guard let session = selectedSession,
+              let newName = askForVMRename(session: session) else {
+            return
+        }
+
+        do {
+            let currentConfig = try VMConfig.load(from: session.paths.config)
+            let updatedConfig = try currentConfig.withName(newName).validated()
+            try updatedConfig.save(to: session.paths.config)
+            session.config = updatedConfig
+            session.detail = statusDetail(paths: session.paths, config: updatedConfig)
+            AppLog.lifecycle.info("Renamed VM project=\(session.paths.root.path, privacy: .public) name=\(session.title, privacy: .public)")
+            rebuildTabButtons()
+            setStatus(for: session, status: session.status, detail: session.detail)
+        } catch {
+            setStatus(for: session, status: "Rename failed", detail: error.localizedDescription)
+            window?.toolbar?.validateVisibleItems()
+        }
+    }
+
     @objc private func deleteProject() {
         guard let session = selectedSession, session.virtualMachine == nil else { return }
         let selectedProject = session.projectPath
@@ -1049,6 +1115,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             session.detail = error.localizedDescription
             window?.toolbar?.validateVisibleItems()
         }
+    }
+
+    private func askForVMRename(session: VMTabSession) -> String? {
+        var result: String?
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 230),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Rename VM"
+        panel.isReleasedWhenClosed = false
+        panel.level = .modalPanel
+        panel.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1)
+
+        let content = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1).cgColor
+
+        let title = NSTextField(labelWithString: "Rename VM")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
+
+        let path = NSTextField(labelWithString: session.projectPath)
+        path.translatesAutoresizingMaskIntoConstraints = false
+        path.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        path.textColor = .secondaryLabelColor
+        path.lineBreakMode = .byTruncatingMiddle
+
+        let nameField = NSTextField(string: session.title)
+        nameField.setAccessibilityIdentifier("okrun.rename.name")
+        nameField.translatesAutoresizingMaskIntoConstraints = false
+        nameField.controlSize = .large
+        nameField.font = .systemFont(ofSize: 13)
+
+        let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        cancelButton.setAccessibilityIdentifier("okrun.rename.cancel")
+        cancelButton.bezelStyle = .rounded
+        cancelButton.controlSize = .large
+        cancelButton.keyEquivalent = "\u{1b}"
+
+        let renameButton = NSButton(title: "Rename", target: nil, action: nil)
+        renameButton.setAccessibilityIdentifier("okrun.rename.confirm")
+        renameButton.bezelStyle = .rounded
+        renameButton.controlSize = .large
+        renameButton.keyEquivalent = "\r"
+
+        let buttonRow = NSStackView(views: [cancelButton, renameButton])
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.spacing = 12
+
+        func updateRenameButton() {
+            guard let candidate = VMConfig.normalizedName(nameField.stringValue) else {
+                renameButton.isEnabled = false
+                return
+            }
+            renameButton.isEnabled = candidate != session.title
+        }
+
+        let actions = RenameDialogActions()
+        actions.onTextChange = {
+            updateRenameButton()
+        }
+        actions.onRename = { [weak panel] in
+            guard let name = VMConfig.normalizedName(nameField.stringValue) else {
+                NSSound.beep()
+                return
+            }
+
+            result = name
+            panel?.close()
+            NSApp.stopModal()
+        }
+        actions.onCancel = { [weak panel] in
+            panel?.close()
+            NSApp.stopModal()
+        }
+
+        nameField.delegate = actions
+        cancelButton.target = actions
+        cancelButton.action = #selector(RenameDialogActions.cancel)
+        renameButton.target = actions
+        renameButton.action = #selector(RenameDialogActions.rename)
+
+        content.addSubview(title)
+        content.addSubview(path)
+        content.addSubview(nameField)
+        content.addSubview(buttonRow)
+        panel.contentView = content
+
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
+            title.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+            title.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
+            path.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            path.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            path.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 14),
+            nameField.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            nameField.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            nameField.topAnchor.constraint(equalTo: path.bottomAnchor, constant: 18),
+            buttonRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+            buttonRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
+            cancelButton.widthAnchor.constraint(equalToConstant: 110),
+            renameButton.widthAnchor.constraint(equalToConstant: 110)
+        ])
+
+        if let window {
+            panel.setFrameOrigin(NSPoint(
+                x: window.frame.midX - panel.frame.width / 2,
+                y: window.frame.midY - panel.frame.height / 2
+            ))
+        } else {
+            panel.center()
+        }
+
+        updateRenameButton()
+        panel.makeFirstResponder(nameField)
+        nameField.currentEditor()?.selectAll(nil)
+        NSApp.runModal(for: panel)
+        _ = actions
+        return result
     }
 
     private func confirmDelete(session: VMTabSession) -> Bool {
@@ -1400,6 +1590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 
         do {
             let updatedConfig = VMConfig(
+                name: currentConfig.name,
                 cpuCount: currentConfig.cpuCount,
                 memoryGB: currentConfig.memoryGB,
                 diskGB: currentConfig.diskGB,

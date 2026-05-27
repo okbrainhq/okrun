@@ -96,6 +96,27 @@ struct OkrunVMTests {
     }
 
     @Test
+    func vmConfigSavesAndLoadsName() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let configURL = project.appendingPathComponent("okrun-vm.json")
+        let config = try VMConfig(
+            name: "  Dev Box  ",
+            cpuCount: 4,
+            memoryGB: 4,
+            diskGB: 64,
+            installerISOPath: nil
+        ).validated()
+        try config.save(to: configURL)
+
+        let loaded = try VMConfig.load(from: configURL)
+
+        #expect(loaded.name == "Dev Box")
+        #expect(loaded.displayName(fallbackProjectPath: project.path) == "Dev Box")
+    }
+
+    @Test
     func vmConfigLoadsLegacyConfigWithoutSharedDirectories() throws {
         let project = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(project) }
@@ -117,6 +138,8 @@ struct OkrunVMTests {
         #expect(config.diskGB == 20)
         #expect(config.guestOS == .linux)
         #expect(config.installerISOPath == nil)
+        #expect(config.name == nil)
+        #expect(config.displayName(fallbackProjectPath: project.path) == project.lastPathComponent)
         #expect(config.privateNetwork == .enabled)
         #expect(config.sharedDirectories == [])
         #expect(config.diskIO == .defaults)

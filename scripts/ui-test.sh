@@ -596,6 +596,7 @@ run_project_lifecycle_smoke() {
   printf 'okrun-ui-e2e placeholder iso\n' >"$iso_path"
 
   launch_app "$registry_path" "$test_dir/empty-default-project" \
+    OKRUN_UI_E2E_VM_NAME="Lifecycle VM" \
     OKRUN_UI_E2E_PROJECT_PATH="$project_path" \
     OKRUN_UI_E2E_ISO_PATH="$iso_path" \
     OKRUN_UI_E2E_DISK_GB=1 \
@@ -608,6 +609,7 @@ run_project_lifecycle_smoke() {
   click_button "Create" "okrun.add.create"
   wait_for_file "$project_path/okrun-vm.json"
   wait_for_any_file "$project_path/vm/linux.raw" "$project_path/vm/linux.asif"
+  grep -Fq '"name" : "Lifecycle VM"' "$project_path/okrun-vm.json"
   grep -Fq '"enabled" : true' "$project_path/okrun-vm.json"
   grep -Fq '"identifier" : "okrun"' "$project_path/okrun-vm.json"
   wait_for_file "$test_dir/empty-default-project/private-networks.json"
@@ -621,16 +623,22 @@ run_project_lifecycle_smoke() {
   wait_for_file "$config_open_log"
   grep -Fq "$project_path/okrun-vm.json" "$config_open_log"
 
+  click_menu_item "VM" "Rename VM..."
+  capture "03-lifecycle-rename"
+  replace_text "Renamed Lifecycle VM"
+  click_button "Rename" "okrun.rename.confirm"
+  grep -Fq '"name" : "Renamed Lifecycle VM"' "$project_path/okrun-vm.json"
+
   click_menu_item "VM" "Delete VM"
-  capture "03-lifecycle-delete-confirmation"
-  type_text "ui-e2e-vm"
+  capture "04-lifecycle-delete-confirmation"
+  type_text "Renamed Lifecycle VM"
   click_button "Delete" "okrun.delete.confirm"
   wait_for_missing "$project_path"
   if registry_contains_project "$registry_path" "$project_path"; then
     printf 'Project path still exists in registry: %s\n' "$registry_path" >&2
     exit 1
   fi
-  capture "04-lifecycle-after-delete"
+  capture "05-lifecycle-after-delete"
   cleanup
 }
 

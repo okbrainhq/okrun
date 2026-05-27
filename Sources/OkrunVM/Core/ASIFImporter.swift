@@ -42,8 +42,9 @@ enum ASIFImporter {
         return Int(rounded)
     }
 
-    static func importedConfig(diskGB: Int, cpuCount: Int = 4, memoryGB: Int = 4) throws -> VMConfig {
+    static func importedConfig(diskGB: Int, cpuCount: Int = 4, memoryGB: Int = 4, name: String? = nil) throws -> VMConfig {
         try VMConfig(
+            name: name,
             cpuCount: cpuCount,
             memoryGB: memoryGB,
             diskGB: diskGB,
