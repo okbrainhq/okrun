@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_DIR="${OKRUN_LOG_DIR:-/mnt/okrun/okrun-guest-logs}"
+GUEST_OS="$(uname -s)"
+DEFAULT_LOG_DIR="/mnt/okrun/okrun-guest-logs"
+if [[ "$GUEST_OS" == "Darwin" ]]; then
+  DEFAULT_LOG_DIR="/Volumes/okrun/okrun-guest-logs"
+fi
+LOG_DIR="${OKRUN_LOG_DIR:-$DEFAULT_LOG_DIR}"
 LOG_FILE="$LOG_DIR/guest-health.log"
 LOG_MAX_BYTES="${OKRUN_LOG_MAX_BYTES:-10485760}"
 LOG_KEEP="${OKRUN_LOG_KEEP:-5}"
@@ -10,6 +15,29 @@ KERNEL_ALERT_PATTERN='bug:|oops:|kernel panic|i/o error|blk_update_request|buffe
 KERNEL_FAULT_CONTEXT_PATTERN='bug:|oops|kernel panic|unable to handle|internal error|undefined instruction|fixing recursive fault|segfault|tainted'
 
 mkdir -p "$LOG_DIR"
+
+timestamp() {
+  date -Is 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+guest_uptime() {
+  if [[ -r /proc/uptime ]]; then
+    cut -d' ' -f1 /proc/uptime
+    return
+  fi
+
+  if [[ "$GUEST_OS" == "Darwin" ]] && command -v sysctl >/dev/null 2>&1 && command -v date >/dev/null 2>&1; then
+    local boot_sec now
+    boot_sec="$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9][0-9]*\).*/\1/p')"
+    now="$(date +%s 2>/dev/null || true)"
+    if [[ -n "$boot_sec" && -n "$now" ]]; then
+      printf '%s\n' "$((now - boot_sec))"
+      return
+    fi
+  fi
+
+  printf 'unknown\n'
+}
 
 file_size() {
   local file="$1"
@@ -40,7 +68,7 @@ rotate_log_if_needed() {
 emit() {
   local message="$1"
   rotate_log_if_needed
-  printf '%s %s\n' "$(date -Is)" "$message" | tee -a "$LOG_FILE"
+  printf '%s %s\n' "$(timestamp)" "$message" | tee -a "$LOG_FILE"
 }
 
 emit_file_line() {
@@ -157,8 +185,51 @@ emit_sandbox_setup_snapshot() {
   fi
 }
 
+emit_macos_snapshot() {
+  if command -v sw_vers >/dev/null 2>&1; then
+    run_probe "sw-vers" sw_vers
+  fi
+
+  if command -v sysctl >/dev/null 2>&1; then
+    run_probe "sysctl" sysctl hw.memsize hw.ncpu kern.boottime kern.osrelease kern.osproductversion
+  fi
+
+  if command -v uptime >/dev/null 2>&1; then
+    run_probe "uptime" uptime
+  fi
+
+  if command -v df >/dev/null 2>&1; then
+    run_probe "df" df -h / /Volumes/okrun
+  fi
+
+  if command -v mount >/dev/null 2>&1; then
+    run_probe "mount-okrun" bash -c "mount | grep ' on /Volumes/okrun ' || true"
+  fi
+
+  if command -v ifconfig >/dev/null 2>&1; then
+    run_probe "ifconfig" ifconfig
+  fi
+
+  if command -v netstat >/dev/null 2>&1; then
+    run_probe "routes" netstat -rn
+  fi
+
+  if command -v ps >/dev/null 2>&1; then
+    run_probe "ps-top" bash -c "ps ax -o pid,ppid,state,comm,%cpu,%mem | head -30"
+  fi
+}
+
 while true; do
-  emit "health-start hostname=$(hostname) kernel=$(uname -r) uptime=$(cut -d' ' -f1 /proc/uptime)"
+  emit "health-start hostname=$(hostname) kernel=$(uname -r) uptime=$(guest_uptime)"
+
+  if [[ "$GUEST_OS" == "Darwin" ]]; then
+    emit_macos_snapshot
+    emit "health-end"
+    [[ "${OKRUN_HEALTH_ONCE:-0}" == "1" ]] && exit 0
+    sleep "${OKRUN_HEALTH_INTERVAL:-60}"
+    continue
+  fi
+
   emit_proc_snapshot
   emit_kernel_alerts
   emit_system_alerts

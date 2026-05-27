@@ -113,6 +113,14 @@ tell application "System Events"
           end try
         end if
         try
+          first button of window 1 whose name is "$label"
+          return true
+        end try
+        try
+          first button of window 1 whose description is "$label"
+          return true
+        end try
+        try
           first UI element of entire contents of window 1 whose role is "AXButton" and (name is "$label" or description is "$label")
           return true
         end try
@@ -153,6 +161,100 @@ tell application "System Events"
   end repeat
 end tell
 error "Timed out waiting for checkbox: $identifier"
+APPLESCRIPT
+}
+
+click_network_tab() {
+  local label="$1"
+  osascript <<APPLESCRIPT
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        try
+          click (first radio button of tab group 1 of window "Private Network" whose name is "$label")
+          return true
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for network tab: $label"
+APPLESCRIPT
+}
+
+click_network_checkbox() {
+  local label="$1"
+  osascript <<APPLESCRIPT
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        try
+          click (first checkbox of tab group 1 of window "Private Network" whose name is "$label")
+          return true
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for network checkbox: $label"
+APPLESCRIPT
+}
+
+set_network_tab_text_field() {
+  local index="$1"
+  local text="$2"
+  osascript <<APPLESCRIPT
+on appProcess()
+  tell application "System Events"
+    if exists process "OkrunVM" then return process "OkrunVM"
+    if exists process "Okrun VM" then return process "Okrun VM"
+  end tell
+  return missing value
+end appProcess
+
+set deadline to (current date) + 12
+tell application "System Events"
+  repeat while (current date) is less than deadline
+    set targetProcess to my appProcess()
+    if targetProcess is not missing value then
+      tell targetProcess
+        set frontmost to true
+        try
+          set value of text field $index of tab group 1 of window "Private Network" to "$text"
+          return true
+        end try
+      end tell
+    end if
+    delay 0.2
+  end repeat
+end tell
+error "Timed out waiting for network text field: $index"
 APPLESCRIPT
 }
 
@@ -280,7 +382,7 @@ tell application "System Events"
         set frontmost to true
         try
           set targetWindow to window 1
-          set newButton to first UI element of targetWindow whose description is "New VM"
+          set newButton to first button of targetWindow whose description is "New VM"
           set firstTab to first UI element of targetWindow whose description is "first-vm"
           set buttonPosition to position of newButton
           set buttonSize to size of newButton
@@ -596,6 +698,7 @@ run_project_lifecycle_smoke() {
   printf 'okrun-ui-e2e placeholder iso\n' >"$iso_path"
 
   launch_app "$registry_path" "$test_dir/empty-default-project" \
+    OKRUN_UI_E2E_VM_NAME="Lifecycle VM" \
     OKRUN_UI_E2E_PROJECT_PATH="$project_path" \
     OKRUN_UI_E2E_ISO_PATH="$iso_path" \
     OKRUN_UI_E2E_DISK_GB=1 \
@@ -608,12 +711,12 @@ run_project_lifecycle_smoke() {
   click_button "Create" "okrun.add.create"
   wait_for_file "$project_path/okrun-vm.json"
   wait_for_any_file "$project_path/vm/linux.raw" "$project_path/vm/linux.asif"
+  grep -Fq '"name" : "Lifecycle VM"' "$project_path/okrun-vm.json"
   grep -Fq '"enabled" : true' "$project_path/okrun-vm.json"
-  grep -Fq '"identifier" : "okrun"' "$project_path/okrun-vm.json"
   wait_for_file "$test_dir/empty-default-project/private-networks.json"
   grep -Fq '"okrun"' "$test_dir/empty-default-project/private-networks.json"
   grep -Fq '"enabled" : true' "$test_dir/empty-default-project/private-networks.json"
-  grep -Fq '"cidr" : "10.77.0.0/24"' "$test_dir/empty-default-project/private-networks.json"
+  tr -d '\\' <"$test_dir/empty-default-project/private-networks.json" | grep -Fq '"cidr" : "10.77.0.0/24"'
   registry_contains_project "$registry_path" "$project_path"
   capture "02-lifecycle-after-add"
 
@@ -621,16 +724,22 @@ run_project_lifecycle_smoke() {
   wait_for_file "$config_open_log"
   grep -Fq "$project_path/okrun-vm.json" "$config_open_log"
 
+  click_menu_item "VM" "Rename VM..."
+  capture "03-lifecycle-rename"
+  replace_text "Renamed Lifecycle VM"
+  click_button "Rename" "okrun.rename.confirm"
+  grep -Fq '"name" : "Renamed Lifecycle VM"' "$project_path/okrun-vm.json"
+
   click_menu_item "VM" "Delete VM"
-  capture "03-lifecycle-delete-confirmation"
-  type_text "ui-e2e-vm"
+  capture "04-lifecycle-delete-confirmation"
+  type_text "Renamed Lifecycle VM"
   click_button "Delete" "okrun.delete.confirm"
   wait_for_missing "$project_path"
   if registry_contains_project "$registry_path" "$project_path"; then
     printf 'Project path still exists in registry: %s\n' "$registry_path" >&2
     exit 1
   fi
-  capture "04-lifecycle-after-delete"
+  capture "05-lifecycle-after-delete"
   cleanup
 }
 
@@ -662,7 +771,6 @@ run_network_config_smoke() {
   local registry_path="$test_dir/.okrun"
   local home_path="$test_dir/home"
   local bind_port=$((20000 + $$ % 20000))
-  local peer_port=$((bind_port + 1))
 
   rm -rf "$test_dir"
   mkdir -p "$test_dir"
@@ -673,25 +781,19 @@ run_network_config_smoke() {
   wait_for_file "$home_path/private-networks.json"
   capture "08-network-config-open"
 
-  click_checkbox "okrun.network.bridge.enabled"
-  click_checkbox "okrun.network.bridge.bind-enabled"
-  set_accessibility_value "okrun.network.bridge.bind-host" "127.0.0.1"
-  set_accessibility_value "okrun.network.bridge.bind-port" "$bind_port"
-  set_accessibility_value "okrun.network.bridge.peer-host" "127.0.0.1"
-  set_accessibility_value "okrun.network.bridge.peer-port" "$peer_port"
-  click_button "Add Peer" "okrun.network.bridge.peer-add"
+  click_network_tab "Local Switch"
+  click_network_checkbox "Local Switch"
+  set_network_tab_text_field 1 "127.0.0.1:$bind_port"
   click_button "Apply & Connect" "okrun.network.apply"
 
-  grep -Fq '"bridge"' "$home_path/private-networks.json"
-  grep -Fq '"host" : "127.0.0.1"' "$home_path/private-networks.json"
-  grep -Fq "\"port\" : $bind_port" "$home_path/private-networks.json"
-  grep -Fq "\"port\" : $peer_port" "$home_path/private-networks.json"
-  wait_for_accessibility_value "okrun.network.status.bind" "Listening on 127.0.0.1:$bind_port"
+  grep -Fq '"localSwitch"' "$home_path/private-networks.json"
+  grep -Fq '"enabled" : true' "$home_path/private-networks.json"
+  grep -Fq "\"server\" : \"127.0.0.1:$bind_port\"" "$home_path/private-networks.json"
 
-  click_button "Remove Peer" "okrun.network.bridge.peer-remove"
+  click_network_checkbox "Local Switch"
   click_button "Apply & Connect" "okrun.network.apply"
-  if grep -Fq "\"port\" : $peer_port" "$home_path/private-networks.json"; then
-    printf 'Peer was not removed from private network config.\n' >&2
+  if grep -Fq "\"server\" : \"127.0.0.1:$bind_port\"" "$home_path/private-networks.json"; then
+    printf 'Local Switch was not removed from private network config.\n' >&2
     exit 1
   fi
   capture "09-network-config-bound"
@@ -759,6 +861,12 @@ run_titlebar_zoom_keeps_sidebar_visible() {
   sleep 0.8
   assert_sidebar_visible "after titlebar zoom"
   capture "12-titlebar-after-zoom"
+  click_button "Hide Sidebar" "okrun.sidebar.hide"
+  assert_button_exists "Show Sidebar" "okrun.sidebar.show"
+  capture "13-titlebar-sidebar-collapsed"
+  click_button "Show Sidebar" "okrun.sidebar.show"
+  assert_sidebar_visible "after sidebar restore"
+  capture "14-titlebar-sidebar-restored"
   cleanup
 }
 

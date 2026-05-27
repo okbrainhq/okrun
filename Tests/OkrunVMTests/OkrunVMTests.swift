@@ -23,6 +23,12 @@ struct OkrunVMTests {
         #expect(paths.efiStore == vmDirectory.appendingPathComponent("efi.variables"))
         #expect(paths.savedStateEfiStore == vmDirectory.appendingPathComponent("efi.variables.machine-state"))
         #expect(paths.installerEfiStore == vmDirectory.appendingPathComponent("installer.efi.variables"))
+        #expect(paths.machineIdentifier == vmDirectory.appendingPathComponent("machine.identifier"))
+        #expect(paths.macOSRawDisk == vmDirectory.appendingPathComponent("macos.raw"))
+        #expect(paths.macOSASIFDisk == vmDirectory.appendingPathComponent("macos.asif"))
+        #expect(paths.macOSAuxiliaryStorage == vmDirectory.appendingPathComponent("macos.auxiliary-storage"))
+        #expect(paths.macOSHardwareModel == vmDirectory.appendingPathComponent("macos.hardware-model"))
+        #expect(paths.macOSMachineIdentifier == vmDirectory.appendingPathComponent("macos.machine-identifier"))
         #expect(paths.machineState == vmDirectory.appendingPathComponent("machine.state"))
     }
 
@@ -47,6 +53,17 @@ struct OkrunVMTests {
         let paths = VMPaths.project(at: project)
 
         #expect(try paths.diskURL(for: .asif).lastPathComponent == "linux.asif")
+    }
+
+    @Test
+    func vmPathsResolveMacOSDiskNamesSeparatelyFromLinuxDisks() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let paths = VMPaths.project(at: project)
+
+        #expect(try paths.diskURL(for: .raw, guestOS: .macOS).lastPathComponent == "macos.raw")
+        #expect(try paths.diskURL(for: .asif, guestOS: .macOS).lastPathComponent == "macos.asif")
     }
 
     @Test
@@ -79,6 +96,27 @@ struct OkrunVMTests {
     }
 
     @Test
+    func vmConfigSavesAndLoadsName() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let configURL = project.appendingPathComponent("okrun-vm.json")
+        let config = try VMConfig(
+            name: "  Dev Box  ",
+            cpuCount: 4,
+            memoryGB: 4,
+            diskGB: 64,
+            installerISOPath: nil
+        ).validated()
+        try config.save(to: configURL)
+
+        let loaded = try VMConfig.load(from: configURL)
+
+        #expect(loaded.name == "Dev Box")
+        #expect(loaded.displayName(fallbackProjectPath: project.path) == "Dev Box")
+    }
+
+    @Test
     func vmConfigLoadsLegacyConfigWithoutSharedDirectories() throws {
         let project = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(project) }
@@ -98,7 +136,10 @@ struct OkrunVMTests {
         #expect(config.cpuCount == 2)
         #expect(config.memoryGB == 3)
         #expect(config.diskGB == 20)
+        #expect(config.guestOS == .linux)
         #expect(config.installerISOPath == nil)
+        #expect(config.name == nil)
+        #expect(config.displayName(fallbackProjectPath: project.path) == project.lastPathComponent)
         #expect(config.privateNetwork == .enabled)
         #expect(config.sharedDirectories == [])
         #expect(config.diskIO == .defaults)
@@ -106,6 +147,7 @@ struct OkrunVMTests {
 
         let migratedData = try Data(contentsOf: configURL)
         let migratedJSON = try #require(JSONSerialization.jsonObject(with: migratedData) as? [String: Any])
+        #expect(migratedJSON["guestOS"] as? String == "linux")
         #expect(migratedJSON["diskFormat"] as? String == "raw")
         let privateNetwork = try #require(migratedJSON["privateNetwork"] as? [String: Any])
         #expect(privateNetwork["enabled"] as? Bool == true)
@@ -143,6 +185,28 @@ struct OkrunVMTests {
 
         #expect(try VMConfig.load(from: configURL) == config)
     }
+
+#if arch(arm64)
+    @Test
+    func vmConfigSavesAndLoadsMacOSGuestType() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let configURL = project.appendingPathComponent("okrun-vm.json")
+        let config = VMConfig(
+            cpuCount: 4,
+            memoryGB: 8,
+            diskGB: 80,
+            installerISOPath: "/tmp/macos.ipsw",
+            privateNetwork: .enabled,
+            guestOS: .macOS
+        )
+
+        try config.save(to: configURL)
+
+        #expect(try VMConfig.load(from: configURL) == config)
+    }
+#endif
 
     @Test
     func vmConfigSavesAndLoadsStartupConfig() throws {
@@ -233,6 +297,7 @@ struct OkrunVMTests {
             #expect(config.cpuCount == 4)
             #expect(config.memoryGB == 4)
             #expect(config.diskGB == 9)
+            #expect(config.guestOS == .linux)
             #expect(config.diskFormat == .asif)
             #expect(config.diskIO == .defaults)
             #expect(config.installerISOPath == nil)
@@ -928,6 +993,29 @@ struct OkrunVMTests {
         let attributes = try FileManager.default.attributesOfItem(atPath: paths.disk.path)
         #expect(attributes[.size] as? UInt64 == 1_073_741_824)
     }
+
+#if arch(arm64)
+    @Test
+    func storagePrepareMacOSRequiresInstallerBeforeMetadataExists() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let paths = VMPaths.project(at: project)
+        let config = VMConfig(
+            cpuCount: 4,
+            memoryGB: 8,
+            diskGB: 1,
+            installerISOPath: nil,
+            guestOS: .macOS
+        )
+
+        #expect(throws: (any Error).self) {
+            try VMStorage.prepare(paths: paths, config: config)
+        }
+        #expect(FileManager.default.fileExists(atPath: paths.macOSRawDisk.path))
+        #expect(!FileManager.default.fileExists(atPath: paths.macOSAuxiliaryStorage.path))
+    }
+#endif
 
     @Test
     func storagePrepareCreatesASIFDiskOnSupportedHosts() throws {

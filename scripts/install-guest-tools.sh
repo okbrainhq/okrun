@@ -14,12 +14,14 @@ ENABLE_VIRTIOFS_MOUNT="1"
 RESIZE_ROOT="0"
 HEALTH_INTERVAL="60"
 LOG_SHARE_NAME="okrun-guest-logs"
+GUEST_OS="${OKRUN_GUEST_OS:-auto}"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/install-guest-tools.sh [options] <hostname-or-ip>
 
 Copies and installs generic Okrun guest support over SSH/SCP.
+The remote installer supports Linux and macOS guests.
 
 Options:
   --user USER              SSH user. Defaults to current local user or OKRUN_GUEST_USER.
@@ -29,10 +31,11 @@ Options:
                            the default when --private-ip is not supplied.
   --private-ip CIDR        Persist a private-network address, for example 10.77.0.3/24.
   --private-iface IFACE    Interface for private networking. Defaults to auto-detect in the guest.
-  --no-virtiofs-mount      Do not install the /mnt/okrun VirtioFS mount unit.
-  --log-share NAME         Required writable share below /mnt/okrun. Default: okrun-guest-logs.
+  --no-virtiofs-mount      Do not install the Okrun VirtioFS mount unit.
+  --log-share NAME         Required writable share below the guest mount root. Default: okrun-guest-logs.
   --resize-root            Try to grow the guest root partition/filesystem.
   --health-interval SEC    Seconds between health log snapshots. Default: 60.
+  --guest-os OS            Override remote OS detection: auto, linux, or macos.
   -h, --help               Show this help.
 
 Examples:
@@ -95,6 +98,14 @@ while [[ $# -gt 0 ]]; do
       [[ "$HEALTH_INTERVAL" =~ ^[0-9]+$ ]] || { echo "--health-interval must be seconds" >&2; exit 64; }
       shift 2
       ;;
+    --guest-os)
+      GUEST_OS="${2:-}"
+      case "$GUEST_OS" in
+        auto|linux|macos) ;;
+        *) echo "--guest-os must be auto, linux, or macos" >&2; exit 64 ;;
+      esac
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -133,6 +144,9 @@ if [[ -n "$SSH_IDENTITY" ]]; then
 fi
 
 INSTALL_ARGS=(--health-interval "$HEALTH_INTERVAL" --log-share "$LOG_SHARE_NAME")
+if [[ "$GUEST_OS" != "auto" ]]; then
+  INSTALL_ARGS+=(--guest-os "$GUEST_OS")
+fi
 if [[ "$ENABLE_VIRTIOFS_MOUNT" == "0" ]]; then
   INSTALL_ARGS+=(--no-virtiofs-mount)
 fi

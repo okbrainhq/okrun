@@ -23,18 +23,25 @@ struct VMPaths {
     let disk: URL
     let rawDisk: URL
     let asifDisk: URL
+    let macOSRawDisk: URL
+    let macOSASIFDisk: URL
     let legacyDisk: URL
     let savedStateDisk: URL
     let efiStore: URL
     let savedStateEfiStore: URL
     let installerEfiStore: URL
     let machineIdentifier: URL
+    let macOSAuxiliaryStorage: URL
+    let macOSHardwareModel: URL
+    let macOSMachineIdentifier: URL
     let machineState: URL
 
     static func project(at root: URL) -> VMPaths {
         let vmDirectory = root.appendingPathComponent("vm", isDirectory: true)
         let rawDisk = vmDirectory.appendingPathComponent("linux.raw")
         let asifDisk = vmDirectory.appendingPathComponent("linux.asif")
+        let macOSRawDisk = vmDirectory.appendingPathComponent("macos.raw")
+        let macOSASIFDisk = vmDirectory.appendingPathComponent("macos.asif")
         let legacyDisk = vmDirectory.appendingPathComponent("debian.raw")
         let disk = preferredDisk(rawDisk: rawDisk, asifDisk: asifDisk, legacyDisk: legacyDisk)
         return VMPaths(
@@ -44,12 +51,17 @@ struct VMPaths {
             disk: disk,
             rawDisk: rawDisk,
             asifDisk: asifDisk,
+            macOSRawDisk: macOSRawDisk,
+            macOSASIFDisk: macOSASIFDisk,
             legacyDisk: legacyDisk,
             savedStateDisk: vmDirectory.appendingPathComponent("machine-state.raw"),
             efiStore: vmDirectory.appendingPathComponent("efi.variables"),
             savedStateEfiStore: vmDirectory.appendingPathComponent("efi.variables.machine-state"),
             installerEfiStore: vmDirectory.appendingPathComponent("installer.efi.variables"),
             machineIdentifier: vmDirectory.appendingPathComponent("machine.identifier"),
+            macOSAuxiliaryStorage: vmDirectory.appendingPathComponent("macos.auxiliary-storage"),
+            macOSHardwareModel: vmDirectory.appendingPathComponent("macos.hardware-model"),
+            macOSMachineIdentifier: vmDirectory.appendingPathComponent("macos.machine-identifier"),
             machineState: vmDirectory.appendingPathComponent("machine.state")
         )
     }
@@ -71,10 +83,19 @@ struct VMPaths {
     }
 
     func diskURL(for config: VMConfig) throws -> URL {
-        try diskURL(for: config.diskFormat)
+        try diskURL(for: config.diskFormat, guestOS: config.guestOS)
     }
 
-    func diskURL(for format: DiskImageFormat) throws -> URL {
+    func diskURL(for format: DiskImageFormat, guestOS: GuestOS = .linux) throws -> URL {
+        switch guestOS {
+        case .linux:
+            return try linuxDiskURL(for: format)
+        case .macOS:
+            return try macOSDiskURL(for: format)
+        }
+    }
+
+    private func linuxDiskURL(for format: DiskImageFormat) throws -> URL {
         let fileManager = FileManager.default
         let rawExists = fileManager.fileExists(atPath: rawDisk.path)
         let asifExists = fileManager.fileExists(atPath: asifDisk.path)
@@ -110,6 +131,37 @@ struct VMPaths {
             return rawDisk
         case .asif:
             return asifDisk
+        }
+    }
+
+    private func macOSDiskURL(for format: DiskImageFormat) throws -> URL {
+        let fileManager = FileManager.default
+        let rawExists = fileManager.fileExists(atPath: macOSRawDisk.path)
+        let asifExists = fileManager.fileExists(atPath: macOSASIFDisk.path)
+
+        if rawExists && asifExists {
+            throw AppError("Multiple macOS VM disks exist in \(vmDirectory.path). Keep only one of macos.raw or macos.asif.")
+        }
+
+        if asifExists {
+            guard format == .asif else {
+                throw AppError("Existing macOS disk is macos.asif but diskFormat is '\(format.rawValue)'. Set diskFormat to 'asif' or move \(macOSASIFDisk.path).")
+            }
+            return macOSASIFDisk
+        }
+
+        if rawExists {
+            guard format == .raw else {
+                throw AppError("Existing macOS disk is macos.raw but diskFormat is '\(format.rawValue)'. Set diskFormat to 'raw' or move \(macOSRawDisk.path).")
+            }
+            return macOSRawDisk
+        }
+
+        switch format {
+        case .raw:
+            return macOSRawDisk
+        case .asif:
+            return macOSASIFDisk
         }
     }
 }
@@ -340,6 +392,44 @@ enum DiskImageFormat: String, Codable, Equatable {
     }
 }
 
+enum GuestOS: String, Codable, Equatable {
+    case linux
+    case macOS = "macos"
+
+    var displayName: String {
+        switch self {
+        case .linux:
+            return "Linux"
+        case .macOS:
+            return "macOS"
+        }
+    }
+
+    var installerKindName: String {
+        switch self {
+        case .linux:
+            return "ISO"
+        case .macOS:
+            return "IPSW"
+        }
+    }
+}
+
+enum GuestOSValidator {
+    static func validate(_ guestOS: GuestOS) throws {
+        switch guestOS {
+        case .linux:
+            return
+        case .macOS:
+#if arch(arm64)
+            return
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
+        }
+    }
+}
+
 enum DiskCachingMode: String, Codable, Equatable {
     case automatic
     case cached
@@ -422,6 +512,8 @@ struct VMConfig: Codable, Equatable {
         )
     }
 
+    let name: String?
+    let guestOS: GuestOS
     let cpuCount: Int
     let memoryGB: Int
     let diskGB: Int
@@ -433,6 +525,8 @@ struct VMConfig: Codable, Equatable {
     let startup: VMStartupConfig
 
     enum CodingKeys: String, CodingKey {
+        case name
+        case guestOS
         case cpuCount
         case memoryGB
         case diskGB
@@ -445,6 +539,7 @@ struct VMConfig: Codable, Equatable {
     }
 
     init(
+        name: String? = nil,
         cpuCount: Int,
         memoryGB: Int,
         diskGB: Int,
@@ -453,8 +548,11 @@ struct VMConfig: Codable, Equatable {
         privateNetwork: PrivateNetworkConfig = .enabled,
         sharedDirectories: [SharedDirectoryConfig] = [],
         diskIO: DiskIOConfig = .defaults,
-        startup: VMStartupConfig = .disabled
+        startup: VMStartupConfig = .disabled,
+        guestOS: GuestOS = .linux
     ) {
+        self.name = name
+        self.guestOS = guestOS
         self.cpuCount = cpuCount
         self.memoryGB = memoryGB
         self.diskGB = diskGB
@@ -468,6 +566,8 @@ struct VMConfig: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        guestOS = try container.decodeIfPresent(GuestOS.self, forKey: .guestOS) ?? .linux
         cpuCount = try container.decode(Int.self, forKey: .cpuCount)
         memoryGB = try container.decode(Int.self, forKey: .memoryGB)
         diskGB = try container.decode(Int.self, forKey: .diskGB)
@@ -481,6 +581,8 @@ struct VMConfig: Codable, Equatable {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encode(guestOS, forKey: .guestOS)
         try container.encode(cpuCount, forKey: .cpuCount)
         try container.encode(memoryGB, forKey: .memoryGB)
         try container.encode(diskGB, forKey: .diskGB)
@@ -508,8 +610,11 @@ struct VMConfig: Codable, Equatable {
         }
 
         let data = try Data(contentsOf: url)
-        let config = try JSONDecoder().decode(VMConfig.self, from: data).validated()
-        if !Self.configDataContainsDiskFormat(data)
+        let decodedConfig = try JSONDecoder().decode(VMConfig.self, from: data)
+        let config = try decodedConfig.validated()
+        if decodedConfig != config
+            || !Self.configDataContainsGuestOS(data)
+            || !Self.configDataContainsDiskFormat(data)
             || !Self.configDataContainsDiskIO(data)
             || !Self.configDataContainsPrivateNetwork(data)
             || !Self.configDataContainsStartup(data) {
@@ -526,6 +631,15 @@ struct VMConfig: Codable, Equatable {
     }
 
     func validated() throws -> VMConfig {
+        let normalizedName = Self.normalizedName(name)
+        if let normalizedName {
+            guard normalizedName.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
+                throw AppError("name must not contain NUL.")
+            }
+            guard normalizedName.utf8.count <= 128 else {
+                throw AppError("name must be 128 bytes or fewer.")
+            }
+        }
         guard cpuCount > 0 else {
             throw AppError("cpuCount must be greater than 0.")
         }
@@ -538,9 +652,48 @@ struct VMConfig: Codable, Equatable {
         guard diskFormat.isSupported else {
             throw AppError("diskFormat 'asif' requires macOS 26 Tahoe or later.")
         }
+        try GuestOSValidator.validate(guestOS)
         try PrivateNetworkValidator.validate(privateNetwork)
         try SharedDirectoryValidator.validate(sharedDirectories)
-        return self
+        return normalizedName == name ? self : withName(normalizedName)
+    }
+
+    static func normalizedName(_ name: String?) -> String? {
+        guard let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    func displayName(fallbackProjectPath: String) -> String {
+        if let name = Self.normalizedName(name) {
+            return name
+        }
+
+        let url = URL(fileURLWithPath: fallbackProjectPath, isDirectory: true)
+        let lastPathComponent = url.lastPathComponent
+        return lastPathComponent.isEmpty ? fallbackProjectPath : lastPathComponent
+    }
+
+    func withName(_ name: String?) -> VMConfig {
+        VMConfig(
+            name: name,
+            cpuCount: cpuCount,
+            memoryGB: memoryGB,
+            diskGB: diskGB,
+            installerISOPath: installerISOPath,
+            diskFormat: diskFormat,
+            privateNetwork: privateNetwork,
+            sharedDirectories: sharedDirectories,
+            diskIO: diskIO,
+            startup: startup,
+            guestOS: guestOS
+        )
+    }
+
+    private static func configDataContainsGuestOS(_ data: Data) -> Bool {
+        configData(data, contains: CodingKeys.guestOS.rawValue)
     }
 
     private static func configDataContainsDiskFormat(_ data: Data) -> Bool {
@@ -1506,27 +1659,20 @@ enum VMStorage {
             }
         }
 
-        if !fileManager.fileExists(atPath: paths.efiStore.path) {
-            _ = try VZEFIVariableStore(creatingVariableStoreAt: paths.efiStore)
-        }
-
-        if !fileManager.fileExists(atPath: paths.machineIdentifier.path) {
-            let machineIdentifier = VZGenericMachineIdentifier()
-            try machineIdentifier.dataRepresentation.write(to: paths.machineIdentifier, options: .atomic)
-        }
+        try prepareBootMetadata(paths: paths, config: config)
 
         let hostAvailableBytes = hostAvailableBytes(for: paths.vmDirectory)
         let result = PreparationResult(diskChange: diskChange, hostAvailableBytes: hostAvailableBytes)
         let diskInfo = try? DiskImageInfo.load(from: diskURL)
         AppLog.storage.info(
             """
-            Prepared storage project=\(paths.root.path, privacy: .public) disk=\(diskURL.path, privacy: .public) format=\(config.diskFormat.rawValue, privacy: .public) configuredGB=\(config.diskGB) change=\(String(describing: diskChange), privacy: .public) apparentBytes=\(diskInfo?.apparentSize ?? 0) allocatedBytes=\(diskInfo?.allocatedSize ?? 0) hostAvailableBytes=\(hostAvailableBytes ?? 0)
+            Prepared storage project=\(paths.root.path, privacy: .public) guestOS=\(config.guestOS.rawValue, privacy: .public) disk=\(diskURL.path, privacy: .public) format=\(config.diskFormat.rawValue, privacy: .public) configuredGB=\(config.diskGB) change=\(String(describing: diskChange), privacy: .public) apparentBytes=\(diskInfo?.apparentSize ?? 0) allocatedBytes=\(diskInfo?.allocatedSize ?? 0) hostAvailableBytes=\(hostAvailableBytes ?? 0)
             """
         )
 
         if result.expandedDisk {
             AppLog.storage.warning(
-                "Disk image expanded for project=\(paths.root.path, privacy: .public). Guest partition/filesystem still needs to be grown inside Linux."
+                "Disk image expanded for project=\(paths.root.path, privacy: .public). Guest partition/filesystem may still need to be grown inside \(config.guestOS.displayName, privacy: .public)."
             )
         }
 
@@ -1537,6 +1683,31 @@ enum VMStorage {
         }
 
         return result
+    }
+
+    private static func prepareBootMetadata(paths: VMPaths, config: VMConfig) throws {
+        let fileManager = FileManager.default
+
+        switch config.guestOS {
+        case .linux:
+            if !fileManager.fileExists(atPath: paths.efiStore.path) {
+                _ = try VZEFIVariableStore(creatingVariableStoreAt: paths.efiStore)
+            }
+
+            if !fileManager.fileExists(atPath: paths.machineIdentifier.path) {
+                let machineIdentifier = VZGenericMachineIdentifier()
+                try machineIdentifier.dataRepresentation.write(to: paths.machineIdentifier, options: .atomic)
+            }
+        case .macOS:
+#if arch(arm64)
+            let installerImageURL = config.installerISOPath.flatMap { path -> URL? in
+                path.isEmpty ? nil : URL(fileURLWithPath: path)
+            }
+            try MacOSGuestMetadata.prepare(paths: paths, config: config, installerImageURL: installerImageURL)
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
+        }
     }
 
     private static func hostAvailableBytes(for url: URL) -> UInt64? {
@@ -1558,6 +1729,132 @@ enum VMStorage {
         return nil
     }
 }
+
+#if arch(arm64)
+enum MacOSGuestMetadata {
+    static func prepare(paths: VMPaths, config: VMConfig, installerImageURL: URL?) throws {
+        let fileManager = FileManager.default
+        let hasHardwareModel = fileManager.fileExists(atPath: paths.macOSHardwareModel.path)
+        let hasAuxiliaryStorage = fileManager.fileExists(atPath: paths.macOSAuxiliaryStorage.path)
+
+        let hardwareModel: VZMacHardwareModel
+        if hasHardwareModel {
+            hardwareModel = try loadHardwareModel(from: paths.macOSHardwareModel)
+        } else {
+            guard !hasAuxiliaryStorage else {
+                throw AppError("macOS hardware model metadata is missing for the existing auxiliary storage at \(paths.macOSAuxiliaryStorage.path). Restore \(paths.macOSHardwareModel.path) or create a new macOS VM project.")
+            }
+            let requirements = try loadConfigurationRequirements(from: installerImageURL)
+            try validate(config: config, satisfies: requirements)
+            hardwareModel = requirements.hardwareModel
+            guard hardwareModel.isSupported else {
+                throw AppError("The selected macOS restore image uses a hardware model that is not supported on this Mac.")
+            }
+            try hardwareModel.dataRepresentation.write(to: paths.macOSHardwareModel, options: .atomic)
+        }
+
+        if !fileManager.fileExists(atPath: paths.macOSMachineIdentifier.path) {
+            let machineIdentifier = VZMacMachineIdentifier()
+            try machineIdentifier.dataRepresentation.write(to: paths.macOSMachineIdentifier, options: .atomic)
+        }
+
+        if !hasAuxiliaryStorage {
+            _ = try VZMacAuxiliaryStorage(
+                creatingStorageAt: paths.macOSAuxiliaryStorage,
+                hardwareModel: hardwareModel,
+                options: []
+            )
+        }
+    }
+
+    static func loadHardwareModel(from url: URL) throws -> VZMacHardwareModel {
+        let data = try Data(contentsOf: url)
+        guard let hardwareModel = VZMacHardwareModel(dataRepresentation: data) else {
+            throw AppError("Invalid macOS hardware model metadata at \(url.path)")
+        }
+        guard hardwareModel.isSupported else {
+            throw AppError("The macOS hardware model saved at \(url.path) is not supported on this Mac.")
+        }
+        return hardwareModel
+    }
+
+    static func loadMachineIdentifier(from url: URL) throws -> VZMacMachineIdentifier {
+        let data = try Data(contentsOf: url)
+        guard let machineIdentifier = VZMacMachineIdentifier(dataRepresentation: data) else {
+            throw AppError("Invalid macOS machine identifier at \(url.path)")
+        }
+        return machineIdentifier
+    }
+
+    static func loadAuxiliaryStorage(from url: URL) throws -> VZMacAuxiliaryStorage {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw AppError("Missing macOS auxiliary storage at \(url.path). Boot the installer with an IPSW restore image first.")
+        }
+        return VZMacAuxiliaryStorage(url: url)
+    }
+
+    static func loadRestoreImage(from url: URL) throws -> VZMacOSRestoreImage {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw AppError("macOS restore image does not exist: \(url.path)")
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var loadedResult: Result<VZMacOSRestoreImage, any Error>?
+
+        VZMacOSRestoreImage.load(from: url) { result in
+            lock.lock()
+            loadedResult = result
+            lock.unlock()
+            semaphore.signal()
+        }
+        semaphore.wait()
+
+        lock.lock()
+        let result = loadedResult
+        lock.unlock()
+
+        switch result {
+        case .success(let restoreImage):
+            if #available(macOS 13.0, *), !restoreImage.isSupported {
+                throw AppError("The selected macOS restore image is not supported on this Mac.")
+            }
+            return restoreImage
+        case .failure(let error):
+            throw AppError("Failed to load macOS restore image \(url.path): \(error.localizedDescription)")
+        case .none:
+            throw AppError("Failed to load macOS restore image \(url.path).")
+        }
+    }
+
+    private static func loadConfigurationRequirements(from installerImageURL: URL?) throws -> VZMacOSConfigurationRequirements {
+        guard let installerImageURL else {
+            throw AppError("macOS guests need an IPSW restore image before first boot so Okrun can create Mac hardware metadata.")
+        }
+
+        let restoreImage = try loadRestoreImage(from: installerImageURL)
+        guard let requirements = restoreImage.mostFeaturefulSupportedConfiguration else {
+            throw AppError("The selected macOS restore image has no configuration supported by this Mac.")
+        }
+        return requirements
+    }
+
+    private static func validate(config: VMConfig, satisfies requirements: VZMacOSConfigurationRequirements) throws {
+        let requestedMemoryBytes = UInt64(config.memoryGB) * 1024 * 1024 * 1024
+        let minimumCPUCount = Int(requirements.minimumSupportedCPUCount)
+        guard config.cpuCount >= minimumCPUCount else {
+            throw AppError("This macOS restore image requires at least \(minimumCPUCount) CPUs.")
+        }
+        guard requestedMemoryBytes >= requirements.minimumSupportedMemorySize else {
+            let minimum = ByteCountFormatter.string(
+                fromByteCount: Int64(min(requirements.minimumSupportedMemorySize, UInt64(Int64.max))),
+                countStyle: .memory
+            )
+            throw AppError("This macOS restore image requires at least \(minimum) of memory.")
+        }
+    }
+}
+#endif
 
 enum DiskImageAttachmentFactory {
     static func make(url: URL, readOnly: Bool, diskIO: DiskIOConfig? = nil) throws -> VZDiskImageStorageDeviceAttachment {

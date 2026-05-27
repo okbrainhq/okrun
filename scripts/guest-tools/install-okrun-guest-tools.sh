@@ -8,8 +8,11 @@ ENABLE_VIRTIOFS_MOUNT="1"
 RESIZE_ROOT="0"
 HEALTH_INTERVAL="60"
 GUEST_ROOT="${OKRUN_GUEST_ROOT:-}"
+GUEST_OS="${OKRUN_GUEST_OS:-auto}"
 managed_virtiofs_mount_config="0"
 LOG_SHARE_NAME="okrun-guest-logs"
+LINUX_SHARE_MOUNT_POINT="/mnt/okrun"
+MACOS_SHARE_MOUNT_POINT="/Volumes/okrun"
 
 guest_path() {
   printf '%s%s' "$GUEST_ROOT" "$1"
@@ -28,20 +31,22 @@ usage() {
   cat <<'EOF'
 Usage: sudo install-okrun-guest-tools.sh [options]
 
-Installs generic Okrun guest support inside a Linux VM.
+Installs generic Okrun guest support inside a Linux or macOS VM.
 
 Options:
   --private-dhcp           Configure the private-network interface with DHCP. This is
                            the default when --private-ip is not supplied.
   --private-ip CIDR        Persist a private-network address, for example 10.77.0.3/24.
   --private-iface IFACE    Interface for private networking. Defaults to auto-detect.
-  --no-virtiofs-mount      Do not install the /mnt/okrun VirtioFS mount unit.
-  --log-share NAME         Required writable share below /mnt/okrun. Default: okrun-guest-logs.
+  --no-virtiofs-mount      Do not install the Okrun VirtioFS mount unit.
+  --log-share NAME         Required writable share below the Okrun mount root. Default: okrun-guest-logs.
   --resize-root            Try to grow the root partition/filesystem if free disk space is adjacent.
+                           Linux only; macOS guests skip this safely.
   --health-interval SEC    Seconds between health log snapshots. Default: 60.
+  --guest-os OS            Override guest OS detection: auto, linux, or macos.
   -h, --help               Show this help.
 
-Logs are written to /mnt/okrun/<log-share>/guest-health.log and journald.
+Logs are written below /mnt/okrun on Linux or /Volumes/okrun on macOS.
 EOF
 }
 
@@ -79,6 +84,14 @@ while [[ $# -gt 0 ]]; do
       [[ "$HEALTH_INTERVAL" =~ ^[0-9]+$ ]] || { echo "--health-interval must be seconds" >&2; exit 64; }
       shift 2
       ;;
+    --guest-os)
+      GUEST_OS="${2:-}"
+      case "$GUEST_OS" in
+        auto|linux|macos) ;;
+        *) echo "--guest-os must be auto, linux, or macos" >&2; exit 64 ;;
+      esac
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -101,7 +114,369 @@ if [[ "$LOG_SHARE_NAME" == */* || "$LOG_SHARE_NAME" == *:* ]]; then
   exit 64
 fi
 
-LOG_DIR="/mnt/okrun/$LOG_SHARE_NAME"
+print_missing_log_share_instructions() {
+  cat >&2 <<EOF
+Missing writable Okrun guest log share: $LOG_DIR
+
+Okrun now creates and mounts this share automatically when the VM starts. On the
+Mac, use an updated Okrun build, fully stop the VM, and start it again. The host
+will create this project directory if needed:
+
+  <project>/vm/guest-logs
+
+After the VM restarts, rerun:
+
+  ./scripts/install-guest-tools.sh <hostname-or-ip>
+
+EOF
+}
+
+detect_guest_os() {
+  if [[ "$GUEST_OS" != "auto" ]]; then
+    printf '%s\n' "$GUEST_OS"
+    return
+  fi
+
+  if [[ -n "$GUEST_ROOT" ]]; then
+    printf 'linux\n'
+    return
+  fi
+
+  case "$(uname -s)" in
+    Darwin) printf 'macos\n' ;;
+    Linux) printf 'linux\n' ;;
+    *)
+      echo "Unsupported guest OS: $(uname -s). Use --guest-os linux or --guest-os macos if this is unexpected." >&2
+      exit 77
+      ;;
+  esac
+}
+
+GUEST_OS="$(detect_guest_os)"
+case "$GUEST_OS" in
+  macos) SHARE_MOUNT_POINT="$MACOS_SHARE_MOUNT_POINT" ;;
+  linux) SHARE_MOUNT_POINT="$LINUX_SHARE_MOUNT_POINT" ;;
+  *) SHARE_MOUNT_POINT="$LINUX_SHARE_MOUNT_POINT" ;;
+esac
+LOG_DIR="$SHARE_MOUNT_POINT/$LOG_SHARE_NAME"
+
+set_root_wheel_if_live() {
+  [[ -z "$GUEST_ROOT" ]] || return 0
+  chown root:wheel "$@" 2>/dev/null || true
+}
+
+launch_macos_plist() {
+  local plist="$1"
+  local label="$2"
+
+  [[ -z "$GUEST_ROOT" ]] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+
+  launchctl bootout "system/$label" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
+  launchctl bootstrap system "$plist" >/dev/null 2>&1 || launchctl load -w "$plist" >/dev/null 2>&1 || true
+  launchctl kickstart -k "system/$label" >/dev/null 2>&1 || true
+}
+
+macos_log_share_is_ready() {
+  local guest_log_dir
+  guest_log_dir="$(guest_path "$LOG_DIR")"
+  [[ -d "$guest_log_dir" && -w "$guest_log_dir" ]]
+}
+
+require_macos_log_share() {
+  if macos_log_share_is_ready; then
+    return 0
+  fi
+
+  print_missing_log_share_instructions
+  exit 78
+}
+
+cidr_to_netmask() {
+  local prefix="$1"
+  local octet value bits
+  local parts=()
+
+  [[ "$prefix" =~ ^[0-9]+$ && "$prefix" -ge 0 && "$prefix" -le 32 ]] || return 1
+
+  for ((octet = 0; octet < 4; octet++)); do
+    if (( prefix >= 8 )); then
+      value=255
+      prefix=$((prefix - 8))
+    elif (( prefix > 0 )); then
+      bits=$((8 - prefix))
+      value=$((256 - (1 << bits)))
+      prefix=0
+    else
+      value=0
+    fi
+    parts+=("$value")
+  done
+
+  printf '%s.%s.%s.%s\n' "${parts[0]}" "${parts[1]}" "${parts[2]}" "${parts[3]}"
+}
+
+install_macos_diagnose() {
+  cat >"$(guest_path /usr/local/sbin/okrun-guest-diagnose)" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -r /etc/okrun/guest-tools.env ]]; then
+  # shellcheck disable=SC1091
+  source /etc/okrun/guest-tools.env
+fi
+OKRUN_LOG_DIR="${OKRUN_LOG_DIR:-/Volumes/okrun/okrun-guest-logs}"
+OKRUN_LOG_PROBE_TIMEOUT="${OKRUN_LOG_PROBE_TIMEOUT:-8}"
+
+section() {
+  printf '\n== %s ==\n' "$1"
+}
+
+run_probe() {
+  local name="$1"
+  shift
+
+  printf '\n-- %s --\n' "$name"
+  "$@" 2>&1 || true
+}
+
+section "Identity"
+run_probe sw-vers sw_vers
+run_probe hostname hostname
+run_probe uname uname -a
+run_probe uptime uptime
+
+section "Hardware"
+run_probe sysctl sysctl hw.memsize hw.ncpu kern.boottime kern.osrelease kern.osproductversion
+
+section "Disk"
+run_probe df df -h / /Volumes/okrun
+run_probe mount mount
+
+section "Network"
+run_probe ifconfig ifconfig
+run_probe routes netstat -rn
+
+section "Processes"
+run_probe ps-top bash -c 'ps ax -o pid,ppid,state,comm,%cpu,%mem | head -40'
+
+section "Recent Okrun Health"
+run_probe guest-health tail -300 "$OKRUN_LOG_DIR/guest-health.log"
+
+section "Recent System Logs"
+if command -v log >/dev/null 2>&1; then
+  run_probe system-log log show --last 30m --style compact --predicate 'eventMessage CONTAINS[c] "okrun" OR process CONTAINS[c] "okrun"'
+fi
+EOF
+  chmod 0755 "$(guest_path /usr/local/sbin/okrun-guest-diagnose)"
+}
+
+install_macos_virtiofs_mount() {
+  local mount_script plist
+  mount_script="$(guest_path /usr/local/sbin/okrun-mount-virtiofs)"
+  plist="$(guest_path /Library/LaunchDaemons/com.okrun.virtiofs.plist)"
+
+  mkdir -p "$(guest_path "$MACOS_SHARE_MOUNT_POINT")"
+  install -d -m 0755 "$(guest_path /Library/LaunchDaemons)"
+  cat >"$mount_script" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOUNT_POINT="/Volumes/okrun"
+TAG="okrun"
+
+mkdir -p "$MOUNT_POINT"
+
+if mount | awk -v mount_point="$MOUNT_POINT" '$3 == mount_point { found = 1 } END { exit found ? 0 : 1 }'; then
+  exit 0
+fi
+
+if command -v mount_virtiofs >/dev/null 2>&1; then
+  exec mount_virtiofs "$TAG" "$MOUNT_POINT"
+fi
+
+if [[ -x /System/Library/Filesystems/virtiofs.fs/Contents/Resources/mount_virtiofs ]]; then
+  exec /System/Library/Filesystems/virtiofs.fs/Contents/Resources/mount_virtiofs "$TAG" "$MOUNT_POINT"
+fi
+
+echo "mount_virtiofs is unavailable in this macOS guest." >&2
+exit 78
+EOF
+  chmod 0755 "$mount_script"
+
+  cat >"$plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.okrun.virtiofs</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/sbin/okrun-mount-virtiofs</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/okrun/virtiofs.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/okrun/virtiofs.launchd.err</string>
+</dict>
+</plist>
+EOF
+  chmod 0644 "$plist"
+  set_root_wheel_if_live "$mount_script" "$plist"
+
+  if [[ -z "$GUEST_ROOT" ]]; then
+    "$mount_script" || true
+  fi
+  launch_macos_plist "$plist" "com.okrun.virtiofs"
+}
+
+install_macos_private_network_config() {
+  [[ "$PRIVATE_IFACE" != "auto" ]] || {
+    return 0
+  }
+
+  local script plist ip prefix netmask mode
+  script="$(guest_path /usr/local/sbin/okrun-private-network)"
+  plist="$(guest_path /Library/LaunchDaemons/com.okrun.private-network.plist)"
+  install -d -m 0755 "$(guest_path /Library/LaunchDaemons)"
+
+  if [[ -n "$PRIVATE_IP_CIDR" ]]; then
+    ip="${PRIVATE_IP_CIDR%/*}"
+    prefix="${PRIVATE_IP_CIDR#*/}"
+    netmask="$(cidr_to_netmask "$prefix")" || {
+      echo "--private-ip must use a valid IPv4 CIDR prefix for macOS guests." >&2
+      exit 64
+    }
+    mode="static"
+    cat >"$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+/sbin/ifconfig "$PRIVATE_IFACE" inet "$ip" netmask "$netmask" up
+EOF
+  else
+    mode="dhcp"
+    cat >"$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+/usr/sbin/ipconfig set "$PRIVATE_IFACE" DHCP
+EOF
+  fi
+  chmod 0755 "$script"
+
+  cat >"$plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.okrun.private-network</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/sbin/okrun-private-network</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/okrun/private-network.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/okrun/private-network.launchd.err</string>
+</dict>
+</plist>
+EOF
+  chmod 0644 "$plist"
+  set_root_wheel_if_live "$script" "$plist"
+
+  if [[ -z "$GUEST_ROOT" ]]; then
+    "$script" || true
+  fi
+  launch_macos_plist "$plist" "com.okrun.private-network"
+  echo "Okrun macOS private network $mode config installed on $PRIVATE_IFACE."
+}
+
+install_macos_guest_tools() {
+  install -d -m 0755 \
+    "$(guest_path /usr/local/lib/okrun)" \
+    "$(guest_path /usr/local/sbin)" \
+    "$(guest_path /var/log/okrun)" \
+    "$(guest_path /etc/okrun)" \
+    "$(guest_path /Library/LaunchDaemons)"
+
+  install -m 0755 "$(dirname "$0")/okrun-guest-health.sh" "$(guest_path /usr/local/lib/okrun/okrun-guest-health.sh)"
+  cat >"$(guest_path /etc/okrun/guest-tools.env)" <<EOF
+OKRUN_LOG_DIR=$LOG_DIR
+OKRUN_LOG_PROBE_TIMEOUT=8
+EOF
+
+  install_macos_diagnose
+
+  if [[ "$ENABLE_VIRTIOFS_MOUNT" == "1" ]]; then
+    install_macos_virtiofs_mount
+  fi
+
+  install_macos_private_network_config
+
+  if [[ "$RESIZE_ROOT" == "1" ]]; then
+    echo "Skipping root resize: macOS guests manage APFS container growth separately."
+  fi
+
+  require_macos_log_share
+
+  local plist
+  plist="$(guest_path /Library/LaunchDaemons/com.okrun.guest-health.plist)"
+  cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.okrun.guest-health</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/lib/okrun/okrun-guest-health.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OKRUN_HEALTH_INTERVAL</key>
+    <string>$HEALTH_INTERVAL</string>
+    <key>OKRUN_LOG_DIR</key>
+    <string>$LOG_DIR</string>
+    <key>OKRUN_LOG_PROBE_TIMEOUT</key>
+    <string>8</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/okrun/guest-health.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/okrun/guest-health.launchd.err</string>
+</dict>
+</plist>
+EOF
+  chmod 0644 "$plist"
+  set_root_wheel_if_live "$plist"
+  launch_macos_plist "$plist" "com.okrun.guest-health"
+
+  echo "Okrun guest tools installed for macOS."
+  echo "Run: sudo okrun-guest-diagnose"
+}
+
+if [[ "$GUEST_OS" == "macos" ]]; then
+  install_macos_guest_tools
+  exit 0
+fi
+
+if [[ "$GUEST_OS" != "linux" ]]; then
+  echo "Unsupported guest OS: $GUEST_OS" >&2
+  exit 77
+fi
 
 install -d -m 0755 "$(guest_path /usr/local/lib/okrun)" "$(guest_path /usr/local/sbin)" "$(guest_path /var/log/okrun)" "$(guest_path /etc/okrun)"
 install -m 0755 "$(dirname "$0")/okrun-guest-health.sh" "$(guest_path /usr/local/lib/okrun/okrun-guest-health.sh)"
@@ -266,23 +641,6 @@ okrun_virtiofs_device_available() {
   fi
 
   return 1
-}
-
-print_missing_log_share_instructions() {
-  cat >&2 <<EOF
-Missing writable Okrun guest log share: $LOG_DIR
-
-Okrun now creates and mounts this share automatically when the VM starts. On the
-Mac, use an updated Okrun build, fully stop the VM, and start it again. The host
-will create this project directory if needed:
-
-  <project>/vm/guest-logs
-
-After the VM restarts, rerun:
-
-  ./scripts/install-guest-tools.sh <hostname-or-ip>
-
-EOF
 }
 
 require_log_share() {

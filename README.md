@@ -1,8 +1,8 @@
 # Okrun VM
 
-Okrun VM is a small native macOS app for running Linux VMs with
+Okrun VM is a small native macOS app for running Linux and macOS VMs with
 Virtualization.framework. The app is organized around VM projects: each project
-is a folder with its own config, disk, EFI store, and machine identity.
+is a folder with its own config, disk, boot metadata, and machine identity.
 
 ## Clone & Build It
 
@@ -36,20 +36,23 @@ Okrun runs on macOS 13 or later. New ASIF disks and ASIF imports require macOS
 
 Okrun remembers known VM projects in `~/.okrun/registry.json`. The sidebar shows
 one tab per VM project. Use the plus button for a new VM, the import button for
-an ASIF import, and the network button for private network settings.
+an ASIF import, and the network button for private network settings. Use the
+sidebar button or **View > Toggle Sidebar** to collapse the sidebar and give the
+VM display the full window width.
 
 ## Create a New VM
 
 1. Click **New VM**.
-2. Choose a VM folder. This folder becomes the Okrun project.
-3. Choose a Linux installer ISO. On Apple silicon, use an arm64/aarch64 ISO.
-4. Pick CPU, memory, disk size, and disk format.
-5. Click **Create**.
-6. Click **Boot Installer** and install Linux to the virtual disk.
-7. Shut Linux down cleanly.
-8. Click **Start** for normal installed boots.
+2. Enter a VM name.
+3. Choose a VM folder. This folder becomes the Okrun project.
+4. Choose the guest OS and installer image. Linux uses an ISO; macOS uses an IPSW restore image.
+5. Pick CPU, memory, disk size, and disk format.
+6. Click **Create**.
+7. Click **Boot Installer** and install the guest OS to the virtual disk.
+8. Shut the guest down cleanly.
+9. Click **Start** for normal installed boots.
 
-After installation, log in to Linux through the Okrun VM display. You need the
+After installation, log in through the Okrun VM display. For Linux, you need the
 VM's network name or IP address before you can SSH in or install guest tools.
 
 The project folder will look like this:
@@ -63,11 +66,17 @@ my-vm/
     machine.identifier
 ```
 
+macOS projects use `macos.raw` or `macos.asif` plus `macos.hardware-model`,
+`macos.machine-identifier`, and `macos.auxiliary-storage`. Okrun creates those
+files from the selected IPSW before the first macOS install.
+
 `okrun-vm.json` is the file to edit for VM resources, startup behavior, shared
 folders, and per-VM private networking:
 
 ```json
 {
+  "name": "my-vm",
+  "guestOS": "linux",
   "cpuCount": 4,
   "memoryGB": 4,
   "diskGB": 64,
@@ -88,7 +97,15 @@ folders, and per-VM private networking:
 }
 ```
 
-Use **VM > Edit VM Config** to open the selected VM's config. Stop the VM before
+Use `"guestOS": "macos"` with an IPSW path in `installerISOPath` for a macOS
+guest. When macOS is selected in **Add VM**, Okrun can open or copy Apple's
+latest restore-image download URL supported by the current Mac. macOS guests
+require Apple silicon. Okrun configures both the Mac trackpad device and a USB
+screen-coordinate pointing device, so mouse and trackpad input work across newer
+and older guests.
+
+Use **VM > Rename VM...** to change the selected VM's display name. Use
+**VM > Edit VM Config** to open the selected VM's config. Stop the VM before
 changing config that affects devices, disks, or shared directories.
 
 ## Find the VM IP
@@ -124,8 +141,8 @@ ssh <linux-user>@<hostname>.local
 
 ## Install Guest Tools
 
-After Linux is installed and SSH is enabled inside the VM, install the guest
-tools from your Mac:
+After Linux or macOS is installed and SSH is enabled inside the VM, install the
+guest tools from your Mac:
 
 ```sh
 ./scripts/install-guest-tools.sh --user <linux-user> <hostname-or-ip>
@@ -137,6 +154,7 @@ Examples:
 ./scripts/install-guest-tools.sh --user ubuntu 192.168.64.16
 ./scripts/install-guest-tools.sh --user arunoda --port 22 devbox.local
 ./scripts/install-guest-tools.sh --user ubuntu --identity ~/.ssh/id_ed25519 192.168.64.16
+./scripts/install-guest-tools.sh --guest-os macos --user arunoda macos-vm.local
 ```
 
 Fully stop and restart the VM once before running the installer so the managed
@@ -144,18 +162,21 @@ guest log share is present.
 
 The installer copies scripts over SSH and installs:
 
-- `okrun-guest-health.service` for periodic guest health logs.
+- `okrun-guest-health.service` on Linux or `com.okrun.guest-health` on macOS for periodic guest health logs.
 - `okrun-guest-diagnose` for one-shot guest diagnostics.
-- `/mnt/okrun` VirtioFS mount support.
-- DHCP setup for the Okrun private network interface.
+- VirtioFS mount support at `/mnt/okrun` on Linux or `/Volumes/okrun` on macOS.
+- DHCP setup for the Okrun private network interface on Linux, with macOS support when `--private-iface` is supplied.
 
 Guest health logs are written to the Mac side at `vm/guest-logs` and exposed to
-Linux as `/mnt/okrun/okrun-guest-logs`. Check them inside the VM with:
+Linux as `/mnt/okrun/okrun-guest-logs` or macOS as `/Volumes/okrun/okrun-guest-logs`.
+Check them inside the VM with:
 
 ```sh
 tail -f /mnt/okrun/okrun-guest-logs/guest-health.log
+tail -f /Volumes/okrun/okrun-guest-logs/guest-health.log
 sudo okrun-guest-diagnose
 systemctl status okrun-guest-health.service
+sudo launchctl print system/com.okrun.guest-health
 ```
 
 To grow the guest filesystem after increasing `diskGB`, run:
@@ -194,15 +215,26 @@ sudo mount -t virtiofs okrun /mnt/okrun
 ls /mnt/okrun
 ```
 
-Each configured folder appears below `/mnt/okrun` by its `name`:
+Inside macOS, mount the same share at the native Volumes location:
+
+```sh
+sudo mkdir -p /Volumes/okrun
+sudo mount_virtiofs okrun /Volumes/okrun
+ls /Volumes/okrun
+```
+
+Each configured folder appears below the guest mount root by its `name`:
 
 ```text
 /mnt/okrun/projects
 /mnt/okrun/downloads
+/Volumes/okrun/projects
+/Volumes/okrun/downloads
 ```
 
-Guest tools install a systemd mount unit for `/mnt/okrun`. Without guest tools,
-create one manually if you want the share mounted on boot.
+Guest tools install a systemd mount unit for `/mnt/okrun` on Linux or a launchd
+helper for `/Volumes/okrun` on macOS. Without guest tools, create one manually if
+you want the share mounted on boot.
 
 ## VM Networking
 
@@ -352,12 +384,12 @@ certificate, revocation, and LaunchAgent setup.
 
 ## Other Useful Stuff
 
-Use Okrun's **Shutdown** control or shut down from inside Linux. Force stop is
+Use Okrun's **Shutdown** control or shut down from inside the guest. Force stop is
 for stuck VMs only; it is equivalent to cutting power and can leave the guest
 filesystem needing repair.
 
-Increasing `diskGB` expands the virtual disk image, but Linux still needs its
-partition and filesystem expanded. Guest tools can try this with
+Increasing `diskGB` expands the virtual disk image, but the guest may still need
+its partition and filesystem expanded. Linux guest tools can try this with
 `--resize-root`; otherwise use tools such as `growpart` and `resize2fs` inside
 the guest.
 

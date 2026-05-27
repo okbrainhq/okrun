@@ -46,6 +46,7 @@ private class HoverIconButton: NSButton {
         super.init(frame: .zero)
         self.target = target
         self.action = action
+        title = label
         setAccessibilityLabel(label)
         translatesAutoresizingMaskIntoConstraints = false
         bezelStyle = .regularSquare
@@ -155,6 +156,24 @@ private final class DeleteConfirmationActions: NSObject, NSTextFieldDelegate {
     }
 }
 
+private final class RenameDialogActions: NSObject, NSTextFieldDelegate {
+    var onRename: (() -> Void)?
+    var onCancel: (() -> Void)?
+    var onTextChange: (() -> Void)?
+
+    @objc func rename() {
+        onRename?()
+    }
+
+    @objc func cancel() {
+        onCancel?()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        onTextChange?()
+    }
+}
+
 private final class VMTabSession {
     let id = UUID()
     let projectPath: String
@@ -167,6 +186,9 @@ private final class VMTabSession {
     var shutdownRequested = false
     var projectLockFD: Int32?
     var privateNetworkRuntimes: [PrivateNetworkRuntime] = []
+#if arch(arm64)
+    var macOSInstaller: VZMacOSInstaller?
+#endif
     var canStartControls = true
     var canStopControls = false
     var status = "Ready"
@@ -179,16 +201,22 @@ private final class VMTabSession {
         self.config = config
         vmView.translatesAutoresizingMaskIntoConstraints = false
         vmView.capturesSystemKeys = true
+        if #available(macOS 14.0, *) {
+            vmView.automaticallyReconfiguresDisplay = true
+        }
     }
 
     var title: String {
-        let url = URL(fileURLWithPath: projectPath, isDirectory: true)
-        let lastPathComponent = url.lastPathComponent
-        return lastPathComponent.isEmpty ? projectPath : lastPathComponent
+        config.displayName(fallbackProjectPath: projectPath)
     }
 
     var isRunning: Bool {
-        virtualMachine != nil || fakeRunning
+#if arch(arm64)
+        if macOSInstaller != nil {
+            return true
+        }
+#endif
+        return virtualMachine != nil || fakeRunning
     }
 }
 
@@ -214,6 +242,7 @@ private final class VMTabItemView: NSControl {
     private let numberLabel = NSTextField(labelWithString: "")
     private let titleLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
+    private let renameButton: VMTabActionButton
     private let settingsButton: VMTabActionButton
     private let deleteButton: VMTabActionButton
     private static let activeColor = NSColor(calibratedRed: 0.02, green: 0.48, blue: 0.95, alpha: 1)
@@ -224,12 +253,21 @@ private final class VMTabItemView: NSControl {
         title: String,
         target: AnyObject?,
         action: Selector,
+        renameTarget: AnyObject?,
+        renameAction: Selector,
         settingsTarget: AnyObject?,
         settingsAction: Selector,
         deleteTarget: AnyObject?,
         deleteAction: Selector
     ) {
         self.sessionID = sessionID
+        renameButton = VMTabActionButton(
+            sessionID: sessionID,
+            symbolName: "pencil",
+            label: "Rename VM",
+            target: renameTarget,
+            action: renameAction
+        )
         settingsButton = VMTabActionButton(
             sessionID: sessionID,
             symbolName: "gearshape",
@@ -249,6 +287,7 @@ private final class VMTabItemView: NSControl {
         setAccessibilityRole(.button)
         setAccessibilityLabel(title)
         setAccessibilityIdentifier("okrun.vm-tab.item")
+        renameButton.setAccessibilityIdentifier("okrun.vm-tab.rename")
         settingsButton.setAccessibilityIdentifier("okrun.vm-tab.settings")
         deleteButton.setAccessibilityIdentifier("okrun.vm-tab.delete")
         self.target = target
@@ -287,7 +326,7 @@ private final class VMTabItemView: NSControl {
         textStack.alignment = .leading
         textStack.spacing = 3
 
-        let actionStack = NSStackView(views: [settingsButton, deleteButton])
+        let actionStack = NSStackView(views: [renameButton, settingsButton, deleteButton])
         actionStack.translatesAutoresizingMaskIntoConstraints = false
         actionStack.orientation = .horizontal
         actionStack.alignment = .centerY
@@ -328,6 +367,8 @@ private final class VMTabItemView: NSControl {
         layer?.backgroundColor = isSelected ? Self.activeColor.cgColor : NSColor.clear.cgColor
         titleLabel.textColor = isSelected ? .white : .labelColor
         statusLabel.textColor = isSelected ? NSColor.white.withAlphaComponent(0.88) : .secondaryLabelColor
+        renameButton.isHidden = !isSelected
+        renameButton.isEnabled = isSelected
         settingsButton.isHidden = !isSelected
         settingsButton.isEnabled = isSelected && !isRunning
         deleteButton.isHidden = !isSelected
@@ -358,6 +399,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private var startButton: NSButton!
     private var shutdownButton: NSButton!
     private var networkButton: NSButton!
+    private var tabPanel: TabRailView!
+    private var splitSeparator: NSView!
+    private var tabPanelWidthConstraint: NSLayoutConstraint!
+    private var splitSeparatorWidthConstraint: NSLayoutConstraint!
+    private var sidebarRevealButton: NSButton!
+    private var sidebarCollapseButton: NSButton!
+    private var isSidebarCollapsed = false
     private let projectStore = ProjectStore()
     private var registry = ProjectRegistry.empty
     private var sessions: [VMTabSession] = []
@@ -376,11 +424,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         ProcessInfo.processInfo.environment["OKRUN_UI_E2E_TEST_COMMANDS"] == "1"
     }
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        buildApplicationChromeIfNeeded()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        installAppIcon()
-        buildWindow()
-        installMainMenu()
+        buildApplicationChromeIfNeeded()
         AppLog.lifecycle.info(
             "Launching OkrunVM pid=\(getpid()) bundle=\(Bundle.main.bundleURL.path, privacy: .public) executable=\(Bundle.main.executableURL?.path ?? "unknown", privacy: .public)"
         )
@@ -460,6 +509,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         return candidateFrame
     }
 
+    private func buildApplicationChromeIfNeeded() {
+        guard window == nil else { return }
+        NSApp.setActivationPolicy(.regular)
+        installAppIcon()
+        buildWindow()
+        installMainMenu()
+    }
+
     private func installAppIcon() {
         guard let iconURL = Bundle.main.url(forResource: "OkrunVM", withExtension: "png"),
               let icon = NSImage(contentsOf: iconURL) else {
@@ -505,6 +562,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         detailRow.addArrangedSubview(statusLabel)
         detailRow.addArrangedSubview(detailsLabel)
 
+        sidebarRevealButton = makeSidebarRevealButton()
+
         installerButton = makeContextButton(label: "Boot Installer", symbolName: "opticaldiscdrive", action: #selector(startInstaller))
         startButton = makeContextButton(label: "Start", symbolName: "play.fill", action: #selector(startInstalled))
         shutdownButton = makeContextButton(label: "Shutdown", symbolName: "stop.fill", action: #selector(shutdownVM))
@@ -519,7 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         statusSpacer.translatesAutoresizingMaskIntoConstraints = false
         statusSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let statusRow = NSStackView(views: [detailRow, statusSpacer, actionRow])
+        let statusRow = NSStackView(views: [sidebarRevealButton, detailRow, statusSpacer, actionRow])
         statusRow.orientation = .horizontal
         statusRow.alignment = .centerY
         statusRow.spacing = 12
@@ -540,18 +599,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         emptyStateLabel.alignment = .center
         vmContainer.addSubview(emptyStateLabel)
 
-        let tabPanel = TabRailView()
+        tabPanel = TabRailView()
         tabPanel.setContentHuggingPriority(.required, for: .horizontal)
         tabPanel.setContentCompressionResistancePriority(.required, for: .horizontal)
         mainPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
         mainPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         networkButton = makeSidebarNetworkButton()
+        sidebarCollapseButton = makeSidebarCollapseButton()
         let sidebarNewButton = makeSidebarNewVMButton()
         let sidebarImportButton = makeSidebarImportVMButton()
         let sidebarHeader = NSView()
         sidebarHeader.translatesAutoresizingMaskIntoConstraints = false
-        let sidebarActionStack = NSStackView(views: [sidebarNewButton, sidebarImportButton, networkButton])
+        let sidebarActionStack = NSStackView(views: [sidebarCollapseButton, sidebarNewButton, sidebarImportButton, networkButton])
         sidebarActionStack.translatesAutoresizingMaskIntoConstraints = false
         sidebarActionStack.orientation = .horizontal
         sidebarActionStack.alignment = .centerY
@@ -569,7 +629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         mainPane.addArrangedSubview(statusContainer)
         mainPane.addArrangedSubview(vmContainer)
 
-        let splitSeparator = NSView()
+        splitSeparator = NSView()
         splitSeparator.translatesAutoresizingMaskIntoConstraints = false
         splitSeparator.wantsLayer = true
         splitSeparator.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.13).cgColor
@@ -592,6 +652,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         window.contentView = content
         window.delegate = self
 
+        tabPanelWidthConstraint = tabPanel.widthAnchor.constraint(equalToConstant: 304)
+        splitSeparatorWidthConstraint = splitSeparator.widthAnchor.constraint(equalToConstant: 1)
+
         let contentTopAnchor = (window.contentLayoutGuide as? NSLayoutGuide)?.topAnchor ?? content.safeAreaLayoutGuide.topAnchor
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -607,8 +670,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             vmContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 420),
             emptyStateLabel.centerXAnchor.constraint(equalTo: vmContainer.centerXAnchor),
             emptyStateLabel.centerYAnchor.constraint(equalTo: vmContainer.centerYAnchor),
-            tabPanel.widthAnchor.constraint(equalToConstant: 304),
-            splitSeparator.widthAnchor.constraint(equalToConstant: 1),
+            tabPanelWidthConstraint,
+            splitSeparatorWidthConstraint,
             sidebarHeader.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
             sidebarHeader.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
             sidebarHeader.topAnchor.constraint(equalTo: tabPanel.topAnchor),
@@ -616,6 +679,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             sidebarActionStack.trailingAnchor.constraint(equalTo: sidebarHeader.trailingAnchor, constant: -12),
             sidebarActionStack.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor),
             sidebarActionStack.heightAnchor.constraint(equalToConstant: 26),
+            sidebarCollapseButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
+            sidebarCollapseButton.bottomAnchor.constraint(equalTo: sidebarActionStack.bottomAnchor),
             sidebarNewButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
             sidebarNewButton.bottomAnchor.constraint(equalTo: sidebarActionStack.bottomAnchor),
             sidebarImportButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
@@ -631,6 +696,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         window.makeKeyAndOrderFront(nil)
 
         window?.toolbar?.validateVisibleItems()
+        updateSidebarCollapsedState()
         updateContextControls()
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -667,6 +733,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
         editItem.submenu = editMenu
 
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        let toggleSidebarItem = NSMenuItem(title: "Toggle Sidebar", action: #selector(toggleSidebar), keyEquivalent: "s")
+        toggleSidebarItem.keyEquivalentModifierMask = [.command, .option]
+        toggleSidebarItem.target = self
+        viewMenu.addItem(toggleSidebarItem)
+        viewItem.submenu = viewMenu
+
         let vmItem = NSMenuItem()
         mainMenu.addItem(vmItem)
 
@@ -674,6 +749,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         let editConfigItem = NSMenuItem(title: "Edit VM Config", action: #selector(openSelectedConfigEditor), keyEquivalent: ",")
         editConfigItem.target = self
         vmMenu.addItem(editConfigItem)
+
+        let renameItem = NSMenuItem(title: "Rename VM...", action: #selector(renameProject), keyEquivalent: "")
+        renameItem.target = self
+        vmMenu.addItem(renameItem)
 
         let deleteItem = NSMenuItem(title: "Delete VM", action: #selector(deleteProject), keyEquivalent: "")
         deleteItem.target = self
@@ -705,6 +784,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         button.normalTint = .secondaryLabelColor
         button.disabledTint = NSColor.secondaryLabelColor.withAlphaComponent(0.35)
         button.hoverBackground = NSColor.white.withAlphaComponent(0.10)
+        return button
+    }
+
+    private func makeSidebarRevealButton() -> NSButton {
+        let button = HoverIconButton(symbolName: "sidebar.left", label: "Show Sidebar", target: self, action: #selector(toggleSidebar))
+        button.setAccessibilityIdentifier("okrun.sidebar.show")
+        button.normalTint = .secondaryLabelColor
+        button.disabledTint = NSColor.secondaryLabelColor.withAlphaComponent(0.35)
+        button.hoverBackground = NSColor.white.withAlphaComponent(0.10)
+        return button
+    }
+
+    private func makeSidebarCollapseButton() -> NSButton {
+        let button = HoverIconButton(symbolName: "sidebar.left", label: "Hide Sidebar", target: self, action: #selector(toggleSidebar))
+        button.setAccessibilityIdentifier("okrun.sidebar.hide")
+        button.normalTint = .labelColor
+        button.disabledTint = NSColor.labelColor.withAlphaComponent(0.35)
+        button.hoverBackground = NSColor.white.withAlphaComponent(0.12)
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
         return button
     }
 
@@ -747,6 +846,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         shutdownButton?.isEnabled = selectedSession?.canStopControls == true
     }
 
+    @objc private func toggleSidebar() {
+        isSidebarCollapsed.toggle()
+        updateSidebarCollapsedState()
+    }
+
+    private func updateSidebarCollapsedState() {
+        tabPanelWidthConstraint?.constant = isSidebarCollapsed ? 0 : 304
+        splitSeparatorWidthConstraint?.constant = isSidebarCollapsed ? 0 : 1
+        tabPanel?.isHidden = isSidebarCollapsed
+        splitSeparator?.isHidden = isSidebarCollapsed
+        sidebarRevealButton?.isHidden = !isSidebarCollapsed
+        window?.layoutIfNeeded()
+    }
+
     private var selectedSession: VMTabSession? {
         guard let selectedSessionID else { return nil }
         return sessions.first { $0.id == selectedSessionID }
@@ -768,7 +881,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             session.detail = statusDetail(paths: paths, config: config)
             sessions.append(session)
             AppLog.lifecycle.info(
-                "Loaded VM tab path=\(paths.root.path, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count) startOnAppLaunch=\(config.startup.startOnAppLaunch) startupMode=\(config.startup.mode.rawValue, privacy: .public)"
+                "Loaded VM tab path=\(paths.root.path, privacy: .public) guestOS=\(config.guestOS.rawValue, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count) startOnAppLaunch=\(config.startup.startOnAppLaunch) startupMode=\(config.startup.mode.rawValue, privacy: .public)"
             )
         }
 
@@ -796,7 +909,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             case .installer:
                 guard let isoPath = session.config.installerISOPath,
                       FileManager.default.fileExists(atPath: isoPath) else {
-                    AppLog.lifecycle.warning("Skipping VM auto-start project=\(session.paths.root.path, privacy: .public) reason=missing-installer-iso")
+                    AppLog.lifecycle.warning("Skipping VM auto-start project=\(session.paths.root.path, privacy: .public) reason=missing-installer-image")
                     setStatus(
                         for: session,
                         status: "Auto start skipped",
@@ -805,7 +918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                     continue
                 }
 
-                AppLog.lifecycle.info("Auto-starting VM project=\(session.paths.root.path, privacy: .public) mode=installer iso=\(isoPath, privacy: .public)")
+                AppLog.lifecycle.info("Auto-starting VM project=\(session.paths.root.path, privacy: .public) mode=installer image=\(isoPath, privacy: .public)")
                 start(session: session, mode: .installer(URL(fileURLWithPath: isoPath)))
             }
         }
@@ -824,6 +937,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 title: session.title,
                 target: self,
                 action: #selector(tabButtonPressed(_:)),
+                renameTarget: self,
+                renameAction: #selector(renameTabButtonPressed(_:)),
                 settingsTarget: self,
                 settingsAction: #selector(settingsTabButtonPressed(_:)),
                 deleteTarget: self,
@@ -899,6 +1014,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         deleteProject()
     }
 
+    @objc private func renameTabButtonPressed(_ sender: NSButton) {
+        guard let sender = sender as? VMTabActionButton,
+              let session = sessions.first(where: { $0.id == sender.sessionID }) else {
+            return
+        }
+
+        selectSession(session)
+        renameProject()
+    }
+
     @objc private func settingsTabButtonPressed(_ sender: NSButton) {
         guard let sender = sender as? VMTabActionButton,
               let session = sessions.first(where: { $0.id == sender.sessionID }),
@@ -957,7 +1082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             if skipAutomaticStartAfterCreate {
                 setStatus(for: session, status: "Ready", detail: statusDetail(paths: paths, config: request.config))
             } else {
-                start(mode: .installer(request.isoURL))
+                start(mode: .installer(request.installerURL))
             }
         } catch {
             setStatus("Add project failed", detail: error.localizedDescription)
@@ -1012,6 +1137,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         }
     }
 
+    @objc private func renameProject() {
+        guard let session = selectedSession,
+              let newName = askForVMRename(session: session) else {
+            return
+        }
+
+        do {
+            let currentConfig = try VMConfig.load(from: session.paths.config)
+            let updatedConfig = try currentConfig.withName(newName).validated()
+            try updatedConfig.save(to: session.paths.config)
+            session.config = updatedConfig
+            session.detail = statusDetail(paths: session.paths, config: updatedConfig)
+            AppLog.lifecycle.info("Renamed VM project=\(session.paths.root.path, privacy: .public) name=\(session.title, privacy: .public)")
+            rebuildTabButtons()
+            setStatus(for: session, status: session.status, detail: session.detail)
+        } catch {
+            setStatus(for: session, status: "Rename failed", detail: error.localizedDescription)
+            window?.toolbar?.validateVisibleItems()
+        }
+    }
+
     @objc private func deleteProject() {
         guard let session = selectedSession, session.virtualMachine == nil else { return }
         let selectedProject = session.projectPath
@@ -1038,6 +1184,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             session.detail = error.localizedDescription
             window?.toolbar?.validateVisibleItems()
         }
+    }
+
+    private func askForVMRename(session: VMTabSession) -> String? {
+        var result: String?
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 230),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Rename VM"
+        panel.isReleasedWhenClosed = false
+        panel.level = .modalPanel
+        panel.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1)
+
+        let content = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1).cgColor
+
+        let title = NSTextField(labelWithString: "Rename VM")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
+
+        let path = NSTextField(labelWithString: session.projectPath)
+        path.translatesAutoresizingMaskIntoConstraints = false
+        path.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        path.textColor = .secondaryLabelColor
+        path.lineBreakMode = .byTruncatingMiddle
+
+        let nameField = NSTextField(string: session.title)
+        nameField.setAccessibilityIdentifier("okrun.rename.name")
+        nameField.translatesAutoresizingMaskIntoConstraints = false
+        nameField.controlSize = .large
+        nameField.font = .systemFont(ofSize: 13)
+
+        let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        cancelButton.setAccessibilityIdentifier("okrun.rename.cancel")
+        cancelButton.bezelStyle = .rounded
+        cancelButton.controlSize = .large
+        cancelButton.keyEquivalent = "\u{1b}"
+
+        let renameButton = NSButton(title: "Rename", target: nil, action: nil)
+        renameButton.setAccessibilityIdentifier("okrun.rename.confirm")
+        renameButton.bezelStyle = .rounded
+        renameButton.controlSize = .large
+        renameButton.keyEquivalent = "\r"
+
+        let buttonRow = NSStackView(views: [cancelButton, renameButton])
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.spacing = 12
+
+        func updateRenameButton() {
+            guard let candidate = VMConfig.normalizedName(nameField.stringValue) else {
+                renameButton.isEnabled = false
+                return
+            }
+            renameButton.isEnabled = candidate != session.title
+        }
+
+        let actions = RenameDialogActions()
+        actions.onTextChange = {
+            updateRenameButton()
+        }
+        actions.onRename = { [weak panel] in
+            guard let name = VMConfig.normalizedName(nameField.stringValue) else {
+                NSSound.beep()
+                return
+            }
+
+            result = name
+            panel?.close()
+            NSApp.stopModal()
+        }
+        actions.onCancel = { [weak panel] in
+            panel?.close()
+            NSApp.stopModal()
+        }
+
+        nameField.delegate = actions
+        cancelButton.target = actions
+        cancelButton.action = #selector(RenameDialogActions.cancel)
+        renameButton.target = actions
+        renameButton.action = #selector(RenameDialogActions.rename)
+
+        content.addSubview(title)
+        content.addSubview(path)
+        content.addSubview(nameField)
+        content.addSubview(buttonRow)
+        panel.contentView = content
+
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
+            title.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+            title.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
+            path.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            path.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            path.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 14),
+            nameField.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            nameField.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            nameField.topAnchor.constraint(equalTo: path.bottomAnchor, constant: 18),
+            buttonRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+            buttonRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
+            cancelButton.widthAnchor.constraint(equalToConstant: 110),
+            renameButton.widthAnchor.constraint(equalToConstant: 110)
+        ])
+
+        if let window {
+            panel.setFrameOrigin(NSPoint(
+                x: window.frame.midX - panel.frame.width / 2,
+                y: window.frame.midY - panel.frame.height / 2
+            ))
+        } else {
+            panel.center()
+        }
+
+        updateRenameButton()
+        panel.makeFirstResponder(nameField)
+        nameField.currentEditor()?.selectAll(nil)
+        NSApp.runModal(for: panel)
+        _ = actions
+        return result
     }
 
     private func confirmDelete(session: VMTabSession) -> Bool {
@@ -1212,10 +1482,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         config: VMConfig,
         preparation: VMStorage.PreparationResult? = nil
     ) -> String {
-        var detail = "\(paths.root.path)  |  CPU \(config.cpuCount)  Memory \(config.memoryGB) GB  Disk \(config.diskGB) GB \(config.diskFormat.displayName)"
+        var detail = "\(paths.root.path)  |  \(config.guestOS.displayName)  |  CPU \(config.cpuCount)  Memory \(config.memoryGB) GB  Disk \(config.diskGB) GB \(config.diskFormat.displayName)"
 
         if preparation?.expandedDisk == true {
-            detail += "  |  Disk image expanded; grow the Linux partition/filesystem inside the guest."
+            detail += "  |  Disk image expanded; grow the guest partition/filesystem if needed."
         }
 
         if let hostAvailableBytes = preparation?.hostAvailableBytes,
@@ -1272,9 +1542,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
 
         let detailLabel = NSTextField(wrappingLabelWithString: """
-        Closing Okrun before Linux shuts down cleanly can corrupt the guest disk.
+        Closing Okrun before a guest shuts down cleanly can corrupt the guest disk.
 
-        Ask Linux to shut down, keep Okrun running, or force quit only if the VM is stuck.
+        Ask the guest to shut down, keep Okrun running, or force quit only if the VM is stuck.
         """)
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         detailLabel.font = .systemFont(ofSize: 13)
@@ -1385,27 +1655,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             return
         }
 
-        guard let iso = chooseInstallerISO() else { return }
+        guard let installerImage = chooseInstallerImage(for: currentConfig.guestOS) else { return }
 
         do {
             let updatedConfig = VMConfig(
+                name: currentConfig.name,
                 cpuCount: currentConfig.cpuCount,
                 memoryGB: currentConfig.memoryGB,
                 diskGB: currentConfig.diskGB,
-                installerISOPath: iso.path,
+                installerISOPath: installerImage.path,
                 diskFormat: currentConfig.diskFormat,
                 privateNetwork: currentConfig.privateNetwork,
                 sharedDirectories: currentConfig.sharedDirectories,
                 diskIO: currentConfig.diskIO,
-                startup: currentConfig.startup
+                startup: currentConfig.startup,
+                guestOS: currentConfig.guestOS
             )
             try updatedConfig.save(to: session.paths.config)
             session.config = updatedConfig
-            AppLog.lifecycle.info("Updated installer ISO project=\(session.paths.root.path, privacy: .public) iso=\(iso.path, privacy: .public)")
-            start(mode: .installer(iso))
+            AppLog.lifecycle.info("Updated installer image project=\(session.paths.root.path, privacy: .public) image=\(installerImage.path, privacy: .public)")
+            start(mode: .installer(installerImage))
         } catch {
-            AppLog.lifecycle.error("ISO update failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            setStatus("ISO update failed", detail: error.localizedDescription)
+            AppLog.lifecycle.error("Installer image update failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            setStatus("Installer update failed", detail: error.localizedDescription)
         }
     }
 
@@ -1451,7 +1723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 
         if session.shutdownRequested {
             guard allowsForcePrompt else {
-                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
+                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for \(session.config.guestOS.displayName) to shut down cleanly.")
                 return true
             }
 
@@ -1466,7 +1738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 try virtualMachine.requestStop()
                 session.shutdownRequested = true
                 AppLog.virtualMachine.info("Requested graceful shutdown project=\(session.paths.root.path, privacy: .public)")
-                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
+                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for \(session.config.guestOS.displayName) to shut down cleanly.")
                 return true
             }
         } catch {
@@ -1485,7 +1757,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             setStatus(
                 for: session,
                 status: "Shutdown unavailable",
-                detail: "Linux cannot be asked to shut down from this VM state. Force quit only if it is stuck."
+                detail: "\(session.config.guestOS.displayName) cannot be asked to shut down from this VM state. Force quit only if it is stuck."
             )
             return false
         }
@@ -1501,7 +1773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Force stop \(session.title)?"
-        alert.informativeText = "Force stopping does not let Linux shut down cleanly. It can interrupt guest writes and may corrupt the guest disk."
+        alert.informativeText = "Force stopping does not let \(session.config.guestOS.displayName) shut down cleanly. It can interrupt guest writes and may corrupt the guest disk."
         alert.addButton(withTitle: "Force Stop")
         alert.addButton(withTitle: "Keep Waiting")
         return alert.runModal() == .alertFirstButtonReturn
@@ -1557,6 +1829,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                     self?.releasePrivateNetworkRuntimes(for: session)
                     session.virtualMachine = nil
                     session.vmView.virtualMachine = nil
+#if arch(arm64)
+                    session.macOSInstaller = nil
+#endif
                     session.shutdownRequested = false
                     session.canStartControls = true
                     session.canStopControls = false
@@ -1672,7 +1947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             try acquireProjectLock(for: session)
             let loaded = try reloadConfiguration(for: session)
             AppLog.virtualMachine.info(
-                "Starting VM project=\(session.paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) cpu=\(loaded.config.cpuCount) memoryGB=\(loaded.config.memoryGB) diskGB=\(loaded.config.diskGB) privateNetwork=\(loaded.config.privateNetwork.enabled) sharedDirectories=\(loaded.config.sharedDirectories.count) diskChange=\(String(describing: loaded.preparation.diskChange), privacy: .public)"
+                "Starting VM project=\(session.paths.root.path, privacy: .public) guestOS=\(loaded.config.guestOS.rawValue, privacy: .public) mode=\(mode.logDescription, privacy: .public) cpu=\(loaded.config.cpuCount) memoryGB=\(loaded.config.memoryGB) diskGB=\(loaded.config.diskGB) privateNetwork=\(loaded.config.privateNetwork.enabled) sharedDirectories=\(loaded.config.sharedDirectories.count) diskChange=\(String(describing: loaded.preparation.diskChange), privacy: .public)"
             )
             let modeText: String
             switch mode {
@@ -1704,6 +1979,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 detail: statusDetail(paths: session.paths, config: loaded.config, preparation: loaded.preparation)
             )
 
+            if case .installer(let installerImage) = mode, loaded.config.guestOS == .macOS {
+                startMacOSInstaller(
+                    for: session,
+                    virtualMachine: vm,
+                    installerImage: installerImage,
+                    modeText: modeText
+                )
+                return
+            }
+
             vm.start { [weak self] result in
                 DispatchQueue.main.async {
                     switch result {
@@ -1717,6 +2002,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                         self?.releasePrivateNetworkRuntimes(for: session)
                         session.virtualMachine = nil
                         session.vmView.virtualMachine = nil
+#if arch(arm64)
+                        session.macOSInstaller = nil
+#endif
                         session.shutdownRequested = false
                         self?.setControlsEnabled(for: session, canStart: true, canStop: false)
                         self?.setStatus(for: session, status: "Start failed", detail: error.localizedDescription)
@@ -1731,6 +2019,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             setControlsEnabled(for: session, canStart: true, canStop: false)
             setStatus(for: session, status: "Configuration failed", detail: error.localizedDescription)
         }
+    }
+
+    private func startMacOSInstaller(
+        for session: VMTabSession,
+        virtualMachine: VZVirtualMachine,
+        installerImage: URL,
+        modeText: String
+    ) {
+#if arch(arm64)
+        let installer = VZMacOSInstaller(
+            virtualMachine: virtualMachine,
+            restoringFromImageAt: installerImage
+        )
+        session.macOSInstaller = installer
+        setStatus(for: session, status: "Installing macOS", detail: runtimeDetail(for: session, "Mode: \(modeText)"))
+        AppLog.virtualMachine.info("Starting macOS installer project=\(session.paths.root.path, privacy: .public) image=\(installerImage.path, privacy: .public)")
+
+        installer.install { [weak self] result in
+            DispatchQueue.main.async {
+                session.macOSInstaller = nil
+
+                switch result {
+                case .success:
+                    AppLog.virtualMachine.info("macOS install completed project=\(session.paths.root.path, privacy: .public)")
+                    session.shutdownRequested = false
+                    if virtualMachine.state == .stopped {
+                        self?.releaseProjectLock(for: session)
+                        self?.releasePrivateNetworkRuntimes(for: session)
+                        session.virtualMachine = nil
+                        session.vmView.virtualMachine = nil
+                        self?.setControlsEnabled(for: session, canStart: true, canStop: false)
+                        self?.setStatus(for: session, status: "macOS installed", detail: "Start the installed system when you are ready.")
+                        self?.completePendingCloseIfReady()
+                    } else {
+                        self?.setControlsEnabled(for: session, canStart: false, canStop: true)
+                        self?.setStatus(for: session, status: "macOS installed", detail: "Installer completed; waiting for the guest to shut down.")
+                    }
+                case .failure(let error):
+                    AppLog.virtualMachine.error("macOS install failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                    self?.releaseProjectLock(for: session)
+                    self?.releasePrivateNetworkRuntimes(for: session)
+                    session.virtualMachine = nil
+                    session.vmView.virtualMachine = nil
+                    session.shutdownRequested = false
+                    self?.setControlsEnabled(for: session, canStart: true, canStop: false)
+                    self?.setStatus(for: session, status: "Install failed", detail: error.localizedDescription)
+                    self?.cancelPendingClose()
+                }
+            }
+        }
+#else
+        releaseProjectLock(for: session)
+        releasePrivateNetworkRuntimes(for: session)
+        session.virtualMachine = nil
+        session.vmView.virtualMachine = nil
+        setControlsEnabled(for: session, canStart: true, canStop: false)
+        setStatus(for: session, status: "Install unavailable", detail: "macOS guests require Apple silicon.")
+#endif
     }
 
     private func acquireProjectLock(for session: VMTabSession) throws {
@@ -1771,24 +2117,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private func makeConfiguration(paths: VMPaths, config: VMConfig, mode: VMMode, session: VMTabSession) throws -> VZVirtualMachineConfiguration {
         let configuration = VZVirtualMachineConfiguration()
 
-        let machineIdentifierData = try Data(contentsOf: paths.machineIdentifier)
-        guard let machineIdentifier = VZGenericMachineIdentifier(dataRepresentation: machineIdentifierData) else {
-            throw AppError("Invalid machine identifier at \(paths.machineIdentifier.path)")
-        }
-        let platform = VZGenericPlatformConfiguration()
-        platform.machineIdentifier = machineIdentifier
-        configuration.platform = platform
-
-        let bootLoader = VZEFIBootLoader()
-        bootLoader.variableStore = try makeEFIVariableStore(paths: paths, mode: mode)
-        configuration.bootLoader = bootLoader
+        let machineIdentifierData = try configurePlatformAndBootLoader(
+            for: configuration,
+            paths: paths,
+            config: config,
+            mode: mode
+        )
 
         configuration.cpuCount = min(config.cpuCount, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
         configuration.memorySize = min(UInt64(config.memoryGB) * 1024 * 1024 * 1024, VZVirtualMachineConfiguration.maximumAllowedMemorySize)
 
-        configuration.graphicsDevices = [makeGraphicsDevice()]
-        configuration.keyboards = [VZUSBKeyboardConfiguration()]
-        configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        configuration.graphicsDevices = [try makeGraphicsDevice(for: config.guestOS)]
+        configuration.keyboards = try makeKeyboards(for: config.guestOS)
+        configuration.pointingDevices = try makePointingDevices(for: config.guestOS)
         configuration.networkDevices = try NetworkDeviceFactory.makeDevices(
             privateNetwork: config.privateNetwork,
             machineIdentifierData: machineIdentifierData
@@ -1806,24 +2147,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         return configuration
     }
 
-    private func makeEFIVariableStore(paths: VMPaths, mode: VMMode) throws -> VZEFIVariableStore {
-        try EFIVariableStoreFactory.make(paths: paths, mode: mode)
-    }
+    private func configurePlatformAndBootLoader(
+        for configuration: VZVirtualMachineConfiguration,
+        paths: VMPaths,
+        config: VMConfig,
+        mode: VMMode
+    ) throws -> Data {
+        switch config.guestOS {
+        case .linux:
+            let machineIdentifierData = try Data(contentsOf: paths.machineIdentifier)
+            guard let machineIdentifier = VZGenericMachineIdentifier(dataRepresentation: machineIdentifierData) else {
+                throw AppError("Invalid machine identifier at \(paths.machineIdentifier.path)")
+            }
+            let platform = VZGenericPlatformConfiguration()
+            platform.machineIdentifier = machineIdentifier
+            configuration.platform = platform
 
-    private func loadMachineIdentifier(from url: URL) throws -> VZGenericMachineIdentifier {
-        let data = try Data(contentsOf: url)
-        guard let machineIdentifier = VZGenericMachineIdentifier(dataRepresentation: data) else {
-            throw AppError("Invalid machine identifier at \(url.path)")
+            let bootLoader = VZEFIBootLoader()
+            bootLoader.variableStore = try EFIVariableStoreFactory.make(paths: paths, mode: mode)
+            configuration.bootLoader = bootLoader
+            return machineIdentifierData
+        case .macOS:
+#if arch(arm64)
+            let hardwareModel = try MacOSGuestMetadata.loadHardwareModel(from: paths.macOSHardwareModel)
+            let machineIdentifier = try MacOSGuestMetadata.loadMachineIdentifier(from: paths.macOSMachineIdentifier)
+            let platform = VZMacPlatformConfiguration()
+            platform.hardwareModel = hardwareModel
+            platform.machineIdentifier = machineIdentifier
+            platform.auxiliaryStorage = try MacOSGuestMetadata.loadAuxiliaryStorage(from: paths.macOSAuxiliaryStorage)
+            configuration.platform = platform
+            configuration.bootLoader = VZMacOSBootLoader()
+            return machineIdentifier.dataRepresentation
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
         }
-        return machineIdentifier
     }
 
-    private func makeGraphicsDevice() -> VZGraphicsDeviceConfiguration {
-        let graphicsDevice = VZVirtioGraphicsDeviceConfiguration()
-        graphicsDevice.scanouts = [
-            VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)
-        ]
-        return graphicsDevice
+    private func makeGraphicsDevice(for guestOS: GuestOS) throws -> VZGraphicsDeviceConfiguration {
+        switch guestOS {
+        case .linux:
+            let graphicsDevice = VZVirtioGraphicsDeviceConfiguration()
+            graphicsDevice.scanouts = [
+                VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)
+            ]
+            return graphicsDevice
+        case .macOS:
+#if arch(arm64)
+            let graphicsDevice = VZMacGraphicsDeviceConfiguration()
+            graphicsDevice.displays = [
+                VZMacGraphicsDisplayConfiguration(
+                    widthInPixels: 1280,
+                    heightInPixels: 800,
+                    pixelsPerInch: 80
+                )
+            ]
+            return graphicsDevice
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
+        }
+    }
+
+    private func makeKeyboards(for guestOS: GuestOS) throws -> [VZKeyboardConfiguration] {
+        switch guestOS {
+        case .linux:
+            return [VZUSBKeyboardConfiguration()]
+        case .macOS:
+#if arch(arm64)
+            var keyboards: [VZKeyboardConfiguration] = [VZUSBKeyboardConfiguration()]
+            if #available(macOS 14.0, *) {
+                keyboards.insert(VZMacKeyboardConfiguration(), at: 0)
+            }
+            return keyboards
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
+        }
+    }
+
+    private func makePointingDevices(for guestOS: GuestOS) throws -> [VZPointingDeviceConfiguration] {
+        switch guestOS {
+        case .linux:
+            return [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        case .macOS:
+#if arch(arm64)
+            var pointingDevices: [VZPointingDeviceConfiguration] = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+            if #available(macOS 13.0, *) {
+                pointingDevices.insert(VZMacTrackpadConfiguration(), at: 0)
+            }
+            return pointingDevices
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
+        }
     }
 
     private func makeStorageDevices(paths: VMPaths, mode: VMMode, config: VMConfig) throws -> [VZStorageDeviceConfiguration] {
@@ -1834,6 +2251,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             diskIO: config.diskIO
         )
         let diskDevice = VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
+
+        guard config.guestOS == .linux else {
+            return [diskDevice]
+        }
 
         switch mode {
         case .installed:
@@ -1879,6 +2300,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             self.releasePrivateNetworkRuntimes(for: session)
             session.virtualMachine = nil
             session.vmView.virtualMachine = nil
+#if arch(arm64)
+            session.macOSInstaller = nil
+#endif
             session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Shutdown", detail: "The VM has shut down.")
@@ -1894,6 +2318,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             self.releasePrivateNetworkRuntimes(for: session)
             session.virtualMachine = nil
             session.vmView.virtualMachine = nil
+#if arch(arm64)
+            session.macOSInstaller = nil
+#endif
             session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Stopped with error", detail: error.localizedDescription)
