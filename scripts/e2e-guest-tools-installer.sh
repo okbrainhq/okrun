@@ -6,6 +6,7 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/okrun-guest-tools-e2e.XXXXXX")"
 BIN_DIR="$WORK_DIR/bin"
 LOG_FILE="$WORK_DIR/commands.log"
 DEFAULT_LOG_FILE="$WORK_DIR/default-commands.log"
+MACOS_LOG_FILE="$WORK_DIR/macos-commands.log"
 
 cleanup() {
   rm -rf "$WORK_DIR"
@@ -96,6 +97,21 @@ fi
 if grep -q -- '--private-ip' "$DEFAULT_LOG_FILE"; then
   echo "Default remote install command should not request a static private IP." >&2
   cat "$DEFAULT_LOG_FILE" >&2
+  exit 1
+fi
+
+run_step "Record macOS remote guest tools install command" \
+  env OKRUN_E2E_LOG="$MACOS_LOG_FILE" PATH="$BIN_DIR:$PATH" "$ROOT/scripts/install-guest-tools.sh" \
+  --guest-os macos \
+  --user tester \
+  --port 2222 \
+  --identity "$WORK_DIR/id_ed25519" \
+  --private-iface en1 \
+  example-macos.test
+
+if ! grep -q 'sudo.*install-okrun-guest-tools.sh.*--health-interval.*60.*--log-share.*okrun-guest-logs.*--guest-os.*macos.*--private-dhcp.*--private-iface.*en1' "$MACOS_LOG_FILE"; then
+  echo "Expected macOS remote install command was not recorded." >&2
+  cat "$MACOS_LOG_FILE" >&2
   exit 1
 fi
 
@@ -218,6 +234,68 @@ if grep -q "^Address=" "$STATIC_TO_DHCP_ROOT/etc/systemd/network/20-okrun-privat
   echo "--private-dhcp should replace an existing Okrun-managed static Address line." >&2
   exit 1
 fi
+
+MACOS_ROOT="$WORK_DIR/macos-root"
+mkdir -p "$MACOS_ROOT/Volumes/okrun/okrun-guest-logs"
+run_step "Install into macOS test guest root with DHCP private network" \
+  env OKRUN_GUEST_ROOT="$MACOS_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+  --guest-os macos \
+  --private-iface en1 \
+  --health-interval 17 \
+  --resize-root
+
+[[ -x "$MACOS_ROOT/usr/local/lib/okrun/okrun-guest-health.sh" ]]
+[[ -x "$MACOS_ROOT/usr/local/sbin/okrun-guest-diagnose" ]]
+[[ -x "$MACOS_ROOT/usr/local/sbin/okrun-mount-virtiofs" ]]
+[[ -x "$MACOS_ROOT/usr/local/sbin/okrun-private-network" ]]
+[[ -d "$MACOS_ROOT/var/log/okrun" ]]
+[[ -d "$MACOS_ROOT/Volumes/okrun/okrun-guest-logs" ]]
+
+assert_file_contains "$MACOS_ROOT/etc/okrun/guest-tools.env" "OKRUN_LOG_DIR=/Volumes/okrun/okrun-guest-logs"
+assert_file_contains "$MACOS_ROOT/Library/LaunchDaemons/com.okrun.guest-health.plist" "com.okrun.guest-health"
+assert_file_contains "$MACOS_ROOT/Library/LaunchDaemons/com.okrun.guest-health.plist" "<string>17</string>"
+assert_file_contains "$MACOS_ROOT/Library/LaunchDaemons/com.okrun.virtiofs.plist" "com.okrun.virtiofs"
+assert_file_contains "$MACOS_ROOT/usr/local/sbin/okrun-mount-virtiofs" 'MOUNT_POINT="/Volumes/okrun"'
+assert_file_contains "$MACOS_ROOT/Library/LaunchDaemons/com.okrun.private-network.plist" "com.okrun.private-network"
+assert_file_contains "$MACOS_ROOT/usr/local/sbin/okrun-private-network" 'ipconfig set "en1" DHCP'
+
+MACOS_STATIC_ROOT="$WORK_DIR/macos-static-root"
+mkdir -p "$MACOS_STATIC_ROOT/Volumes/okrun/okrun-guest-logs"
+run_step "Install into macOS test guest root with static private IP" \
+  env OKRUN_GUEST_ROOT="$MACOS_STATIC_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+  --guest-os macos \
+  --private-iface en2 \
+  --private-ip 10.77.0.12/24 \
+  --health-interval 19
+
+assert_file_contains "$MACOS_STATIC_ROOT/usr/local/sbin/okrun-private-network" 'ifconfig "en2" inet "10.77.0.12" netmask "255.255.255.0" up'
+assert_file_contains "$MACOS_STATIC_ROOT/Library/LaunchDaemons/com.okrun.guest-health.plist" "<string>19</string>"
+
+MACOS_MISSING_SHARE_ROOT="$WORK_DIR/macos-missing-share-root"
+printf '  -> Reject missing macOS guest log share\n'
+MACOS_MISSING_START="$SECONDS"
+set +e
+MACOS_MISSING_OUTPUT="$(
+  OKRUN_GUEST_ROOT="$MACOS_MISSING_SHARE_ROOT" "$ROOT/scripts/guest-tools/install-okrun-guest-tools.sh" \
+    --guest-os macos \
+    --health-interval 13 2>&1
+)"
+MACOS_MISSING_STATUS=$?
+set -e
+
+if [[ "$MACOS_MISSING_STATUS" -ne 78 ]]; then
+  echo "macOS installer should fail with exit 78 when the guest log share is missing." >&2
+  printf '%s\n' "$MACOS_MISSING_OUTPUT" >&2
+  exit 1
+fi
+
+if ! grep -q 'Missing writable Okrun guest log share: /Volumes/okrun/okrun-guest-logs' <<<"$MACOS_MISSING_OUTPUT"; then
+  echo "macOS missing-share error did not mention /Volumes/okrun." >&2
+  printf '%s\n' "$MACOS_MISSING_OUTPUT" >&2
+  exit 1
+fi
+
+printf '  OK Reject missing macOS guest log share (%ss)\n' "$((SECONDS - MACOS_MISSING_START))"
 
 MANUAL_ROOT="$WORK_DIR/manual-root"
 mkdir -p "$MANUAL_ROOT/etc/systemd/network" "$MANUAL_ROOT/etc/systemd/system" "$MANUAL_ROOT/etc" "$MANUAL_ROOT/mnt/okrun/okrun-guest-logs"

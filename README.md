@@ -36,7 +36,9 @@ Okrun runs on macOS 13 or later. New ASIF disks and ASIF imports require macOS
 
 Okrun remembers known VM projects in `~/.okrun/registry.json`. The sidebar shows
 one tab per VM project. Use the plus button for a new VM, the import button for
-an ASIF import, and the network button for private network settings.
+an ASIF import, and the network button for private network settings. Use the
+sidebar button or **View > Toggle Sidebar** to collapse the sidebar and give the
+VM display the full window width.
 
 ## Create a New VM
 
@@ -139,8 +141,8 @@ ssh <linux-user>@<hostname>.local
 
 ## Install Guest Tools
 
-After Linux is installed and SSH is enabled inside the VM, install the guest
-tools from your Mac:
+After Linux or macOS is installed and SSH is enabled inside the VM, install the
+guest tools from your Mac:
 
 ```sh
 ./scripts/install-guest-tools.sh --user <linux-user> <hostname-or-ip>
@@ -152,6 +154,7 @@ Examples:
 ./scripts/install-guest-tools.sh --user ubuntu 192.168.64.16
 ./scripts/install-guest-tools.sh --user arunoda --port 22 devbox.local
 ./scripts/install-guest-tools.sh --user ubuntu --identity ~/.ssh/id_ed25519 192.168.64.16
+./scripts/install-guest-tools.sh --guest-os macos --user arunoda macos-vm.local
 ```
 
 Fully stop and restart the VM once before running the installer so the managed
@@ -159,18 +162,21 @@ guest log share is present.
 
 The installer copies scripts over SSH and installs:
 
-- `okrun-guest-health.service` for periodic guest health logs.
+- `okrun-guest-health.service` on Linux or `com.okrun.guest-health` on macOS for periodic guest health logs.
 - `okrun-guest-diagnose` for one-shot guest diagnostics.
-- `/mnt/okrun` VirtioFS mount support.
-- DHCP setup for the Okrun private network interface.
+- VirtioFS mount support at `/mnt/okrun` on Linux or `/Volumes/okrun` on macOS.
+- DHCP setup for the Okrun private network interface on Linux, with macOS support when `--private-iface` is supplied.
 
 Guest health logs are written to the Mac side at `vm/guest-logs` and exposed to
-Linux as `/mnt/okrun/okrun-guest-logs`. Check them inside the VM with:
+Linux as `/mnt/okrun/okrun-guest-logs` or macOS as `/Volumes/okrun/okrun-guest-logs`.
+Check them inside the VM with:
 
 ```sh
 tail -f /mnt/okrun/okrun-guest-logs/guest-health.log
+tail -f /Volumes/okrun/okrun-guest-logs/guest-health.log
 sudo okrun-guest-diagnose
 systemctl status okrun-guest-health.service
+sudo launchctl print system/com.okrun.guest-health
 ```
 
 To grow the guest filesystem after increasing `diskGB`, run:
@@ -209,15 +215,26 @@ sudo mount -t virtiofs okrun /mnt/okrun
 ls /mnt/okrun
 ```
 
-Each configured folder appears below `/mnt/okrun` by its `name`:
+Inside macOS, mount the same share at the native Volumes location:
+
+```sh
+sudo mkdir -p /Volumes/okrun
+sudo mount_virtiofs okrun /Volumes/okrun
+ls /Volumes/okrun
+```
+
+Each configured folder appears below the guest mount root by its `name`:
 
 ```text
 /mnt/okrun/projects
 /mnt/okrun/downloads
+/Volumes/okrun/projects
+/Volumes/okrun/downloads
 ```
 
-Guest tools install a systemd mount unit for `/mnt/okrun`. Without guest tools,
-create one manually if you want the share mounted on boot.
+Guest tools install a systemd mount unit for `/mnt/okrun` on Linux or a launchd
+helper for `/Volumes/okrun` on macOS. Without guest tools, create one manually if
+you want the share mounted on boot.
 
 ## VM Networking
 

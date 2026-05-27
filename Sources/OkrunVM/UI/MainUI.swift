@@ -46,6 +46,7 @@ private class HoverIconButton: NSButton {
         super.init(frame: .zero)
         self.target = target
         self.action = action
+        title = label
         setAccessibilityLabel(label)
         translatesAutoresizingMaskIntoConstraints = false
         bezelStyle = .regularSquare
@@ -398,6 +399,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private var startButton: NSButton!
     private var shutdownButton: NSButton!
     private var networkButton: NSButton!
+    private var tabPanel: TabRailView!
+    private var splitSeparator: NSView!
+    private var tabPanelWidthConstraint: NSLayoutConstraint!
+    private var splitSeparatorWidthConstraint: NSLayoutConstraint!
+    private var sidebarRevealButton: NSButton!
+    private var sidebarCollapseButton: NSButton!
+    private var isSidebarCollapsed = false
     private let projectStore = ProjectStore()
     private var registry = ProjectRegistry.empty
     private var sessions: [VMTabSession] = []
@@ -416,11 +424,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         ProcessInfo.processInfo.environment["OKRUN_UI_E2E_TEST_COMMANDS"] == "1"
     }
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        buildApplicationChromeIfNeeded()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        installAppIcon()
-        buildWindow()
-        installMainMenu()
+        buildApplicationChromeIfNeeded()
         AppLog.lifecycle.info(
             "Launching OkrunVM pid=\(getpid()) bundle=\(Bundle.main.bundleURL.path, privacy: .public) executable=\(Bundle.main.executableURL?.path ?? "unknown", privacy: .public)"
         )
@@ -500,6 +509,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         return candidateFrame
     }
 
+    private func buildApplicationChromeIfNeeded() {
+        guard window == nil else { return }
+        NSApp.setActivationPolicy(.regular)
+        installAppIcon()
+        buildWindow()
+        installMainMenu()
+    }
+
     private func installAppIcon() {
         guard let iconURL = Bundle.main.url(forResource: "OkrunVM", withExtension: "png"),
               let icon = NSImage(contentsOf: iconURL) else {
@@ -545,6 +562,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         detailRow.addArrangedSubview(statusLabel)
         detailRow.addArrangedSubview(detailsLabel)
 
+        sidebarRevealButton = makeSidebarRevealButton()
+
         installerButton = makeContextButton(label: "Boot Installer", symbolName: "opticaldiscdrive", action: #selector(startInstaller))
         startButton = makeContextButton(label: "Start", symbolName: "play.fill", action: #selector(startInstalled))
         shutdownButton = makeContextButton(label: "Shutdown", symbolName: "stop.fill", action: #selector(shutdownVM))
@@ -559,7 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         statusSpacer.translatesAutoresizingMaskIntoConstraints = false
         statusSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let statusRow = NSStackView(views: [detailRow, statusSpacer, actionRow])
+        let statusRow = NSStackView(views: [sidebarRevealButton, detailRow, statusSpacer, actionRow])
         statusRow.orientation = .horizontal
         statusRow.alignment = .centerY
         statusRow.spacing = 12
@@ -580,18 +599,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         emptyStateLabel.alignment = .center
         vmContainer.addSubview(emptyStateLabel)
 
-        let tabPanel = TabRailView()
+        tabPanel = TabRailView()
         tabPanel.setContentHuggingPriority(.required, for: .horizontal)
         tabPanel.setContentCompressionResistancePriority(.required, for: .horizontal)
         mainPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
         mainPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         networkButton = makeSidebarNetworkButton()
+        sidebarCollapseButton = makeSidebarCollapseButton()
         let sidebarNewButton = makeSidebarNewVMButton()
         let sidebarImportButton = makeSidebarImportVMButton()
         let sidebarHeader = NSView()
         sidebarHeader.translatesAutoresizingMaskIntoConstraints = false
-        let sidebarActionStack = NSStackView(views: [sidebarNewButton, sidebarImportButton, networkButton])
+        let sidebarActionStack = NSStackView(views: [sidebarCollapseButton, sidebarNewButton, sidebarImportButton, networkButton])
         sidebarActionStack.translatesAutoresizingMaskIntoConstraints = false
         sidebarActionStack.orientation = .horizontal
         sidebarActionStack.alignment = .centerY
@@ -609,7 +629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         mainPane.addArrangedSubview(statusContainer)
         mainPane.addArrangedSubview(vmContainer)
 
-        let splitSeparator = NSView()
+        splitSeparator = NSView()
         splitSeparator.translatesAutoresizingMaskIntoConstraints = false
         splitSeparator.wantsLayer = true
         splitSeparator.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.13).cgColor
@@ -632,6 +652,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         window.contentView = content
         window.delegate = self
 
+        tabPanelWidthConstraint = tabPanel.widthAnchor.constraint(equalToConstant: 304)
+        splitSeparatorWidthConstraint = splitSeparator.widthAnchor.constraint(equalToConstant: 1)
+
         let contentTopAnchor = (window.contentLayoutGuide as? NSLayoutGuide)?.topAnchor ?? content.safeAreaLayoutGuide.topAnchor
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -647,8 +670,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             vmContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 420),
             emptyStateLabel.centerXAnchor.constraint(equalTo: vmContainer.centerXAnchor),
             emptyStateLabel.centerYAnchor.constraint(equalTo: vmContainer.centerYAnchor),
-            tabPanel.widthAnchor.constraint(equalToConstant: 304),
-            splitSeparator.widthAnchor.constraint(equalToConstant: 1),
+            tabPanelWidthConstraint,
+            splitSeparatorWidthConstraint,
             sidebarHeader.leadingAnchor.constraint(equalTo: tabPanel.leadingAnchor),
             sidebarHeader.trailingAnchor.constraint(equalTo: tabPanel.trailingAnchor),
             sidebarHeader.topAnchor.constraint(equalTo: tabPanel.topAnchor),
@@ -656,6 +679,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             sidebarActionStack.trailingAnchor.constraint(equalTo: sidebarHeader.trailingAnchor, constant: -12),
             sidebarActionStack.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor),
             sidebarActionStack.heightAnchor.constraint(equalToConstant: 26),
+            sidebarCollapseButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
+            sidebarCollapseButton.bottomAnchor.constraint(equalTo: sidebarActionStack.bottomAnchor),
             sidebarNewButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
             sidebarNewButton.bottomAnchor.constraint(equalTo: sidebarActionStack.bottomAnchor),
             sidebarImportButton.topAnchor.constraint(equalTo: sidebarActionStack.topAnchor),
@@ -671,6 +696,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         window.makeKeyAndOrderFront(nil)
 
         window?.toolbar?.validateVisibleItems()
+        updateSidebarCollapsedState()
         updateContextControls()
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -706,6 +732,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
         editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
         editItem.submenu = editMenu
+
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        let toggleSidebarItem = NSMenuItem(title: "Toggle Sidebar", action: #selector(toggleSidebar), keyEquivalent: "s")
+        toggleSidebarItem.keyEquivalentModifierMask = [.command, .option]
+        toggleSidebarItem.target = self
+        viewMenu.addItem(toggleSidebarItem)
+        viewItem.submenu = viewMenu
 
         let vmItem = NSMenuItem()
         mainMenu.addItem(vmItem)
@@ -752,6 +787,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         return button
     }
 
+    private func makeSidebarRevealButton() -> NSButton {
+        let button = HoverIconButton(symbolName: "sidebar.left", label: "Show Sidebar", target: self, action: #selector(toggleSidebar))
+        button.setAccessibilityIdentifier("okrun.sidebar.show")
+        button.normalTint = .secondaryLabelColor
+        button.disabledTint = NSColor.secondaryLabelColor.withAlphaComponent(0.35)
+        button.hoverBackground = NSColor.white.withAlphaComponent(0.10)
+        return button
+    }
+
+    private func makeSidebarCollapseButton() -> NSButton {
+        let button = HoverIconButton(symbolName: "sidebar.left", label: "Hide Sidebar", target: self, action: #selector(toggleSidebar))
+        button.setAccessibilityIdentifier("okrun.sidebar.hide")
+        button.normalTint = .labelColor
+        button.disabledTint = NSColor.labelColor.withAlphaComponent(0.35)
+        button.hoverBackground = NSColor.white.withAlphaComponent(0.12)
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        return button
+    }
+
     private func makeSidebarNewVMButton() -> NSButton {
         let button = HoverIconButton(symbolName: "plus", label: "New VM", target: self, action: #selector(createProject))
         button.setAccessibilityIdentifier("okrun.new-vm")
@@ -789,6 +844,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         installerButton?.isEnabled = selectedSession?.canStartControls == true
         startButton?.isEnabled = selectedSession?.canStartControls == true
         shutdownButton?.isEnabled = selectedSession?.canStopControls == true
+    }
+
+    @objc private func toggleSidebar() {
+        isSidebarCollapsed.toggle()
+        updateSidebarCollapsedState()
+    }
+
+    private func updateSidebarCollapsedState() {
+        tabPanelWidthConstraint?.constant = isSidebarCollapsed ? 0 : 304
+        splitSeparatorWidthConstraint?.constant = isSidebarCollapsed ? 0 : 1
+        tabPanel?.isHidden = isSidebarCollapsed
+        splitSeparator?.isHidden = isSidebarCollapsed
+        sidebarRevealButton?.isHidden = !isSidebarCollapsed
+        window?.layoutIfNeeded()
     }
 
     private var selectedSession: VMTabSession? {
@@ -2071,7 +2140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode, config: config)
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
             for: config.sharedDirectories,
-            managedGuestLogsDirectory: config.guestOS == .linux ? ManagedGuestTools.guestLogsDirectory(in: paths) : nil
+            managedGuestLogsDirectory: ManagedGuestTools.guestLogsDirectory(in: paths)
         )
 
         try configuration.validate()
