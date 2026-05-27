@@ -1,8 +1,8 @@
 # Okrun VM
 
-Okrun VM is a small native macOS app for running Linux VMs with
+Okrun VM is a small native macOS app for running Linux and macOS VMs with
 Virtualization.framework. The app is organized around VM projects: each project
-is a folder with its own config, disk, EFI store, and machine identity.
+is a folder with its own config, disk, boot metadata, and machine identity.
 
 ## Clone & Build It
 
@@ -42,14 +42,14 @@ an ASIF import, and the network button for private network settings.
 
 1. Click **New VM**.
 2. Choose a VM folder. This folder becomes the Okrun project.
-3. Choose a Linux installer ISO. On Apple silicon, use an arm64/aarch64 ISO.
+3. Choose the guest OS and installer image. Linux uses an ISO; macOS uses an IPSW restore image.
 4. Pick CPU, memory, disk size, and disk format.
 5. Click **Create**.
-6. Click **Boot Installer** and install Linux to the virtual disk.
-7. Shut Linux down cleanly.
+6. Click **Boot Installer** and install the guest OS to the virtual disk.
+7. Shut the guest down cleanly.
 8. Click **Start** for normal installed boots.
 
-After installation, log in to Linux through the Okrun VM display. You need the
+After installation, log in through the Okrun VM display. For Linux, you need the
 VM's network name or IP address before you can SSH in or install guest tools.
 
 The project folder will look like this:
@@ -63,11 +63,16 @@ my-vm/
     machine.identifier
 ```
 
+macOS projects use `macos.raw` or `macos.asif` plus `macos.hardware-model`,
+`macos.machine-identifier`, and `macos.auxiliary-storage`. Okrun creates those
+files from the selected IPSW before the first macOS install.
+
 `okrun-vm.json` is the file to edit for VM resources, startup behavior, shared
 folders, and per-VM private networking:
 
 ```json
 {
+  "guestOS": "linux",
   "cpuCount": 4,
   "memoryGB": 4,
   "diskGB": 64,
@@ -87,6 +92,13 @@ folders, and per-VM private networking:
   }
 }
 ```
+
+Use `"guestOS": "macos"` with an IPSW path in `installerISOPath` for a macOS
+guest. When macOS is selected in **Add VM**, Okrun can open or copy Apple's
+latest restore-image download URL supported by the current Mac. macOS guests
+require Apple silicon. Okrun configures both the Mac trackpad device and a USB
+screen-coordinate pointing device, so mouse and trackpad input work across newer
+and older guests.
 
 Use **VM > Edit VM Config** to open the selected VM's config. Stop the VM before
 changing config that affects devices, disks, or shared directories.
@@ -352,12 +364,12 @@ certificate, revocation, and LaunchAgent setup.
 
 ## Other Useful Stuff
 
-Use Okrun's **Shutdown** control or shut down from inside Linux. Force stop is
+Use Okrun's **Shutdown** control or shut down from inside the guest. Force stop is
 for stuck VMs only; it is equivalent to cutting power and can leave the guest
 filesystem needing repair.
 
-Increasing `diskGB` expands the virtual disk image, but Linux still needs its
-partition and filesystem expanded. Guest tools can try this with
+Increasing `diskGB` expands the virtual disk image, but the guest may still need
+its partition and filesystem expanded. Linux guest tools can try this with
 `--resize-root`; otherwise use tools such as `growpart` and `resize2fs` inside
 the guest.
 

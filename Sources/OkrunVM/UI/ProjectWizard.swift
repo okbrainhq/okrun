@@ -1,9 +1,12 @@
 import AppKit
 import UniformTypeIdentifiers
+#if arch(arm64)
+import Virtualization
+#endif
 
 struct NewProjectRequest {
     let projectURL: URL
-    let isoURL: URL
+    let installerURL: URL
     let config: VMConfig
 }
 
@@ -15,7 +18,10 @@ struct ImportVMRequest {
 
 private final class DialogActions: NSObject {
     var onChooseProject: (() -> Void)?
-    var onChooseISO: (() -> Void)?
+    var onChooseInstaller: (() -> Void)?
+    var onGuestOSChange: (() -> Void)?
+    var onOpenLatestMacOSDownload: (() -> Void)?
+    var onCopyLatestMacOSDownload: (() -> Void)?
     var onCreate: (() -> Void)?
     var onCancel: (() -> Void)?
 
@@ -23,8 +29,20 @@ private final class DialogActions: NSObject {
         onChooseProject?()
     }
 
-    @objc func chooseISO() {
-        onChooseISO?()
+    @objc func chooseInstaller() {
+        onChooseInstaller?()
+    }
+
+    @objc func guestOSChanged() {
+        onGuestOSChange?()
+    }
+
+    @objc func openLatestMacOSDownload() {
+        onOpenLatestMacOSDownload?()
+    }
+
+    @objc func copyLatestMacOSDownload() {
+        onCopyLatestMacOSDownload?()
     }
 
     @objc func create() {
@@ -75,16 +93,25 @@ extension AppDelegate {
         return panel.runModal() == .OK ? panel.url : nil
     }
 
-    func chooseInstallerISO() -> URL? {
+    func chooseInstallerImage(for guestOS: GuestOS) -> URL? {
         let panel = NSOpenPanel()
-        panel.title = "Choose Installer ISO"
-        panel.message = "Select the Linux .iso file for this project."
-        panel.prompt = "Use ISO"
+        panel.title = "Choose Installer \(guestOS.installerKindName)"
+        panel.message = "Select the \(guestOS.displayName) installer \(guestOS.installerKindName) for this project."
+        panel.prompt = "Use \(guestOS.installerKindName)"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [UTType(filenameExtension: "iso") ?? .diskImage]
+        switch guestOS {
+        case .linux:
+            panel.allowedContentTypes = [UTType(filenameExtension: "iso") ?? .diskImage]
+        case .macOS:
+            panel.allowedContentTypes = [UTType(filenameExtension: "ipsw") ?? .data]
+        }
         return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    func chooseInstallerISO() -> URL? {
+        chooseInstallerImage(for: .linux)
     }
 
     private func chooseASIFDisk() -> URL? {
@@ -337,11 +364,19 @@ extension AppDelegate {
 
     func askForNewProject() -> NewProjectRequest? {
         var projectURL = environmentURL("OKRUN_UI_E2E_PROJECT_PATH")
-        var isoURL = environmentURL("OKRUN_UI_E2E_ISO_PATH")
+        var installerURL = environmentURL("OKRUN_UI_E2E_INSTALLER_PATH") ?? environmentURL("OKRUN_UI_E2E_ISO_PATH")
+        var guestOS = GuestOS(rawValue: environmentValue("OKRUN_UI_E2E_GUEST_OS", default: GuestOS.linux.rawValue)) ?? .linux
         var result: NewProjectRequest?
+        let labelColumnWidth: CGFloat = 116
+        let fieldColumnWidth: CGFloat = 360
+        let formColumnSpacing: CGFloat = 12
+        let macOSDownloadPanelPadding: CGFloat = 14
+        let macOSDownloadButtonSpacing: CGFloat = 8
+        let macOSDownloadContentWidth = fieldColumnWidth - (macOSDownloadPanelPadding * 2)
+        let macOSDownloadActionButtonWidth = (macOSDownloadContentWidth - macOSDownloadButtonSpacing) / 2
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 390),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 600),
             styleMask: [.titled],
             backing: .buffered,
             defer: false
@@ -361,7 +396,7 @@ extension AppDelegate {
         title.font = .systemFont(ofSize: 20, weight: .semibold)
         title.alignment = .center
 
-        let subtitle = NSTextField(labelWithString: "Choose the VM folder, installer ISO, and starter resources.")
+        let subtitle = NSTextField(labelWithString: "Choose the VM folder, guest OS, installer image, and starter resources.")
         subtitle.translatesAutoresizingMaskIntoConstraints = false
         subtitle.font = .systemFont(ofSize: 13, weight: .regular)
         subtitle.textColor = .secondaryLabelColor
@@ -373,16 +408,106 @@ extension AppDelegate {
             identifier: "okrun.add.project"
         )
         projectButton.toolTip = projectURL?.path
-        let isoButton = makeChooserButton(
-            title: isoURL?.lastPathComponent ?? "Choose Installer ISO...",
+        let guestOSPopup = makeGuestOSPopup(initialGuestOS: guestOS)
+        let installerButton = makeChooserButton(
+            title: installerURL?.lastPathComponent ?? "Choose Installer \(guestOS.installerKindName)...",
             symbolName: "opticaldisc",
-            identifier: "okrun.add.iso"
+            identifier: "okrun.add.installer"
         )
-        isoButton.toolTip = isoURL?.path
+        installerButton.toolTip = installerURL?.path
+        let defaultMemoryGB = guestOS == .macOS ? "8" : "4"
+        let defaultDiskGB = guestOS == .macOS ? "80" : "64"
         let cpuField = makeNumberField(environmentValue("OKRUN_UI_E2E_CPU", default: "4"), identifier: "okrun.add.cpu")
-        let memoryField = makeNumberField(environmentValue("OKRUN_UI_E2E_MEMORY_GB", default: "4"), identifier: "okrun.add.memory")
-        let diskField = makeNumberField(environmentValue("OKRUN_UI_E2E_DISK_GB", default: "64"), identifier: "okrun.add.disk")
+        let memoryField = makeNumberField(environmentValue("OKRUN_UI_E2E_MEMORY_GB", default: defaultMemoryGB), identifier: "okrun.add.memory")
+        let diskField = makeNumberField(environmentValue("OKRUN_UI_E2E_DISK_GB", default: defaultDiskGB), identifier: "okrun.add.disk")
         let diskFormatPopup = makeDiskFormatPopup()
+
+        var latestMacOSDownloadURL: URL?
+        var isFetchingLatestMacOSDownload = false
+
+        let latestDownloadButton = makeSmallActionButton(
+            title: "Open Latest IPSW",
+            symbolName: "arrow.down.circle",
+            identifier: "okrun.add.macos-download-open",
+            width: macOSDownloadActionButtonWidth
+        )
+        let copyDownloadButton = makeSmallActionButton(
+            title: "Copy Link",
+            symbolName: "doc.on.doc",
+            identifier: "okrun.add.macos-download-copy",
+            width: macOSDownloadActionButtonWidth
+        )
+        let downloadButtonRow = NSStackView(views: [latestDownloadButton, copyDownloadButton])
+        downloadButtonRow.translatesAutoresizingMaskIntoConstraints = false
+        downloadButtonRow.orientation = .horizontal
+        downloadButtonRow.alignment = .centerY
+        downloadButtonRow.spacing = macOSDownloadButtonSpacing
+
+        let macOSDownloadStatus = NSTextField(labelWithString: "Finding the latest supported macOS restore image...")
+        macOSDownloadStatus.setAccessibilityIdentifier("okrun.add.macos-download-status")
+        macOSDownloadStatus.translatesAutoresizingMaskIntoConstraints = false
+        macOSDownloadStatus.font = .systemFont(ofSize: 11)
+        macOSDownloadStatus.textColor = .secondaryLabelColor
+        macOSDownloadStatus.lineBreakMode = .byTruncatingMiddle
+        macOSDownloadStatus.maximumNumberOfLines = 1
+        macOSDownloadStatus.widthAnchor.constraint(equalToConstant: macOSDownloadContentWidth).isActive = true
+
+        let macOSDownloadIcon = NSImageView(image: NSImage(
+            systemSymbolName: "arrow.down.circle",
+            accessibilityDescription: "Latest macOS IPSW"
+        ) ?? NSImage())
+        macOSDownloadIcon.translatesAutoresizingMaskIntoConstraints = false
+        macOSDownloadIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        macOSDownloadIcon.contentTintColor = .systemBlue
+        macOSDownloadIcon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        macOSDownloadIcon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+
+        let macOSDownloadTitle = NSTextField(labelWithString: "Latest supported macOS IPSW")
+        macOSDownloadTitle.translatesAutoresizingMaskIntoConstraints = false
+        macOSDownloadTitle.font = .systemFont(ofSize: 12, weight: .semibold)
+        macOSDownloadTitle.textColor = .labelColor
+
+        let macOSDownloadHeader = NSStackView(views: [macOSDownloadIcon, macOSDownloadTitle])
+        macOSDownloadHeader.translatesAutoresizingMaskIntoConstraints = false
+        macOSDownloadHeader.orientation = .horizontal
+        macOSDownloadHeader.alignment = .centerY
+        macOSDownloadHeader.spacing = 7
+
+        let macOSDownloadContent = NSStackView(views: [macOSDownloadHeader, downloadButtonRow, macOSDownloadStatus])
+        macOSDownloadContent.translatesAutoresizingMaskIntoConstraints = false
+        macOSDownloadContent.orientation = .vertical
+        macOSDownloadContent.alignment = .leading
+        macOSDownloadContent.spacing = 7
+
+        let macOSDownloadPanel = NSView()
+        macOSDownloadPanel.translatesAutoresizingMaskIntoConstraints = false
+        macOSDownloadPanel.wantsLayer = true
+        macOSDownloadPanel.layer?.cornerRadius = 8
+        macOSDownloadPanel.layer?.cornerCurve = .continuous
+        macOSDownloadPanel.layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1).cgColor
+        macOSDownloadPanel.layer?.borderWidth = 1
+        macOSDownloadPanel.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.35).cgColor
+        macOSDownloadPanel.addSubview(macOSDownloadContent)
+
+        NSLayoutConstraint.activate([
+            macOSDownloadPanel.widthAnchor.constraint(equalToConstant: fieldColumnWidth),
+            macOSDownloadPanel.heightAnchor.constraint(equalToConstant: 96),
+            macOSDownloadContent.leadingAnchor.constraint(equalTo: macOSDownloadPanel.leadingAnchor, constant: macOSDownloadPanelPadding),
+            macOSDownloadContent.trailingAnchor.constraint(equalTo: macOSDownloadPanel.trailingAnchor, constant: -macOSDownloadPanelPadding),
+            macOSDownloadContent.centerYAnchor.constraint(equalTo: macOSDownloadPanel.centerYAnchor)
+        ])
+
+        let macOSDownloadSpacer = NSView()
+        macOSDownloadSpacer.translatesAutoresizingMaskIntoConstraints = false
+        let macOSDownloadGrid = NSGridView(views: [
+            [macOSDownloadSpacer, macOSDownloadPanel]
+        ])
+        macOSDownloadGrid.column(at: 0).width = labelColumnWidth
+        macOSDownloadGrid.column(at: 1).width = fieldColumnWidth
+        macOSDownloadGrid.columnSpacing = formColumnSpacing
+        macOSDownloadGrid.rowSpacing = 0
+        macOSDownloadGrid.translatesAutoresizingMaskIntoConstraints = false
+        macOSDownloadGrid.isHidden = guestOS != .macOS
 
         let createButton = NSButton(title: "Create", target: nil, action: nil)
         createButton.setAccessibilityIdentifier("okrun.add.create")
@@ -402,6 +527,95 @@ extension AppDelegate {
         buttonRow.alignment = .centerY
         buttonRow.spacing = 12
 
+        func latestRestoreImageDescription(version: OperatingSystemVersion, build: String, url: URL) -> String {
+            let versionText: String
+            if version.patchVersion > 0 {
+                versionText = "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+            } else {
+                versionText = "\(version.majorVersion).\(version.minorVersion)"
+            }
+            return "macOS \(versionText) \(build)  \(url.absoluteString)"
+        }
+
+        func applyLatestMacOSDownloadURL(open: Bool, copy: Bool) {
+            guard let url = latestMacOSDownloadURL else { return }
+
+            if copy {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(url.absoluteString, forType: .string)
+                macOSDownloadStatus.stringValue = "Copied \(url.absoluteString)"
+                macOSDownloadStatus.toolTip = url.absoluteString
+            }
+
+            if open {
+                NSWorkspace.shared.open(url)
+                macOSDownloadStatus.stringValue = "Opened \(url.absoluteString)"
+                macOSDownloadStatus.toolTip = url.absoluteString
+            }
+        }
+
+        func fetchLatestMacOSDownload(open: Bool, copy: Bool) {
+            guard guestOS == .macOS else { return }
+
+            if latestMacOSDownloadURL != nil {
+                applyLatestMacOSDownloadURL(open: open, copy: copy)
+                return
+            }
+
+            guard !isFetchingLatestMacOSDownload else { return }
+            isFetchingLatestMacOSDownload = true
+            latestDownloadButton.isEnabled = false
+            copyDownloadButton.isEnabled = false
+            macOSDownloadStatus.textColor = .secondaryLabelColor
+            macOSDownloadStatus.stringValue = "Finding the latest supported macOS restore image..."
+            macOSDownloadStatus.toolTip = nil
+
+#if arch(arm64)
+            VZMacOSRestoreImage.fetchLatestSupported { result in
+                DispatchQueue.main.async {
+                    isFetchingLatestMacOSDownload = false
+
+                    switch result {
+                    case .success(let restoreImage):
+                        let url = restoreImage.url
+                        latestMacOSDownloadURL = url
+                        latestDownloadButton.isEnabled = true
+                        copyDownloadButton.isEnabled = true
+                        macOSDownloadStatus.textColor = .secondaryLabelColor
+                        macOSDownloadStatus.stringValue = latestRestoreImageDescription(
+                            version: restoreImage.operatingSystemVersion,
+                            build: restoreImage.buildVersion,
+                            url: url
+                        )
+                        macOSDownloadStatus.toolTip = url.absoluteString
+                        applyLatestMacOSDownloadURL(open: open, copy: copy)
+                    case .failure(let error):
+                        latestDownloadButton.isEnabled = true
+                        copyDownloadButton.isEnabled = true
+                        macOSDownloadStatus.textColor = .systemRed
+                        macOSDownloadStatus.stringValue = error.localizedDescription
+                        macOSDownloadStatus.toolTip = error.localizedDescription
+                    }
+                }
+            }
+#else
+            isFetchingLatestMacOSDownload = false
+            latestDownloadButton.isEnabled = false
+            copyDownloadButton.isEnabled = false
+            macOSDownloadStatus.textColor = .systemRed
+            macOSDownloadStatus.stringValue = "macOS guests require Apple silicon."
+            macOSDownloadStatus.toolTip = macOSDownloadStatus.stringValue
+#endif
+        }
+
+        func updateMacOSDownloadRow(fetchIfNeeded: Bool) {
+            macOSDownloadGrid.isHidden = guestOS != .macOS
+            if guestOS == .macOS, fetchIfNeeded {
+                fetchLatestMacOSDownload(open: false, copy: false)
+            }
+        }
+
         let actions = DialogActions()
         actions.onChooseProject = { [weak self, weak projectButton] in
             guard let url = self?.chooseProjectDirectory() else { return }
@@ -409,17 +623,42 @@ extension AppDelegate {
             projectButton?.title = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
             projectButton?.toolTip = url.path
         }
-        actions.onChooseISO = { [weak self, weak isoButton] in
-            guard let url = self?.chooseInstallerISO() else { return }
-            isoURL = url
-            isoButton?.title = url.lastPathComponent
-            isoButton?.toolTip = url.path
+        actions.onChooseInstaller = { [weak self, weak installerButton] in
+            guard let url = self?.chooseInstallerImage(for: guestOS) else { return }
+            installerURL = url
+            installerButton?.title = url.lastPathComponent
+            installerButton?.toolTip = url.path
         }
-        actions.onCreate = { [weak panel, weak cpuField, weak memoryField, weak diskField, weak diskFormatPopup] in
+        actions.onGuestOSChange = { [weak guestOSPopup, weak installerButton, weak memoryField, weak diskField] in
+            let selectedRaw = guestOSPopup?.selectedItem?.representedObject as? String
+            guestOS = selectedRaw.flatMap(GuestOS.init(rawValue:)) ?? .linux
+            installerURL = nil
+            installerButton?.title = "Choose Installer \(guestOS.installerKindName)..."
+            installerButton?.toolTip = nil
+            latestMacOSDownloadURL = nil
+            if guestOS == .macOS {
+                if memoryField?.stringValue == "4" {
+                    memoryField?.stringValue = "8"
+                }
+                if diskField?.stringValue == "64" {
+                    diskField?.stringValue = "80"
+                }
+            }
+            updateMacOSDownloadRow(fetchIfNeeded: true)
+        }
+        actions.onOpenLatestMacOSDownload = {
+            fetchLatestMacOSDownload(open: true, copy: false)
+        }
+        actions.onCopyLatestMacOSDownload = {
+            fetchLatestMacOSDownload(open: false, copy: true)
+        }
+        actions.onCreate = { [weak panel, weak cpuField, weak memoryField, weak diskField, weak diskFormatPopup, weak guestOSPopup] in
+            let selectedGuestOSRaw = guestOSPopup?.selectedItem?.representedObject as? String
+            let selectedGuestOS = selectedGuestOSRaw.flatMap(GuestOS.init(rawValue:)) ?? guestOS
             let diskFormatRaw = diskFormatPopup?.selectedItem?.representedObject as? String
             let diskFormat = diskFormatRaw.flatMap(DiskImageFormat.init(rawValue:)) ?? .raw
             guard let projectURL,
-                  let isoURL,
+                  let installerURL,
                   let cpu = Int(cpuField?.stringValue ?? ""),
                   let memory = Int(memoryField?.stringValue ?? ""),
                   let disk = Int(diskField?.stringValue ?? ""),
@@ -427,15 +666,16 @@ extension AppDelegate {
                     cpuCount: cpu,
                     memoryGB: memory,
                     diskGB: disk,
-                    installerISOPath: isoURL.path,
+                    installerISOPath: installerURL.path,
                     diskFormat: diskFormat,
-                    privateNetwork: PrivateNetworkConfig(enabled: true)
+                    privateNetwork: PrivateNetworkConfig(enabled: true),
+                    guestOS: selectedGuestOS
                   ).validated() else {
                 NSSound.beep()
                 return
             }
 
-            result = NewProjectRequest(projectURL: projectURL, isoURL: isoURL, config: config)
+            result = NewProjectRequest(projectURL: projectURL, installerURL: installerURL, config: config)
             panel?.close()
             NSApp.stopModal()
         }
@@ -445,31 +685,53 @@ extension AppDelegate {
         }
         projectButton.target = actions
         projectButton.action = #selector(DialogActions.chooseProject)
-        isoButton.target = actions
-        isoButton.action = #selector(DialogActions.chooseISO)
+        guestOSPopup.target = actions
+        guestOSPopup.action = #selector(DialogActions.guestOSChanged)
+        installerButton.target = actions
+        installerButton.action = #selector(DialogActions.chooseInstaller)
+        latestDownloadButton.target = actions
+        latestDownloadButton.action = #selector(DialogActions.openLatestMacOSDownload)
+        copyDownloadButton.target = actions
+        copyDownloadButton.action = #selector(DialogActions.copyLatestMacOSDownload)
         createButton.target = actions
         createButton.action = #selector(DialogActions.create)
         cancelButton.target = actions
         cancelButton.action = #selector(DialogActions.cancel)
 
-        let grid = NSGridView(views: [
+        let topGrid = NSGridView(views: [
             [makeFieldLabel("VM Folder"), projectButton],
-            [makeFieldLabel("ISO"), isoButton],
+            [makeFieldLabel("Guest OS"), guestOSPopup]
+        ])
+        topGrid.column(at: 0).xPlacement = .trailing
+        topGrid.column(at: 0).width = labelColumnWidth
+        topGrid.column(at: 1).width = fieldColumnWidth
+        topGrid.rowSpacing = 14
+        topGrid.columnSpacing = formColumnSpacing
+        topGrid.translatesAutoresizingMaskIntoConstraints = false
+
+        let lowerGrid = NSGridView(views: [
+            [makeFieldLabel("Installer"), installerButton],
             [makeFieldLabel("CPU"), cpuField],
             [makeFieldLabel("Memory GB"), memoryField],
             [makeFieldLabel("Disk GB"), diskField],
             [makeFieldLabel("Disk Format"), diskFormatPopup]
         ])
-        grid.column(at: 0).xPlacement = .trailing
-        grid.column(at: 0).width = 116
-        grid.column(at: 1).width = 280
-        grid.rowSpacing = 14
-        grid.columnSpacing = 12
-        grid.translatesAutoresizingMaskIntoConstraints = false
+        lowerGrid.column(at: 0).xPlacement = .trailing
+        lowerGrid.column(at: 0).width = labelColumnWidth
+        lowerGrid.column(at: 1).width = fieldColumnWidth
+        lowerGrid.rowSpacing = 14
+        lowerGrid.columnSpacing = formColumnSpacing
+        lowerGrid.translatesAutoresizingMaskIntoConstraints = false
+
+        let formStack = NSStackView(views: [topGrid, macOSDownloadGrid, lowerGrid])
+        formStack.translatesAutoresizingMaskIntoConstraints = false
+        formStack.orientation = .vertical
+        formStack.alignment = .centerX
+        formStack.spacing = 16
 
         content.addSubview(title)
         content.addSubview(subtitle)
-        content.addSubview(grid)
+        content.addSubview(formStack)
         content.addSubview(buttonRow)
         panel.contentView = content
 
@@ -480,14 +742,16 @@ extension AppDelegate {
             subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
             subtitle.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 32),
             subtitle.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -32),
-            grid.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 30),
-            grid.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            formStack.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 30),
+            formStack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            buttonRow.topAnchor.constraint(greaterThanOrEqualTo: formStack.bottomAnchor, constant: 24),
             buttonRow.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             buttonRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -26),
             cancelButton.widthAnchor.constraint(equalToConstant: 116),
             createButton.widthAnchor.constraint(equalToConstant: 116)
         ])
 
+        updateMacOSDownloadRow(fetchIfNeeded: true)
         center(panel)
         NSApp.runModal(for: panel)
 
@@ -501,11 +765,11 @@ extension AppDelegate {
         field.alignment = .right
         field.controlSize = .large
         field.font = .systemFont(ofSize: 13)
-        field.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        field.widthAnchor.constraint(equalToConstant: 112).isActive = true
         return field
     }
 
-    private func makeChooserButton(title: String, symbolName: String, identifier: String, width: CGFloat = 280) -> NSButton {
+    private func makeChooserButton(title: String, symbolName: String, identifier: String, width: CGFloat = 360) -> NSButton {
         let button = NSButton(title: title, target: nil, action: nil)
         button.setAccessibilityIdentifier(identifier)
         button.bezelStyle = .rounded
@@ -519,11 +783,42 @@ extension AppDelegate {
         return button
     }
 
+    private func makeSmallActionButton(title: String, symbolName: String, identifier: String, width: CGFloat = 176) -> NSButton {
+        let button = NSButton(title: title, target: nil, action: nil)
+        button.setAccessibilityIdentifier(identifier)
+        button.bezelStyle = .rounded
+        button.controlSize = .regular
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
+        button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
+        button.widthAnchor.constraint(equalToConstant: width).isActive = true
+        return button
+    }
+
+    private func makeGuestOSPopup(initialGuestOS: GuestOS) -> NSPopUpButton {
+        let popup = NSPopUpButton()
+        popup.setAccessibilityIdentifier("okrun.add.guest-os")
+        popup.controlSize = .large
+        popup.widthAnchor.constraint(equalToConstant: 360).isActive = true
+
+        let guestSystems: [GuestOS] = [.linux, .macOS]
+        for guestOS in guestSystems {
+            popup.addItem(withTitle: guestOS.displayName)
+            popup.lastItem?.representedObject = guestOS.rawValue
+        }
+
+        if let index = guestSystems.firstIndex(of: initialGuestOS) {
+            popup.selectItem(at: index)
+        }
+
+        return popup
+    }
+
     private func makeDiskFormatPopup() -> NSPopUpButton {
         let popup = NSPopUpButton()
         popup.setAccessibilityIdentifier("okrun.add.disk-format")
         popup.controlSize = .large
-        popup.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        popup.widthAnchor.constraint(equalToConstant: 360).isActive = true
 
         let formats: [DiskImageFormat] = DiskImageFormat.asif.isSupported ? [.asif, .raw] : [.raw]
         for format in formats {

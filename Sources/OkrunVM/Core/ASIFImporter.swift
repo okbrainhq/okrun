@@ -72,6 +72,9 @@ enum ASIFImporter {
         let virtualSizeBytes = try virtualSizeProvider(sourceURL)
         let diskGB = try diskGB(forVirtualSizeBytes: virtualSizeBytes)
         let config = try (request.config ?? importedConfig(diskGB: diskGB)).validated()
+        guard config.guestOS == .linux else {
+            throw AppError("ASIF import currently supports Linux guests.")
+        }
         guard config.diskFormat == .asif else {
             throw AppError("Imported VM config must use diskFormat 'asif'.")
         }

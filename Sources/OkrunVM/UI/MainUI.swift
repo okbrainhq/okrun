@@ -167,6 +167,9 @@ private final class VMTabSession {
     var shutdownRequested = false
     var projectLockFD: Int32?
     var privateNetworkRuntimes: [PrivateNetworkRuntime] = []
+#if arch(arm64)
+    var macOSInstaller: VZMacOSInstaller?
+#endif
     var canStartControls = true
     var canStopControls = false
     var status = "Ready"
@@ -179,6 +182,9 @@ private final class VMTabSession {
         self.config = config
         vmView.translatesAutoresizingMaskIntoConstraints = false
         vmView.capturesSystemKeys = true
+        if #available(macOS 14.0, *) {
+            vmView.automaticallyReconfiguresDisplay = true
+        }
     }
 
     var title: String {
@@ -188,7 +194,12 @@ private final class VMTabSession {
     }
 
     var isRunning: Bool {
-        virtualMachine != nil || fakeRunning
+#if arch(arm64)
+        if macOSInstaller != nil {
+            return true
+        }
+#endif
+        return virtualMachine != nil || fakeRunning
     }
 }
 
@@ -768,7 +779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             session.detail = statusDetail(paths: paths, config: config)
             sessions.append(session)
             AppLog.lifecycle.info(
-                "Loaded VM tab path=\(paths.root.path, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count) startOnAppLaunch=\(config.startup.startOnAppLaunch) startupMode=\(config.startup.mode.rawValue, privacy: .public)"
+                "Loaded VM tab path=\(paths.root.path, privacy: .public) guestOS=\(config.guestOS.rawValue, privacy: .public) cpu=\(config.cpuCount) memoryGB=\(config.memoryGB) diskGB=\(config.diskGB) privateNetwork=\(config.privateNetwork.enabled) sharedDirectories=\(config.sharedDirectories.count) startOnAppLaunch=\(config.startup.startOnAppLaunch) startupMode=\(config.startup.mode.rawValue, privacy: .public)"
             )
         }
 
@@ -796,7 +807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             case .installer:
                 guard let isoPath = session.config.installerISOPath,
                       FileManager.default.fileExists(atPath: isoPath) else {
-                    AppLog.lifecycle.warning("Skipping VM auto-start project=\(session.paths.root.path, privacy: .public) reason=missing-installer-iso")
+                    AppLog.lifecycle.warning("Skipping VM auto-start project=\(session.paths.root.path, privacy: .public) reason=missing-installer-image")
                     setStatus(
                         for: session,
                         status: "Auto start skipped",
@@ -805,7 +816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                     continue
                 }
 
-                AppLog.lifecycle.info("Auto-starting VM project=\(session.paths.root.path, privacy: .public) mode=installer iso=\(isoPath, privacy: .public)")
+                AppLog.lifecycle.info("Auto-starting VM project=\(session.paths.root.path, privacy: .public) mode=installer image=\(isoPath, privacy: .public)")
                 start(session: session, mode: .installer(URL(fileURLWithPath: isoPath)))
             }
         }
@@ -957,7 +968,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             if skipAutomaticStartAfterCreate {
                 setStatus(for: session, status: "Ready", detail: statusDetail(paths: paths, config: request.config))
             } else {
-                start(mode: .installer(request.isoURL))
+                start(mode: .installer(request.installerURL))
             }
         } catch {
             setStatus("Add project failed", detail: error.localizedDescription)
@@ -1212,10 +1223,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         config: VMConfig,
         preparation: VMStorage.PreparationResult? = nil
     ) -> String {
-        var detail = "\(paths.root.path)  |  CPU \(config.cpuCount)  Memory \(config.memoryGB) GB  Disk \(config.diskGB) GB \(config.diskFormat.displayName)"
+        var detail = "\(paths.root.path)  |  \(config.guestOS.displayName)  |  CPU \(config.cpuCount)  Memory \(config.memoryGB) GB  Disk \(config.diskGB) GB \(config.diskFormat.displayName)"
 
         if preparation?.expandedDisk == true {
-            detail += "  |  Disk image expanded; grow the Linux partition/filesystem inside the guest."
+            detail += "  |  Disk image expanded; grow the guest partition/filesystem if needed."
         }
 
         if let hostAvailableBytes = preparation?.hostAvailableBytes,
@@ -1272,9 +1283,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
 
         let detailLabel = NSTextField(wrappingLabelWithString: """
-        Closing Okrun before Linux shuts down cleanly can corrupt the guest disk.
+        Closing Okrun before a guest shuts down cleanly can corrupt the guest disk.
 
-        Ask Linux to shut down, keep Okrun running, or force quit only if the VM is stuck.
+        Ask the guest to shut down, keep Okrun running, or force quit only if the VM is stuck.
         """)
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         detailLabel.font = .systemFont(ofSize: 13)
@@ -1385,27 +1396,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             return
         }
 
-        guard let iso = chooseInstallerISO() else { return }
+        guard let installerImage = chooseInstallerImage(for: currentConfig.guestOS) else { return }
 
         do {
             let updatedConfig = VMConfig(
                 cpuCount: currentConfig.cpuCount,
                 memoryGB: currentConfig.memoryGB,
                 diskGB: currentConfig.diskGB,
-                installerISOPath: iso.path,
+                installerISOPath: installerImage.path,
                 diskFormat: currentConfig.diskFormat,
                 privateNetwork: currentConfig.privateNetwork,
                 sharedDirectories: currentConfig.sharedDirectories,
                 diskIO: currentConfig.diskIO,
-                startup: currentConfig.startup
+                startup: currentConfig.startup,
+                guestOS: currentConfig.guestOS
             )
             try updatedConfig.save(to: session.paths.config)
             session.config = updatedConfig
-            AppLog.lifecycle.info("Updated installer ISO project=\(session.paths.root.path, privacy: .public) iso=\(iso.path, privacy: .public)")
-            start(mode: .installer(iso))
+            AppLog.lifecycle.info("Updated installer image project=\(session.paths.root.path, privacy: .public) image=\(installerImage.path, privacy: .public)")
+            start(mode: .installer(installerImage))
         } catch {
-            AppLog.lifecycle.error("ISO update failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            setStatus("ISO update failed", detail: error.localizedDescription)
+            AppLog.lifecycle.error("Installer image update failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            setStatus("Installer update failed", detail: error.localizedDescription)
         }
     }
 
@@ -1451,7 +1463,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 
         if session.shutdownRequested {
             guard allowsForcePrompt else {
-                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
+                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for \(session.config.guestOS.displayName) to shut down cleanly.")
                 return true
             }
 
@@ -1466,7 +1478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 try virtualMachine.requestStop()
                 session.shutdownRequested = true
                 AppLog.virtualMachine.info("Requested graceful shutdown project=\(session.paths.root.path, privacy: .public)")
-                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for Linux to shut down cleanly.")
+                setStatus(for: session, status: "Shutdown requested", detail: "Waiting for \(session.config.guestOS.displayName) to shut down cleanly.")
                 return true
             }
         } catch {
@@ -1485,7 +1497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             setStatus(
                 for: session,
                 status: "Shutdown unavailable",
-                detail: "Linux cannot be asked to shut down from this VM state. Force quit only if it is stuck."
+                detail: "\(session.config.guestOS.displayName) cannot be asked to shut down from this VM state. Force quit only if it is stuck."
             )
             return false
         }
@@ -1501,7 +1513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Force stop \(session.title)?"
-        alert.informativeText = "Force stopping does not let Linux shut down cleanly. It can interrupt guest writes and may corrupt the guest disk."
+        alert.informativeText = "Force stopping does not let \(session.config.guestOS.displayName) shut down cleanly. It can interrupt guest writes and may corrupt the guest disk."
         alert.addButton(withTitle: "Force Stop")
         alert.addButton(withTitle: "Keep Waiting")
         return alert.runModal() == .alertFirstButtonReturn
@@ -1557,6 +1569,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                     self?.releasePrivateNetworkRuntimes(for: session)
                     session.virtualMachine = nil
                     session.vmView.virtualMachine = nil
+#if arch(arm64)
+                    session.macOSInstaller = nil
+#endif
                     session.shutdownRequested = false
                     session.canStartControls = true
                     session.canStopControls = false
@@ -1672,7 +1687,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             try acquireProjectLock(for: session)
             let loaded = try reloadConfiguration(for: session)
             AppLog.virtualMachine.info(
-                "Starting VM project=\(session.paths.root.path, privacy: .public) mode=\(mode.logDescription, privacy: .public) cpu=\(loaded.config.cpuCount) memoryGB=\(loaded.config.memoryGB) diskGB=\(loaded.config.diskGB) privateNetwork=\(loaded.config.privateNetwork.enabled) sharedDirectories=\(loaded.config.sharedDirectories.count) diskChange=\(String(describing: loaded.preparation.diskChange), privacy: .public)"
+                "Starting VM project=\(session.paths.root.path, privacy: .public) guestOS=\(loaded.config.guestOS.rawValue, privacy: .public) mode=\(mode.logDescription, privacy: .public) cpu=\(loaded.config.cpuCount) memoryGB=\(loaded.config.memoryGB) diskGB=\(loaded.config.diskGB) privateNetwork=\(loaded.config.privateNetwork.enabled) sharedDirectories=\(loaded.config.sharedDirectories.count) diskChange=\(String(describing: loaded.preparation.diskChange), privacy: .public)"
             )
             let modeText: String
             switch mode {
@@ -1704,6 +1719,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 detail: statusDetail(paths: session.paths, config: loaded.config, preparation: loaded.preparation)
             )
 
+            if case .installer(let installerImage) = mode, loaded.config.guestOS == .macOS {
+                startMacOSInstaller(
+                    for: session,
+                    virtualMachine: vm,
+                    installerImage: installerImage,
+                    modeText: modeText
+                )
+                return
+            }
+
             vm.start { [weak self] result in
                 DispatchQueue.main.async {
                     switch result {
@@ -1717,6 +1742,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                         self?.releasePrivateNetworkRuntimes(for: session)
                         session.virtualMachine = nil
                         session.vmView.virtualMachine = nil
+#if arch(arm64)
+                        session.macOSInstaller = nil
+#endif
                         session.shutdownRequested = false
                         self?.setControlsEnabled(for: session, canStart: true, canStop: false)
                         self?.setStatus(for: session, status: "Start failed", detail: error.localizedDescription)
@@ -1731,6 +1759,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             setControlsEnabled(for: session, canStart: true, canStop: false)
             setStatus(for: session, status: "Configuration failed", detail: error.localizedDescription)
         }
+    }
+
+    private func startMacOSInstaller(
+        for session: VMTabSession,
+        virtualMachine: VZVirtualMachine,
+        installerImage: URL,
+        modeText: String
+    ) {
+#if arch(arm64)
+        let installer = VZMacOSInstaller(
+            virtualMachine: virtualMachine,
+            restoringFromImageAt: installerImage
+        )
+        session.macOSInstaller = installer
+        setStatus(for: session, status: "Installing macOS", detail: runtimeDetail(for: session, "Mode: \(modeText)"))
+        AppLog.virtualMachine.info("Starting macOS installer project=\(session.paths.root.path, privacy: .public) image=\(installerImage.path, privacy: .public)")
+
+        installer.install { [weak self] result in
+            DispatchQueue.main.async {
+                session.macOSInstaller = nil
+
+                switch result {
+                case .success:
+                    AppLog.virtualMachine.info("macOS install completed project=\(session.paths.root.path, privacy: .public)")
+                    session.shutdownRequested = false
+                    if virtualMachine.state == .stopped {
+                        self?.releaseProjectLock(for: session)
+                        self?.releasePrivateNetworkRuntimes(for: session)
+                        session.virtualMachine = nil
+                        session.vmView.virtualMachine = nil
+                        self?.setControlsEnabled(for: session, canStart: true, canStop: false)
+                        self?.setStatus(for: session, status: "macOS installed", detail: "Start the installed system when you are ready.")
+                        self?.completePendingCloseIfReady()
+                    } else {
+                        self?.setControlsEnabled(for: session, canStart: false, canStop: true)
+                        self?.setStatus(for: session, status: "macOS installed", detail: "Installer completed; waiting for the guest to shut down.")
+                    }
+                case .failure(let error):
+                    AppLog.virtualMachine.error("macOS install failed project=\(session.paths.root.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                    self?.releaseProjectLock(for: session)
+                    self?.releasePrivateNetworkRuntimes(for: session)
+                    session.virtualMachine = nil
+                    session.vmView.virtualMachine = nil
+                    session.shutdownRequested = false
+                    self?.setControlsEnabled(for: session, canStart: true, canStop: false)
+                    self?.setStatus(for: session, status: "Install failed", detail: error.localizedDescription)
+                    self?.cancelPendingClose()
+                }
+            }
+        }
+#else
+        releaseProjectLock(for: session)
+        releasePrivateNetworkRuntimes(for: session)
+        session.virtualMachine = nil
+        session.vmView.virtualMachine = nil
+        setControlsEnabled(for: session, canStart: true, canStop: false)
+        setStatus(for: session, status: "Install unavailable", detail: "macOS guests require Apple silicon.")
+#endif
     }
 
     private func acquireProjectLock(for session: VMTabSession) throws {
@@ -1771,24 +1857,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private func makeConfiguration(paths: VMPaths, config: VMConfig, mode: VMMode, session: VMTabSession) throws -> VZVirtualMachineConfiguration {
         let configuration = VZVirtualMachineConfiguration()
 
-        let machineIdentifierData = try Data(contentsOf: paths.machineIdentifier)
-        guard let machineIdentifier = VZGenericMachineIdentifier(dataRepresentation: machineIdentifierData) else {
-            throw AppError("Invalid machine identifier at \(paths.machineIdentifier.path)")
-        }
-        let platform = VZGenericPlatformConfiguration()
-        platform.machineIdentifier = machineIdentifier
-        configuration.platform = platform
-
-        let bootLoader = VZEFIBootLoader()
-        bootLoader.variableStore = try makeEFIVariableStore(paths: paths, mode: mode)
-        configuration.bootLoader = bootLoader
+        let machineIdentifierData = try configurePlatformAndBootLoader(
+            for: configuration,
+            paths: paths,
+            config: config,
+            mode: mode
+        )
 
         configuration.cpuCount = min(config.cpuCount, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
         configuration.memorySize = min(UInt64(config.memoryGB) * 1024 * 1024 * 1024, VZVirtualMachineConfiguration.maximumAllowedMemorySize)
 
-        configuration.graphicsDevices = [makeGraphicsDevice()]
-        configuration.keyboards = [VZUSBKeyboardConfiguration()]
-        configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        configuration.graphicsDevices = [try makeGraphicsDevice(for: config.guestOS)]
+        configuration.keyboards = try makeKeyboards(for: config.guestOS)
+        configuration.pointingDevices = try makePointingDevices(for: config.guestOS)
         configuration.networkDevices = try NetworkDeviceFactory.makeDevices(
             privateNetwork: config.privateNetwork,
             machineIdentifierData: machineIdentifierData
@@ -1799,31 +1880,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode, config: config)
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
             for: config.sharedDirectories,
-            managedGuestLogsDirectory: ManagedGuestTools.guestLogsDirectory(in: paths)
+            managedGuestLogsDirectory: config.guestOS == .linux ? ManagedGuestTools.guestLogsDirectory(in: paths) : nil
         )
 
         try configuration.validate()
         return configuration
     }
 
-    private func makeEFIVariableStore(paths: VMPaths, mode: VMMode) throws -> VZEFIVariableStore {
-        try EFIVariableStoreFactory.make(paths: paths, mode: mode)
-    }
+    private func configurePlatformAndBootLoader(
+        for configuration: VZVirtualMachineConfiguration,
+        paths: VMPaths,
+        config: VMConfig,
+        mode: VMMode
+    ) throws -> Data {
+        switch config.guestOS {
+        case .linux:
+            let machineIdentifierData = try Data(contentsOf: paths.machineIdentifier)
+            guard let machineIdentifier = VZGenericMachineIdentifier(dataRepresentation: machineIdentifierData) else {
+                throw AppError("Invalid machine identifier at \(paths.machineIdentifier.path)")
+            }
+            let platform = VZGenericPlatformConfiguration()
+            platform.machineIdentifier = machineIdentifier
+            configuration.platform = platform
 
-    private func loadMachineIdentifier(from url: URL) throws -> VZGenericMachineIdentifier {
-        let data = try Data(contentsOf: url)
-        guard let machineIdentifier = VZGenericMachineIdentifier(dataRepresentation: data) else {
-            throw AppError("Invalid machine identifier at \(url.path)")
+            let bootLoader = VZEFIBootLoader()
+            bootLoader.variableStore = try EFIVariableStoreFactory.make(paths: paths, mode: mode)
+            configuration.bootLoader = bootLoader
+            return machineIdentifierData
+        case .macOS:
+#if arch(arm64)
+            let hardwareModel = try MacOSGuestMetadata.loadHardwareModel(from: paths.macOSHardwareModel)
+            let machineIdentifier = try MacOSGuestMetadata.loadMachineIdentifier(from: paths.macOSMachineIdentifier)
+            let platform = VZMacPlatformConfiguration()
+            platform.hardwareModel = hardwareModel
+            platform.machineIdentifier = machineIdentifier
+            platform.auxiliaryStorage = try MacOSGuestMetadata.loadAuxiliaryStorage(from: paths.macOSAuxiliaryStorage)
+            configuration.platform = platform
+            configuration.bootLoader = VZMacOSBootLoader()
+            return machineIdentifier.dataRepresentation
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
         }
-        return machineIdentifier
     }
 
-    private func makeGraphicsDevice() -> VZGraphicsDeviceConfiguration {
-        let graphicsDevice = VZVirtioGraphicsDeviceConfiguration()
-        graphicsDevice.scanouts = [
-            VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)
-        ]
-        return graphicsDevice
+    private func makeGraphicsDevice(for guestOS: GuestOS) throws -> VZGraphicsDeviceConfiguration {
+        switch guestOS {
+        case .linux:
+            let graphicsDevice = VZVirtioGraphicsDeviceConfiguration()
+            graphicsDevice.scanouts = [
+                VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)
+            ]
+            return graphicsDevice
+        case .macOS:
+#if arch(arm64)
+            let graphicsDevice = VZMacGraphicsDeviceConfiguration()
+            graphicsDevice.displays = [
+                VZMacGraphicsDisplayConfiguration(
+                    widthInPixels: 1280,
+                    heightInPixels: 800,
+                    pixelsPerInch: 80
+                )
+            ]
+            return graphicsDevice
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
+        }
+    }
+
+    private func makeKeyboards(for guestOS: GuestOS) throws -> [VZKeyboardConfiguration] {
+        switch guestOS {
+        case .linux:
+            return [VZUSBKeyboardConfiguration()]
+        case .macOS:
+#if arch(arm64)
+            var keyboards: [VZKeyboardConfiguration] = [VZUSBKeyboardConfiguration()]
+            if #available(macOS 14.0, *) {
+                keyboards.insert(VZMacKeyboardConfiguration(), at: 0)
+            }
+            return keyboards
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
+        }
+    }
+
+    private func makePointingDevices(for guestOS: GuestOS) throws -> [VZPointingDeviceConfiguration] {
+        switch guestOS {
+        case .linux:
+            return [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        case .macOS:
+#if arch(arm64)
+            var pointingDevices: [VZPointingDeviceConfiguration] = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+            if #available(macOS 13.0, *) {
+                pointingDevices.insert(VZMacTrackpadConfiguration(), at: 0)
+            }
+            return pointingDevices
+#else
+            throw AppError("macOS guests require Apple silicon.")
+#endif
+        }
     }
 
     private func makeStorageDevices(paths: VMPaths, mode: VMMode, config: VMConfig) throws -> [VZStorageDeviceConfiguration] {
@@ -1834,6 +1991,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             diskIO: config.diskIO
         )
         let diskDevice = VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
+
+        guard config.guestOS == .linux else {
+            return [diskDevice]
+        }
 
         switch mode {
         case .installed:
@@ -1879,6 +2040,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             self.releasePrivateNetworkRuntimes(for: session)
             session.virtualMachine = nil
             session.vmView.virtualMachine = nil
+#if arch(arm64)
+            session.macOSInstaller = nil
+#endif
             session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Shutdown", detail: "The VM has shut down.")
@@ -1894,6 +2058,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             self.releasePrivateNetworkRuntimes(for: session)
             session.virtualMachine = nil
             session.vmView.virtualMachine = nil
+#if arch(arm64)
+            session.macOSInstaller = nil
+#endif
             session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Stopped with error", detail: error.localizedDescription)
