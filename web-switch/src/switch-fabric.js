@@ -26,7 +26,16 @@ class SwitchFabric {
     this.maxFrameSize = options.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE;
     this.maxConnectionsPerHost = options.maxConnectionsPerHost ?? 8;
     this.macTtlMs = options.macTtlMs ?? 5 * 60 * 1000;
+    this.now = options.now ?? Date.now;
+    this.rateLimits = {
+      framesPerSecond: options.rateLimitFramesPerSecond ?? 20000,
+      bytesPerSecond: options.rateLimitBytesPerSecond ?? 128 * 1024 * 1024,
+      broadcastFramesPerSecond: options.rateLimitBroadcastFramesPerSecond ?? 2000,
+      multicastFramesPerSecond: options.rateLimitMulticastFramesPerSecond ?? 5000,
+      unknownUnicastFramesPerSecond: options.rateLimitUnknownUnicastFramesPerSecond ?? 5000
+    };
     this.networks = new Map();
+    this.trafficWindows = new Map();
   }
 
   admitConnection(initPayload, identity, connection) {
@@ -134,6 +143,7 @@ class SwitchFabric {
     }
 
     network.hosts.delete(session.nodeID);
+    this.trafficWindows.delete(trafficWindowKey(connection.networkKey, session.nodeID));
     removeMacsForHost(network, session.nodeID);
 
     if (network.hosts.size === 0) {
@@ -177,15 +187,29 @@ class SwitchFabric {
       return { duplicate: false, forwarded: 0 };
     }
 
-    this.expireMacs(network);
+    const now = this.now();
+    this.expireMacs(network, now);
 
-    const targets = chooseTargets(network, connection.session, frame.payload);
+    const inspection = inspectEthernet(frame.payload);
+    const frameClass = classifyFrame(network, inspection);
+    const rateLimit = this.checkRateLimit(connection.session, frame.payload.length, frameClass, now);
+    if (!rateLimit.allowed) {
+      connection.session.recordDrop(rateLimit.reason, frame.payload.length);
+      return {
+        duplicate: false,
+        forwarded: 0,
+        dropped: true,
+        dropReason: rateLimit.reason
+      };
+    }
+
+    const targets = chooseTargets(network, connection.session, frame.payload, now, inspection);
     let forwarded = 0;
     for (const target of targets) {
       forwarded += target.sendData(frame.payload, connection);
     }
 
-    return { duplicate: false, forwarded };
+    return { duplicate: false, forwarded, dropped: false };
   }
 
   handleResetSeq(connection, frame) {
@@ -213,8 +237,58 @@ class SwitchFabric {
     }
   }
 
+  checkRateLimit(session, byteCount, frameClass, now) {
+    const key = trafficWindowKey(session.networkKey, session.nodeID);
+    let current = this.trafficWindows.get(key);
+    if (!current || now - current.startedAt >= 1000) {
+      current = {
+        startedAt: now,
+        frames: 0,
+        bytes: 0,
+        broadcastFrames: 0,
+        multicastFrames: 0,
+        unknownUnicastFrames: 0
+      };
+      this.trafficWindows.set(key, current);
+    }
+
+    current.frames += 1;
+    current.bytes += byteCount;
+    switch (frameClass) {
+    case 'broadcast':
+      current.broadcastFrames += 1;
+      break;
+    case 'multicast':
+      current.multicastFrames += 1;
+      break;
+    case 'unknown_unicast':
+      current.unknownUnicastFrames += 1;
+      break;
+    default:
+      break;
+    }
+
+    if (exceeds(current.frames, this.rateLimits.framesPerSecond)) {
+      return { allowed: false, reason: 'rate_limit_frames' };
+    }
+    if (exceeds(current.bytes, this.rateLimits.bytesPerSecond)) {
+      return { allowed: false, reason: 'rate_limit_bytes' };
+    }
+    if (exceeds(current.broadcastFrames, this.rateLimits.broadcastFramesPerSecond)) {
+      return { allowed: false, reason: 'rate_limit_broadcast' };
+    }
+    if (exceeds(current.multicastFrames, this.rateLimits.multicastFramesPerSecond)) {
+      return { allowed: false, reason: 'rate_limit_multicast' };
+    }
+    if (exceeds(current.unknownUnicastFrames, this.rateLimits.unknownUnicastFramesPerSecond)) {
+      return { allowed: false, reason: 'rate_limit_unknown_unicast' };
+    }
+
+    return { allowed: true, reason: null };
+  }
+
   status() {
-    this.expireMacs();
+    this.expireMacs(null, this.now());
 
     const networks = [];
     let hostCount = 0;
@@ -251,6 +325,7 @@ class SwitchFabric {
       hostCount,
       connectionCount,
       macCount,
+      rateLimits: this.rateLimits,
       networks
     };
   }
@@ -428,19 +503,19 @@ function memberCounts(network) {
   };
 }
 
-function chooseTargets(network, sourceHost, payload) {
-  if (payload.length >= 14) {
-    const destinationMac = formatMac(payload, 0);
-    const sourceMac = formatMac(payload, 6);
+function chooseTargets(network, sourceHost, payload, now = Date.now(), inspection = inspectEthernet(payload)) {
+  if (inspection) {
+    const destinationMac = inspection.destinationMac;
+    const sourceMac = inspection.sourceMac;
 
-    if (!isMulticastMac(sourceMac) && sourceMac !== '00:00:00:00:00:00') {
+    if (!inspection.sourceIsMulticast && sourceMac !== '00:00:00:00:00:00') {
       network.macTable.set(sourceMac, {
         nodeID: sourceHost.nodeID,
-        updatedAt: Date.now()
+        updatedAt: now
       });
     }
 
-    if (!isMulticastMac(destinationMac)) {
+    if (!inspection.destinationIsMulticast) {
       const known = network.macTable.get(destinationMac);
       if (known) {
         const target = network.hosts.get(known.nodeID);
@@ -453,6 +528,48 @@ function chooseTargets(network, sourceHost, payload) {
   }
 
   return Array.from(network.hosts.values()).filter((host) => host !== sourceHost);
+}
+
+function inspectEthernet(payload) {
+  if (payload.length < 14) {
+    return null;
+  }
+
+  const destinationMac = formatMac(payload, 0);
+  const sourceMac = formatMac(payload, 6);
+  const destinationIsBroadcast = destinationMac === 'ff:ff:ff:ff:ff:ff';
+  const destinationIsMulticast = isMulticastMac(destinationMac);
+  return {
+    destinationMac,
+    sourceMac,
+    sourceIsMulticast: isMulticastMac(sourceMac),
+    destinationIsBroadcast,
+    destinationIsMulticast
+  };
+}
+
+function classifyFrame(network, inspection) {
+  if (!inspection) {
+    return 'malformed';
+  }
+  if (inspection.destinationIsBroadcast) {
+    return 'broadcast';
+  }
+  if (inspection.destinationIsMulticast) {
+    return 'multicast';
+  }
+  if (!network.macTable.has(inspection.destinationMac)) {
+    return 'unknown_unicast';
+  }
+  return 'known_unicast';
+}
+
+function exceeds(value, limit) {
+  return limit > 0 && value > limit;
+}
+
+function trafficWindowKey(networkKey, nodeID) {
+  return `${networkKey}\0${nodeID}`;
 }
 
 function isMulticastMac(macAddress) {
@@ -487,6 +604,8 @@ function expireNetworkMacs(network, now, ttlMs) {
 module.exports = {
   AdmissionError,
   SwitchFabric,
+  classifyFrame,
+  inspectEthernet,
   parseDhcpRange,
   parseIPv4,
   rangesOverlap

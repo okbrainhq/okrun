@@ -1169,6 +1169,8 @@ final class PrivateNetworkRuntimeRegistry {
 }
 
 final class PrivateNetworkRuntime {
+    private static let maxFramesPerReadEvent = 512
+
     let identifier: String
     let fileHandle: FileHandle
 
@@ -1182,6 +1184,7 @@ final class PrivateNetworkRuntime {
     private let observerLock = NSLock()
     private var frameObservers: [(PrivateNetworkFrameDirection, Data) -> Void] = []
     private var hostServices: [AnyObject] = []
+    private var droppedGuestFrameCount: UInt64 = 0
 
     init(identifier: String) throws {
         self.identifier = identifier
@@ -1199,6 +1202,7 @@ final class PrivateNetworkRuntime {
         try Self.setSocketOption(guestDescriptor, SO_RCVBUF, receiveBufferSize)
         try Self.setSocketOption(hostDescriptor, SO_SNDBUF, sendBufferSize)
         try Self.setSocketOption(hostDescriptor, SO_RCVBUF, receiveBufferSize)
+        try Self.setNonBlocking(hostDescriptor)
 
         let socketRoot = ProcessInfo.processInfo.environment["OKRUN_PRIVATE_NETWORK_SOCKET_ROOT"]
             .flatMap { $0.isEmpty ? nil : $0 }
@@ -1215,6 +1219,7 @@ final class PrivateNetworkRuntime {
         }
         try Self.setSocketOption(peerDescriptor, SO_SNDBUF, sendBufferSize)
         try Self.setSocketOption(peerDescriptor, SO_RCVBUF, receiveBufferSize)
+        try Self.setNonBlocking(peerDescriptor)
 
         peerURL = networkDirectory.appendingPathComponent("\(Self.shortPeerIdentifier()).sock")
         try Self.bindUnixDatagramSocket(peerDescriptor, to: peerURL.path)
@@ -1245,10 +1250,12 @@ final class PrivateNetworkRuntime {
 
     private func readGuestFrames() {
         var buffer = [UInt8](repeating: 0, count: 65_535)
+        var framesRead = 0
 
-        while true {
+        while framesRead < Self.maxFramesPerReadEvent {
             let count = recv(hostDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
             if count > 0 {
+                framesRead += 1
                 notifyObservers(direction: .fromGuest, frame: Data(buffer.prefix(count)))
                 broadcastFrame(buffer, count: count)
                 continue
@@ -1262,13 +1269,15 @@ final class PrivateNetworkRuntime {
 
     private func readPeerFrames() {
         var buffer = [UInt8](repeating: 0, count: 65_535)
+        var framesRead = 0
 
-        while true {
+        while framesRead < Self.maxFramesPerReadEvent {
             let count = recv(peerDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
             if count > 0 {
+                framesRead += 1
                 notifyObservers(direction: .fromPeer, frame: Data(buffer.prefix(count)))
-                _ = buffer.withUnsafeBufferPointer { pointer in
-                    write(hostDescriptor, pointer.baseAddress, count)
+                buffer.withUnsafeBufferPointer { pointer in
+                    writeFrameToGuest(pointer.baseAddress, count: count, source: "peer")
                 }
                 continue
             }
@@ -1305,7 +1314,7 @@ final class PrivateNetworkRuntime {
     func injectFrameToGuest(_ frame: Data) {
         frame.withUnsafeBytes { bytes in
             guard let baseAddress = bytes.baseAddress else { return }
-            _ = write(hostDescriptor, baseAddress, frame.count)
+            writeFrameToGuest(baseAddress, count: frame.count, source: "remote")
         }
     }
 
@@ -1327,6 +1336,41 @@ final class PrivateNetworkRuntime {
         guard setsockopt(descriptor, SOL_SOCKET, option, &socketValue, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
             throw AppError("Failed to configure private network socket: \(String(cString: strerror(errno))).")
         }
+    }
+
+    private static func setNonBlocking(_ descriptor: Int32) throws {
+        let currentFlags = fcntl(descriptor, F_GETFL)
+        guard currentFlags >= 0 else {
+            throw AppError("Failed to read private network socket flags: \(String(cString: strerror(errno))).")
+        }
+        guard fcntl(descriptor, F_SETFL, currentFlags | O_NONBLOCK) == 0 else {
+            throw AppError("Failed to make private network socket nonblocking: \(String(cString: strerror(errno))).")
+        }
+    }
+
+    private func writeFrameToGuest(_ buffer: UnsafeRawPointer?, count: Int, source: String) {
+        guard count > 0, let buffer else { return }
+        let result = write(hostDescriptor, buffer, count)
+        guard result == count else {
+            let reason: String
+            if result < 0 {
+                reason = String(cString: strerror(errno))
+            } else {
+                reason = "partial write \(result)/\(count)"
+            }
+            recordDroppedGuestFrame(source: source, reason: reason)
+            return
+        }
+    }
+
+    private func recordDroppedGuestFrame(source: String, reason: String) {
+        droppedGuestFrameCount += 1
+        guard droppedGuestFrameCount == 1 || droppedGuestFrameCount.isMultiple(of: 100) else {
+            return
+        }
+        AppLog.virtualMachine.warning(
+            "Dropped private network frame privateNetwork=\(self.identifier, privacy: .public) source=\(source, privacy: .public) dropped=\(self.droppedGuestFrameCount, privacy: .public) reason=\(reason, privacy: .public)"
+        )
     }
 
     private static func shortPeerIdentifier() -> String {

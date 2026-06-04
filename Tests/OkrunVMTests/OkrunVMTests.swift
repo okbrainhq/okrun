@@ -558,6 +558,34 @@ struct OkrunVMTests {
     }
 
     @Test
+    func networkPathSnapshotReconnectDecisionIgnoresAvailableInterfaceOnlyChanges() throws {
+        let previous = NetworkPathSnapshot(
+            status: "satisfied",
+            usedInterfaces: ["wired-ethernet"],
+            availableInterfaces: ["en11:wired-ethernet"]
+        )
+        let availableOnly = NetworkPathSnapshot(
+            status: "satisfied",
+            usedInterfaces: ["wired-ethernet"],
+            availableInterfaces: ["en11:wired-ethernet", "vmenet1:other"]
+        )
+        let usedChanged = NetworkPathSnapshot(
+            status: "satisfied",
+            usedInterfaces: ["wifi"],
+            availableInterfaces: ["en11:wired-ethernet", "en0:wifi"]
+        )
+        let statusChanged = NetworkPathSnapshot(
+            status: "unsatisfied",
+            usedInterfaces: [],
+            availableInterfaces: ["en11:wired-ethernet"]
+        )
+
+        #expect(availableOnly.shouldReconnect(comparedTo: previous) == false)
+        #expect(usedChanged.shouldReconnect(comparedTo: previous) == true)
+        #expect(statusChanged.shouldReconnect(comparedTo: previous) == true)
+    }
+
+    @Test
     func projectStoreMigratesLegacyDefaultRegistryFile() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }

@@ -117,6 +117,21 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/status
 ```
 
+Safety limits are enabled by default and can be tuned per deployment:
+
+```bash
+OKRUN_SWITCH_RATE_LIMIT_FRAMES_PER_SECOND=20000
+OKRUN_SWITCH_RATE_LIMIT_BYTES_PER_SECOND=134217728
+OKRUN_SWITCH_RATE_LIMIT_BROADCAST_FRAMES_PER_SECOND=2000
+OKRUN_SWITCH_RATE_LIMIT_MULTICAST_FRAMES_PER_SECOND=5000
+OKRUN_SWITCH_RATE_LIMIT_UNKNOWN_UNICAST_FRAMES_PER_SECOND=5000
+OKRUN_SWITCH_MAX_PENDING_WRITES=256
+OKRUN_SWITCH_MAX_PENDING_BYTES=4194304
+```
+
+Set a rate limit to `0` to disable that specific limiter. Dropped frames and
+drop reasons are included in `/status` per host.
+
 ## Deploying To A Linux VM
 
 Create the deploy config:

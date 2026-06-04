@@ -23,6 +23,12 @@ struct NetworkPathSnapshot: Equatable, CustomStringConvertible {
         return "status=\(status) used=\(used) available=\(available)"
     }
 
+    init(status: String, usedInterfaces: [String], availableInterfaces: [String]) {
+        self.status = status
+        self.usedInterfaces = usedInterfaces
+        self.availableInterfaces = availableInterfaces
+    }
+
     init(path: NWPath) {
         status = Self.describe(path.status)
         usedInterfaces = Self.interfaceTypes
@@ -61,5 +67,9 @@ struct NetworkPathSnapshot: Equatable, CustomStringConvertible {
         @unknown default:
             return "unknown"
         }
+    }
+
+    func shouldReconnect(comparedTo previous: NetworkPathSnapshot) -> Bool {
+        status != previous.status || usedInterfaces != previous.usedInterfaces
     }
 }

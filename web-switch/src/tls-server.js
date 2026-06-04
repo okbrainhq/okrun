@@ -73,6 +73,8 @@ class SwitchTLSServer {
       keepaliveTimeoutMs: options.keepaliveTimeoutMs ?? 25000,
       initTimeoutMs: options.initTimeoutMs ?? 10000,
       maxFrameSize: options.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE,
+      maxPendingWrites: options.maxPendingWrites ?? 256,
+      maxPendingBytes: options.maxPendingBytes ?? 4 * 1024 * 1024,
       logger: options.logger ?? console
     };
 
@@ -175,6 +177,8 @@ class SwitchLocalServer {
       keepaliveTimeoutMs: options.localKeepaliveTimeoutMs ?? 1500,
       initTimeoutMs: options.initTimeoutMs ?? 10000,
       maxFrameSize: options.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE,
+      maxPendingWrites: options.maxPendingWrites ?? 256,
+      maxPendingBytes: options.maxPendingBytes ?? 4 * 1024 * 1024,
       logger: options.logger ?? console
     };
 
@@ -250,6 +254,11 @@ class SwitchConnection {
     this.initTimer = null;
     this.keepaliveTimer = null;
     this.closing = false;
+    this.backpressured = false;
+    this.drainHandlerAttached = false;
+    this.pendingWrites = [];
+    this.pendingWriteBytes = 0;
+    this.droppedWrites = 0;
   }
 
   start() {
@@ -420,7 +429,16 @@ class SwitchConnection {
       return false;
     }
 
-    return this.socket.write(encoded);
+    if (this.backpressured || this.pendingWrites.length > 0) {
+      return this.enqueueEncodedFrame(encoded);
+    }
+
+    const accepted = this.socket.write(encoded);
+    if (!accepted) {
+      this.backpressured = true;
+      this.attachDrainHandler();
+    }
+    return true;
   }
 
   sendEncodedFrame(encoded) {
@@ -429,6 +447,81 @@ class SwitchConnection {
 
   sendFrame(frame) {
     this.sendEncodedFrame(encodeFrame(frame));
+  }
+
+  enqueueEncodedFrame(encoded) {
+    if (
+      this.options.maxPendingWrites > 0
+      && this.pendingWrites.length >= this.options.maxPendingWrites
+    ) {
+      this.recordDroppedWrite('pending_write_count_limit', encoded.length);
+      return false;
+    }
+
+    if (
+      this.options.maxPendingBytes > 0
+      && this.pendingWriteBytes + encoded.length > this.options.maxPendingBytes
+    ) {
+      this.recordDroppedWrite('pending_write_byte_limit', encoded.length);
+      return false;
+    }
+
+    this.pendingWrites.push(encoded);
+    this.pendingWriteBytes += encoded.length;
+    this.attachDrainHandler();
+    return true;
+  }
+
+  attachDrainHandler() {
+    if (this.drainHandlerAttached || this.closed || this.socket.destroyed) {
+      return;
+    }
+
+    this.drainHandlerAttached = true;
+    this.socket.once('drain', () => {
+      this.drainHandlerAttached = false;
+      this.backpressured = false;
+      this.flushPendingWrites();
+    });
+  }
+
+  flushPendingWrites() {
+    while (
+      this.pendingWrites.length > 0
+      && !this.closed
+      && !this.socket.destroyed
+      && this.socket.writable
+    ) {
+      const encoded = this.pendingWrites.shift();
+      this.pendingWriteBytes -= encoded.length;
+      const accepted = this.socket.write(encoded);
+      if (!accepted) {
+        this.backpressured = true;
+        this.attachDrainHandler();
+        return;
+      }
+    }
+  }
+
+  clearPendingWrites() {
+    this.pendingWrites = [];
+    this.pendingWriteBytes = 0;
+    this.backpressured = false;
+  }
+
+  recordDroppedWrite(reason, byteCount) {
+    this.droppedWrites += 1;
+    if (this.droppedWrites === 1 || this.droppedWrites % 100 === 0) {
+      this.log('drop', {
+        code: reason,
+        clientSerial: this.identity.clientSerial,
+        nodeID: this.nodeID,
+        network: this.networkKey,
+        interface: this.interfaceName,
+        droppedWrites: this.droppedWrites,
+        bytes: byteCount
+      });
+    }
   }
 
   closeWithError(error) {
@@ -460,6 +553,7 @@ class SwitchConnection {
     this.closed = true;
     clearTimeout(this.initTimer);
     clearInterval(this.keepaliveTimer);
+    this.clearPendingWrites();
     this.fabric.removeConnection(this);
 
     if (this.initialized) {

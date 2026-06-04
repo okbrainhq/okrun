@@ -698,6 +698,7 @@ private final class VirtualSwitchSocket {
 private final class RealSwitchSocket {
     private static let initialReconnectDelay: TimeInterval = 0.5
     private static let maxReconnectDelay: TimeInterval = 3
+    private static let networkPathReconnectDelay: TimeInterval = 2
     private static let webConnectionTimeout: TimeInterval = 25
     private static let localConnectionTimeout: TimeInterval = 3
     private static let initResponseTimeout: TimeInterval = 10
@@ -730,6 +731,7 @@ private final class RealSwitchSocket {
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var initResponseWorkItem: DispatchWorkItem?
     private var clientKeepaliveWorkItem: DispatchWorkItem?
+    private var networkPathReconnectWorkItem: DispatchWorkItem?
     private var lastPongAt: Date?
     private var clientKeepaliveInterval = RealSwitchSocket.defaultLocalKeepaliveInterval
     private var clientKeepaliveTimeout = RealSwitchSocket.defaultLocalKeepaliveTimeout
@@ -773,6 +775,7 @@ private final class RealSwitchSocket {
                 "stop network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public)"
             )
             cancelReconnect()
+            cancelNetworkPathReconnect()
             cancelConnectionTimeout()
             cancelInitResponseTimeout()
             cancelClientKeepalive()
@@ -901,15 +904,43 @@ private final class RealSwitchSocket {
             "network path changed network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) previous=\(previousSnapshot.description, privacy: .public) current=\(snapshot.description, privacy: .public)"
         )
 
+        guard snapshot.shouldReconnect(comparedTo: previousSnapshot) else {
+            AppLog.webSwitch.info(
+                "network path metadata changed without reconnect network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) current=\(snapshot.description, privacy: .public)"
+            )
+            return
+        }
+
         if snapshot.isSatisfied {
-            reconnectImmediatelyAfterNetworkPathChange(snapshot: snapshot)
+            scheduleReconnectAfterNetworkPathChange(snapshot: snapshot)
         } else {
             suspendForUnsatisfiedNetworkPath(snapshot: snapshot)
         }
     }
 
+    private func scheduleReconnectAfterNetworkPathChange(snapshot: NetworkPathSnapshot) {
+        guard !stopped else { return }
+        cancelNetworkPathReconnect()
+        let delay = Self.networkPathReconnectDelay
+        let milliseconds = Int(delay * 1000)
+        let message = "Host network changed (\(snapshot.description)). Reconnecting to \(endpoint.description) in \(milliseconds)ms."
+        AppLog.webSwitch.info(
+            "network path reconnect scheduled network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) delayMs=\(milliseconds, privacy: .public) path=\(snapshot.description, privacy: .public)"
+        )
+        report(.connecting, message, connections: initialized ? 1 : 0, error: nil)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            networkPathReconnectWorkItem = nil
+            reconnectImmediatelyAfterNetworkPathChange(snapshot: snapshot)
+        }
+        networkPathReconnectWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
     private func reconnectImmediatelyAfterNetworkPathChange(snapshot: NetworkPathSnapshot) {
         guard !stopped else { return }
+        networkPathReconnectWorkItem = nil
         let message = "Host network changed (\(snapshot.description)). Reconnecting to \(endpoint.description)."
         reconnectDelay = Self.initialReconnectDelay
         cancelReconnect()
@@ -934,6 +965,7 @@ private final class RealSwitchSocket {
         let message = "Host network unavailable (\(snapshot.description)). Waiting for network availability."
         reconnectDelay = Self.initialReconnectDelay
         cancelReconnect()
+        cancelNetworkPathReconnect()
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
         cancelClientKeepalive()
@@ -1433,6 +1465,7 @@ private final class RealSwitchSocket {
         reportState: PrivateNetworkSwitchConnectionState = .connecting
     ) {
         guard reconnectWorkItem == nil, !stopped else { return }
+        cancelNetworkPathReconnect()
         reconnectAttempts += 1
         let delay = delayOverride ?? reconnectDelay
         let milliseconds = Int(delay * 1000)
@@ -1468,6 +1501,11 @@ private final class RealSwitchSocket {
     private func cancelReconnect() {
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
+    }
+
+    private func cancelNetworkPathReconnect() {
+        networkPathReconnectWorkItem?.cancel()
+        networkPathReconnectWorkItem = nil
     }
 
     private func report(

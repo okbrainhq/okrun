@@ -19,12 +19,15 @@ const {
   parseErrorFrame
 } = require('./client');
 const {
+  DEFAULT_MAX_FRAME_SIZE,
   ETHERNET_STREAM_ID,
   FrameType,
   encodeFrame,
   encodeJsonFrame
 } = require('../../src/protocol');
 const { buildConfig } = require('../../src/index');
+const { SwitchFabric } = require('../../src/switch-fabric');
+const { SwitchConnection } = require('../../src/tls-server');
 
 const tests = [];
 let testCounter = 0;
@@ -83,6 +86,35 @@ function parseMemberUpdate(frame) {
   return JSON.parse(frame.payload.toString('utf8'));
 }
 
+function mockFabricConnection(name, kind = 'tls') {
+  return {
+    name,
+    identity: {
+      clientSerial: name,
+      clientFingerprint: '',
+      kind
+    },
+    sent: [],
+    writeEncodedFrame(encoded) {
+      this.sent.push(encoded);
+      return true;
+    },
+    closeWithError(error) {
+      this.closedWithError = error;
+    }
+  };
+}
+
+function admitFabricHost(fabric, connection, { networkIdentifier, nodeID, interfaceName = 'default' }) {
+  fabric.admitConnection({
+    protocol: 'okrun-switch/1',
+    nodeID,
+    networkIdentifier,
+    interface: interfaceName,
+    maxFrameSize: DEFAULT_MAX_FRAME_SIZE
+  }, connection.identity, connection);
+}
+
 async function closeAll(clients) {
   for (const current of clients) {
     current.close();
@@ -121,6 +153,114 @@ test('web switch default host remains public-listener friendly', async () => {
   const config = buildConfig([], {});
   assert.equal(config.host, '0.0.0.0');
   assert.equal(config.tlsEnabled, true);
+});
+
+test('fabric rate-limits broadcast storms per host', async () => {
+  let now = 1_000;
+  const fabric = new SwitchFabric({
+    now: () => now,
+    rateLimitFramesPerSecond: 0,
+    rateLimitBytesPerSecond: 0,
+    rateLimitBroadcastFramesPerSecond: 2,
+    rateLimitMulticastFramesPerSecond: 0,
+    rateLimitUnknownUnicastFramesPerSecond: 0
+  });
+  const net = networkName('broadcast-rate-limit');
+  const a = mockFabricConnection('rate-a');
+  const b = mockFabricConnection('rate-b');
+  admitFabricHost(fabric, a, {
+    networkIdentifier: net,
+    nodeID: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  });
+  admitFabricHost(fabric, b, {
+    networkIdentifier: net,
+    nodeID: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  });
+
+  const frame = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:55:01', 'storm');
+  assert.equal(fabric.handleData(a, {
+    streamId: ETHERNET_STREAM_ID,
+    type: FrameType.DATA,
+    seqNo: 1,
+    payload: frame
+  }).forwarded, 1);
+  assert.equal(fabric.handleData(a, {
+    streamId: ETHERNET_STREAM_ID,
+    type: FrameType.DATA,
+    seqNo: 2,
+    payload: frame
+  }).forwarded, 1);
+
+  const dropped = fabric.handleData(a, {
+    streamId: ETHERNET_STREAM_ID,
+    type: FrameType.DATA,
+    seqNo: 3,
+    payload: frame
+  });
+  assert.equal(dropped.dropped, true);
+  assert.equal(dropped.dropReason, 'rate_limit_broadcast');
+  assert.equal(b.sent.length, 2);
+
+  const status = fabric.status();
+  const host = status.networks[0].hosts.find((candidate) => candidate.nodeID === a.nodeID);
+  assert.equal(host.droppedFrames, 1);
+  assert.equal(host.dropReasons.rate_limit_broadcast, 1);
+
+  now += 1_001;
+  const afterWindow = fabric.handleData(a, {
+    streamId: ETHERNET_STREAM_ID,
+    type: FrameType.DATA,
+    seqNo: 4,
+    payload: frame
+  });
+  assert.equal(afterWindow.dropped, false);
+  assert.equal(afterWindow.forwarded, 1);
+});
+
+test('switch connection bounds pending writes while backpressured', async () => {
+  const logs = [];
+  const socket = new (require('node:events').EventEmitter)();
+  socket.destroyed = false;
+  socket.writable = true;
+  socket.writes = [];
+  socket.acceptWrites = false;
+  socket.write = (encoded) => {
+    socket.writes.push(encoded);
+    return socket.acceptWrites;
+  };
+  socket.end = () => {};
+
+  const connection = new SwitchConnection({
+    socket,
+    identity: {
+      clientSerial: 'backpressure-client',
+      clientFingerprint: '',
+      kind: 'tls'
+    },
+    fabric: null,
+    options: {
+      initTimeoutMs: 1000,
+      keepaliveIntervalMs: 1000,
+      keepaliveTimeoutMs: 2000,
+      maxFrameSize: DEFAULT_MAX_FRAME_SIZE,
+      maxPendingWrites: 1,
+      maxPendingBytes: 1024
+    },
+    logger: {
+      log(line) {
+        logs.push(JSON.parse(line));
+      }
+    }
+  });
+
+  assert.equal(connection.writeEncodedFrame(Buffer.alloc(10)), true);
+  assert.equal(connection.writeEncodedFrame(Buffer.alloc(10)), true);
+  assert.equal(connection.writeEncodedFrame(Buffer.alloc(10)), false);
+  assert.equal(logs.some((entry) => entry.event === 'drop' && entry.code === 'pending_write_count_limit'), true);
+
+  socket.acceptWrites = true;
+  socket.emit('drain');
+  assert.equal(socket.writes.length, 2);
 });
 
 test('local switch client can INIT without TLS credentials', async ({ server }) => {

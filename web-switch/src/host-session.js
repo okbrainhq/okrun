@@ -23,6 +23,9 @@ class HostSession {
     this.incomingDedup = new Map();
     this.outgoingSeqByStream = new Map();
     this.lastSeenAt = Date.now();
+    this.droppedFrames = 0;
+    this.droppedBytes = 0;
+    this.dropReasons = new Map();
   }
 
   get connectionCount() {
@@ -91,6 +94,13 @@ class HostSession {
     }
   }
 
+  recordDrop(reason, byteCount) {
+    this.droppedFrames += 1;
+    this.droppedBytes += byteCount;
+    this.dropReasons.set(reason, (this.dropReasons.get(reason) ?? 0) + 1);
+    this.lastSeenAt = Date.now();
+  }
+
   nextSeqNo(streamId) {
     const current = this.outgoingSeqByStream.get(streamId) ?? 0;
     const next = current >= 0xffffffff ? 1 : current + 1;
@@ -157,6 +167,9 @@ class HostSession {
             rangeEnd: this.dhcpRange.rangeEnd
           }
         : null,
+      droppedFrames: this.droppedFrames,
+      droppedBytes: this.droppedBytes,
+      dropReasons: Object.fromEntries(Array.from(this.dropReasons.entries()).sort()),
       lastSeenAt: this.lastSeenAt
     };
   }

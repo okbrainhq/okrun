@@ -141,6 +141,41 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
       args['max-frame-size'] ?? env.OKRUN_SWITCH_MAX_FRAME_SIZE,
       DEFAULT_MAX_FRAME_SIZE,
       'max-frame-size'
+    ),
+    rateLimitFramesPerSecond: numberOption(
+      args['rate-limit-frames-per-second'] ?? env.OKRUN_SWITCH_RATE_LIMIT_FRAMES_PER_SECOND,
+      20000,
+      'rate-limit-frames-per-second'
+    ),
+    rateLimitBytesPerSecond: numberOption(
+      args['rate-limit-bytes-per-second'] ?? env.OKRUN_SWITCH_RATE_LIMIT_BYTES_PER_SECOND,
+      128 * 1024 * 1024,
+      'rate-limit-bytes-per-second'
+    ),
+    rateLimitBroadcastFramesPerSecond: numberOption(
+      args['rate-limit-broadcast-frames-per-second'] ?? env.OKRUN_SWITCH_RATE_LIMIT_BROADCAST_FRAMES_PER_SECOND,
+      2000,
+      'rate-limit-broadcast-frames-per-second'
+    ),
+    rateLimitMulticastFramesPerSecond: numberOption(
+      args['rate-limit-multicast-frames-per-second'] ?? env.OKRUN_SWITCH_RATE_LIMIT_MULTICAST_FRAMES_PER_SECOND,
+      5000,
+      'rate-limit-multicast-frames-per-second'
+    ),
+    rateLimitUnknownUnicastFramesPerSecond: numberOption(
+      args['rate-limit-unknown-unicast-frames-per-second'] ?? env.OKRUN_SWITCH_RATE_LIMIT_UNKNOWN_UNICAST_FRAMES_PER_SECOND,
+      5000,
+      'rate-limit-unknown-unicast-frames-per-second'
+    ),
+    maxPendingWrites: numberOption(
+      args['max-pending-writes'] ?? env.OKRUN_SWITCH_MAX_PENDING_WRITES,
+      256,
+      'max-pending-writes'
+    ),
+    maxPendingBytes: numberOption(
+      args['max-pending-bytes'] ?? env.OKRUN_SWITCH_MAX_PENDING_BYTES,
+      4 * 1024 * 1024,
+      'max-pending-bytes'
     )
   };
 }
@@ -185,7 +220,12 @@ function createStatusServer(fabric) {
 function start(config) {
   const fabric = new SwitchFabric({
     maxFrameSize: config.maxFrameSize,
-    macTtlMs: config.macTtlMs
+    macTtlMs: config.macTtlMs,
+    rateLimitFramesPerSecond: config.rateLimitFramesPerSecond,
+    rateLimitBytesPerSecond: config.rateLimitBytesPerSecond,
+    rateLimitBroadcastFramesPerSecond: config.rateLimitBroadcastFramesPerSecond,
+    rateLimitMulticastFramesPerSecond: config.rateLimitMulticastFramesPerSecond,
+    rateLimitUnknownUnicastFramesPerSecond: config.rateLimitUnknownUnicastFramesPerSecond
   });
 
   const tlsServer = config.tlsEnabled !== false
