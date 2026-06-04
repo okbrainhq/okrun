@@ -24,6 +24,7 @@ const {
   encodeFrame,
   encodeJsonFrame
 } = require('../../src/protocol');
+const { buildConfig } = require('../../src/index');
 
 const tests = [];
 let testCounter = 0;
@@ -107,6 +108,19 @@ test('valid mTLS client can INIT and join', async ({ server, certs }) => {
   } finally {
     await closeAll([a]);
   }
+});
+
+test('local-only switch defaults to loopback host', async () => {
+  const config = buildConfig(['--tls-enabled', 'false', '--local-port', '9444'], {});
+  assert.equal(config.host, '127.0.0.1');
+  assert.equal(config.tlsEnabled, false);
+  assert.equal(config.localPort, 9444);
+});
+
+test('web switch default host remains public-listener friendly', async () => {
+  const config = buildConfig([], {});
+  assert.equal(config.host, '0.0.0.0');
+  assert.equal(config.tlsEnabled, true);
 });
 
 test('local switch client can INIT without TLS credentials', async ({ server }) => {
@@ -216,7 +230,7 @@ test('local switch removes silent peers on local keepalive timeout', async ({ se
   }
 });
 
-test('local switch and mTLS clients share the same fabric', async ({ server, certs }) => {
+test('local switch and mTLS clients share membership but do not bridge DATA', async ({ server, certs }) => {
   const net = networkName('mixed-fabric');
   const local = localClient(server, { name: 'mixed-local', networkIdentifier: net });
   const remote = client(server, certs, 'hostA', { name: 'mixed-tls', networkIdentifier: net });
@@ -228,7 +242,7 @@ test('local switch and mTLS clients share the same fabric', async ({ server, cer
     const frame = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:20:01', 'hello-mixed');
     local.sendData(frame);
 
-    assert.deepEqual((await remote.waitForData()).payload, frame);
+    await remote.expectNoData();
   } finally {
     await closeAll([local, remote]);
   }
@@ -494,22 +508,22 @@ test('hosts on different networks are isolated', async ({ server, certs }) => {
   }
 });
 
-test('duplicate DATA frames from multipath sockets are delivered once', async ({ server, certs }) => {
-  const net = networkName('multipath');
+test('duplicate DATA frames from one logical host are delivered once', async ({ server, certs }) => {
+  const net = networkName('same-host-duplicate');
   const nodeID = '11111111-1111-4111-8111-111111111111';
   const a1 = client(server, certs, 'hostA', {
-    name: 'multi-a-en0',
+    name: 'logical-a-en0',
     networkIdentifier: net,
     nodeID,
     interfaceName: 'en0'
   });
   const a2 = client(server, certs, 'hostA', {
-    name: 'multi-a-en1',
+    name: 'logical-a-en1',
     networkIdentifier: net,
     nodeID,
     interfaceName: 'en1'
   });
-  const b = client(server, certs, 'hostB', { name: 'multi-b', networkIdentifier: net });
+  const b = client(server, certs, 'hostB', { name: 'logical-b', networkIdentifier: net });
   const logicalA = new LogicalHost([a1, a2]);
 
   try {
@@ -536,6 +550,46 @@ test('duplicate DATA frames from multipath sockets are delivered once', async ({
     await logicalA.expectNoData();
   } finally {
     await closeAll([a1, a2, b]);
+  }
+});
+
+test('same-host DATA stays on the ingress transport class', async ({ server, certs }) => {
+  const net = networkName('local-shortcut');
+  const nodeID = '33333333-3333-4333-8333-333333333333';
+  const web = client(server, certs, 'hostA', {
+    name: 'shortcut-web',
+    networkIdentifier: net,
+    nodeID,
+    interfaceName: 'web'
+  });
+  const local = localClient(server, {
+    name: 'shortcut-local',
+    networkIdentifier: net,
+    nodeID,
+    interfaceName: 'local'
+  });
+  const b = client(server, certs, 'hostB', { name: 'shortcut-b', networkIdentifier: net });
+  let localPeer = null;
+
+  try {
+    await web.connect();
+    await local.connect();
+    await b.connect();
+
+    const toWeb = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:33:02', 'fallback-web');
+    b.sendData(toWeb);
+    assert.deepEqual((await web.waitForData()).payload, toWeb);
+    await local.expectNoData();
+
+    localPeer = localClient(server, { name: 'shortcut-local-peer', networkIdentifier: net });
+    await localPeer.connect();
+    const toLocal = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:33:01', 'prefer-local');
+    localPeer.sendData(toLocal);
+    assert.deepEqual((await local.waitForData()).payload, toLocal);
+    await web.expectNoData();
+    localPeer.close();
+  } finally {
+    await closeAll([web, local, b, localPeer].filter(Boolean));
   }
 });
 

@@ -102,7 +102,6 @@ extension AppDelegate {
         localSwitchMessageLabel.maximumNumberOfLines = 3
 
         let switchEnabled = makeNetworkCheckbox("Web Switch", identifier: "okrun.network.switch.enabled")
-        let switchMultipath = makeNetworkCheckbox("Multipath", identifier: "okrun.network.switch.multipath")
         let switchServerField = makeNetworkField(identifier: "okrun.network.switch.server")
         setNetworkPlaceholder("switch.example.com:9443", on: switchServerField)
 
@@ -169,7 +168,6 @@ extension AppDelegate {
 
         let switchConnectionGrid = NSGridView(views: [
             [makeNetworkLabel("Enabled"), switchEnabled],
-            [makeNetworkLabel("Multipath"), switchMultipath],
             [makeNetworkLabel("Server URL"), switchServerField]
         ])
         configureNetworkGrid(switchConnectionGrid)
@@ -257,7 +255,6 @@ extension AppDelegate {
             localSwitchEnabled.isEnabled = true
 
             localSwitchServerField.isEnabled = localSwitchOn
-            switchMultipath.isEnabled = switchOn
             switchServerField.isEnabled = switchOn
             bundleTextView.isEditable = true
             bundleTextView.isSelectable = true
@@ -291,14 +288,12 @@ extension AppDelegate {
 
                 if let switchConfig = privateNetwork?.switch {
                     switchEnabled.state = switchConfig.enabled ? .on : .off
-                    switchMultipath.state = switchConfig.multipath ? .on : .off
                     switchServerField.stringValue = switchConfig.server
                     loadedSwitchServer = switchConfig.server
                     bundleTextView.string = (try? readSavedSwitchBundleText()) ?? ""
                     loadedSwitchBundleText = normalizedSwitchBundleText(bundleTextView.string)
                 } else {
                     switchEnabled.state = .off
-                    switchMultipath.state = .off
                     switchServerField.stringValue = ""
                     loadedSwitchServer = ""
                     bundleTextView.string = (try? readSavedSwitchBundleText()) ?? ""
@@ -420,8 +415,9 @@ extension AppDelegate {
         func readLocalSwitchConfig() throws -> PrivateNetworkLocalSwitchConfig? {
             guard localSwitchEnabled.state == .on else { return nil }
 
+            let rawServer = localSwitchServerField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let server = try normalizedSwitchServer(
-                localSwitchServerField.stringValue,
+                rawServer.isEmpty ? "127.0.0.1:9444" : rawServer,
                 displayName: "Local Switch"
             )
             localSwitchServerField.stringValue = server
@@ -447,8 +443,7 @@ extension AppDelegate {
                         caCert: saved.caCert,
                         clientCert: saved.clientCert,
                         clientKey: saved.clientKey,
-                        credentialFingerprint: saved.credentialFingerprint,
-                        multipath: switchMultipath.state == .on
+                        credentialFingerprint: saved.credentialFingerprint
                     ).validated()
                 }
                 throw AppError("Paste a Web Switch host bundle JSON before applying.")
@@ -466,8 +461,7 @@ extension AppDelegate {
                     caCert: saved.caCert,
                     clientCert: saved.clientCert,
                     clientKey: saved.clientKey,
-                    credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText),
-                    multipath: switchMultipath.state == .on
+                    credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText)
                 ).validated()
             }
 
@@ -501,8 +495,7 @@ extension AppDelegate {
                 caCert: paths.ca,
                 clientCert: paths.cert,
                 clientKey: paths.key,
-                credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText),
-                multipath: switchMultipath.state == .on
+                credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText)
             )
             return try config.validated()
         }

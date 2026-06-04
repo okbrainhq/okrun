@@ -87,9 +87,10 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
   const tlsPort = tlsEnabled
     ? numberOption(args['tls-port'] ?? env.OKRUN_SWITCH_TLS_PORT, 9443, 'tls-port')
     : null;
+  const defaultHost = tlsEnabled ? '0.0.0.0' : '127.0.0.1';
 
   return {
-    host: args.host ?? env.OKRUN_SWITCH_HOST ?? '0.0.0.0',
+    host: args.host ?? env.OKRUN_SWITCH_HOST ?? defaultHost,
     tlsEnabled,
     tlsPort,
     localPort,

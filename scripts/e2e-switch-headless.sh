@@ -163,8 +163,7 @@ write_host_config() {
         "server": "localhost:$tls_port",
         "caCert": "$cert_dir/ca-cert.pem",
         "clientCert": "$cert_dir/client-cert.pem",
-        "clientKey": "$cert_dir/client-key.pem",
-        "multipath": false
+        "clientKey": "$cert_dir/client-key.pem"
       }
     }
   }

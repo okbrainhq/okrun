@@ -240,7 +240,6 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
     var clientCert: String
     var clientKey: String
     var credentialFingerprint: String
-    var multipath: Bool
 
     enum CodingKeys: String, CodingKey {
         case enabled
@@ -249,7 +248,6 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         case clientCert
         case clientKey
         case credentialFingerprint
-        case multipath
     }
 
     init(
@@ -258,8 +256,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         caCert: String = "",
         clientCert: String = "",
         clientKey: String = "",
-        credentialFingerprint: String = "",
-        multipath: Bool = false
+        credentialFingerprint: String = ""
     ) {
         self.enabled = enabled
         self.server = server
@@ -267,7 +264,6 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         self.clientCert = clientCert
         self.clientKey = clientKey
         self.credentialFingerprint = credentialFingerprint
-        self.multipath = multipath
     }
 
     init(from decoder: Decoder) throws {
@@ -278,7 +274,6 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         clientCert = try container.decodeIfPresent(String.self, forKey: .clientCert) ?? ""
         clientKey = try container.decodeIfPresent(String.self, forKey: .clientKey) ?? ""
         credentialFingerprint = try container.decodeIfPresent(String.self, forKey: .credentialFingerprint) ?? ""
-        multipath = try container.decodeIfPresent(Bool.self, forKey: .multipath) ?? false
     }
 
     func validated() throws -> PrivateNetworkSwitchConfig {
@@ -322,7 +317,11 @@ struct PrivateNetworkLocalSwitchConfig: Codable, Equatable {
 
     func validated() throws -> PrivateNetworkLocalSwitchConfig {
         guard enabled else { return self }
-        _ = try endpoint()
+        let endpoint = try endpoint()
+        let host = endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard host != "0.0.0.0", host != "::", host != "*" else {
+            throw AppError("private network local switch server must be a reachable host, not a wildcard bind address.")
+        }
         return self
     }
 
@@ -345,7 +344,6 @@ enum SwitchConnectionSecurity: Equatable {
 struct PrivateNetworkSwitchConnectionConfig: Equatable {
     var server: String
     var credentialFingerprint: String
-    var multipath: Bool
     var security: SwitchConnectionSecurity
 
     static func webSwitch(_ config: PrivateNetworkSwitchConfig) throws -> PrivateNetworkSwitchConnectionConfig {
@@ -353,7 +351,6 @@ struct PrivateNetworkSwitchConnectionConfig: Equatable {
         return PrivateNetworkSwitchConnectionConfig(
             server: validated.server,
             credentialFingerprint: validated.credentialFingerprint,
-            multipath: validated.multipath,
             security: .tls(SwitchTLSCredentials(
                 caCert: validated.caCert,
                 clientCert: validated.clientCert,
@@ -367,7 +364,6 @@ struct PrivateNetworkSwitchConnectionConfig: Equatable {
         return PrivateNetworkSwitchConnectionConfig(
             server: validated.server,
             credentialFingerprint: "",
-            multipath: false,
             security: .none
         )
     }
@@ -1015,7 +1011,7 @@ private final class RealSwitchSocket {
             interface: interfaceName,
             maxFrameSize: maxFrameSize,
             dhcpRange: dhcpRange,
-            capabilities: ["ethernet-frame", "multipath-v1"]
+            capabilities: ["ethernet-frame"]
         )
 
         do {

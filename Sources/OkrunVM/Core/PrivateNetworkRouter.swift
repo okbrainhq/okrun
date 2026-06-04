@@ -31,8 +31,52 @@ final class PrivateNetworkTransportRouter {
     }
 
     private struct RemoteRouteEntry {
-        var route: PrivateNetworkTransportRoute
-        var updatedAt: Date
+        var localUpdatedAt: Date?
+        var webUpdatedAt: Date?
+
+        init(localUpdatedAt: Date? = nil, webUpdatedAt: Date? = nil) {
+            self.localUpdatedAt = localUpdatedAt
+            self.webUpdatedAt = webUpdatedAt
+        }
+
+        var hasLocalRoute: Bool {
+            localUpdatedAt != nil
+        }
+
+        var hasWebRoute: Bool {
+            webUpdatedAt != nil
+        }
+
+        mutating func record(_ route: PrivateNetworkTransportRoute, at date: Date) {
+            switch route {
+            case .localSwitch:
+                localUpdatedAt = date
+            case .webSwitch:
+                webUpdatedAt = date
+            }
+        }
+
+        mutating func remove(_ route: PrivateNetworkTransportRoute) {
+            switch route {
+            case .localSwitch:
+                localUpdatedAt = nil
+            case .webSwitch:
+                webUpdatedAt = nil
+            }
+        }
+
+        mutating func expire(now currentDate: Date, ttl: TimeInterval) {
+            if let localUpdatedAt, currentDate.timeIntervalSince(localUpdatedAt) > ttl {
+                self.localUpdatedAt = nil
+            }
+            if let webUpdatedAt, currentDate.timeIntervalSince(webUpdatedAt) > ttl {
+                self.webUpdatedAt = nil
+            }
+        }
+
+        var isEmpty: Bool {
+            localUpdatedAt == nil && webUpdatedAt == nil
+        }
     }
 
     private struct LocalFrameSendPlan {
@@ -154,7 +198,7 @@ final class PrivateNetworkTransportRouter {
         let currentDate = now()
         expireMacsOnQueue(now: currentDate)
         guard let header = EthernetFrameHeader.parse(frame) else {
-            return remoteSendPlanOnQueue(logsNoReachableTransport: true)
+            return webFirstSendPlanOnQueue(logsNoReachableTransport: true)
         }
 
         localMACs[header.source] = currentDate
@@ -163,14 +207,14 @@ final class PrivateNetworkTransportRouter {
         }
 
         guard header.destination.isUnicast else {
-            return remoteSendPlanOnQueue(logsNoReachableTransport: true)
+            return webFirstSendPlanOnQueue(logsNoReachableTransport: true)
         }
 
-        guard remoteRoutes[header.destination] != nil else {
-            return remoteSendPlanOnQueue(logsNoReachableTransport: true)
+        guard let remoteRoute = remoteRoutes[header.destination] else {
+            return webFirstSendPlanOnQueue(logsNoReachableTransport: true)
         }
 
-        return remoteSendPlanOnQueue(logsNoReachableTransport: false)
+        return sendPlanOnQueue(for: remoteRoute, logsNoReachableTransport: false)
     }
 
     private func remoteFrameActionOnQueue(_ frame: Data, via route: PrivateNetworkTransportRoute) -> RemoteFrameAction {
@@ -184,16 +228,45 @@ final class PrivateNetworkTransportRouter {
             return .drop
         }
 
-        remoteRoutes[header.source] = RemoteRouteEntry(route: route, updatedAt: currentDate)
+        var entry = remoteRoutes[header.source] ?? RemoteRouteEntry()
+        entry.record(route, at: currentDate)
+        remoteRoutes[header.source] = entry
         return .inject(localGuestRuntimesOnQueue())
     }
 
-    private func remoteSendPlanOnQueue(logsNoReachableTransport: Bool) -> LocalFrameSendPlan {
+    private func sendPlanOnQueue(
+        for remoteRoute: RemoteRouteEntry,
+        logsNoReachableTransport: Bool
+    ) -> LocalFrameSendPlan {
+        if remoteRoute.hasLocalRoute {
+            return LocalFrameSendPlan(
+                transport: localSwitch,
+                route: .localSwitch,
+                fallbackTransport: webSwitch,
+                fallbackRoute: .webSwitch,
+                logsNoReachableTransport: logsNoReachableTransport
+            )
+        }
+
+        if remoteRoute.hasWebRoute {
+            return LocalFrameSendPlan(
+                transport: webSwitch,
+                route: .webSwitch,
+                fallbackTransport: nil,
+                fallbackRoute: nil,
+                logsNoReachableTransport: logsNoReachableTransport
+            )
+        }
+
+        return webFirstSendPlanOnQueue(logsNoReachableTransport: logsNoReachableTransport)
+    }
+
+    private func webFirstSendPlanOnQueue(logsNoReachableTransport: Bool) -> LocalFrameSendPlan {
         LocalFrameSendPlan(
-            transport: localSwitch,
-            route: .localSwitch,
-            fallbackTransport: webSwitch,
-            fallbackRoute: .webSwitch,
+            transport: webSwitch,
+            route: .webSwitch,
+            fallbackTransport: localSwitch,
+            fallbackRoute: .localSwitch,
             logsNoReachableTransport: logsNoReachableTransport
         )
     }
@@ -214,12 +287,20 @@ final class PrivateNetworkTransportRouter {
     }
 
     private func removeRemoteRoutesOnQueue(_ route: PrivateNetworkTransportRoute) {
-        remoteRoutes = remoteRoutes.filter { $0.value.route != route }
+        remoteRoutes = remoteRoutes.compactMapValues { entry in
+            var updated = entry
+            updated.remove(route)
+            return updated.isEmpty ? nil : updated
+        }
     }
 
     private func expireMacsOnQueue(now currentDate: Date) {
         localMACs = localMACs.filter { currentDate.timeIntervalSince($0.value) <= macTtl }
-        remoteRoutes = remoteRoutes.filter { currentDate.timeIntervalSince($0.value.updatedAt) <= macTtl }
+        remoteRoutes = remoteRoutes.compactMapValues { entry in
+            var updated = entry
+            updated.expire(now: currentDate, ttl: macTtl)
+            return updated.isEmpty ? nil : updated
+        }
     }
 
     private func firstReachableTransport(

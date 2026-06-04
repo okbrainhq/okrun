@@ -98,7 +98,7 @@ class HostSession {
     return next;
   }
 
-  sendData(payload) {
+  sendData(payload, sourceConnection) {
     let seqNo = this.nextSeqNo(ETHERNET_STREAM_ID);
     if (seqNo > SEQ_RESET_THRESHOLD) {
       this.sendResetSeq([ETHERNET_STREAM_ID]);
@@ -113,14 +113,22 @@ class HostSession {
       payload
     });
 
-    let sent = 0;
-    for (const connection of this.connections.values()) {
+    for (const connection of this.dataConnectionOrder(sourceConnection)) {
       if (connection.writeEncodedFrame(encoded)) {
-        sent += 1;
+        return 1;
       }
     }
 
-    return sent;
+    return 0;
+  }
+
+  dataConnectionOrder(sourceConnection) {
+    const connections = Array.from(this.connections.values());
+    const sourceKind = sourceConnection?.identity?.kind ?? 'tls';
+    if (sourceKind === 'local') {
+      return connections.filter((connection) => (connection.identity?.kind ?? 'tls') === 'local');
+    }
+    return connections.filter((connection) => (connection.identity?.kind ?? 'tls') !== 'local');
   }
 
   sendResetSeq(streams) {

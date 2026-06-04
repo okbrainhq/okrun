@@ -94,7 +94,7 @@ class TestSwitchClient extends EventEmitter {
       interface: this.interfaceName,
       maxFrameSize: this.maxFrameSize,
       dhcpRange: this.dhcpRange,
-      capabilities: ['ethernet-frame', 'multipath-v1']
+      capabilities: ['ethernet-frame']
     }));
 
     const frame = await this.waitForFrame(

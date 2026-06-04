@@ -182,7 +182,7 @@ class SwitchFabric {
     const targets = chooseTargets(network, connection.session, frame.payload);
     let forwarded = 0;
     for (const target of targets) {
-      forwarded += target.sendData(frame.payload);
+      forwarded += target.sendData(frame.payload, connection);
     }
 
     return { duplicate: false, forwarded };

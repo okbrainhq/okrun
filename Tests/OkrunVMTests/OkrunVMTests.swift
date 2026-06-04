@@ -1387,7 +1387,7 @@ struct OkrunVMTests {
     }
 
     @Test
-    func privateNetworkRouterPrefersLocalSwitchOverWebSwitch() throws {
+    func privateNetworkRouterSendsDiscoveryFramesToWebSwitchWhenLocalSwitchIsAvailable() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let localSwitch = MockRoutableTransport()
         let webSwitch = MockRoutableTransport()
@@ -1402,8 +1402,8 @@ struct OkrunVMTests {
 
         router.routeLocalFrame(frame)
 
-        #expect(localSwitch.sentFrames == [frame])
-        #expect(webSwitch.sentFrames.isEmpty)
+        #expect(localSwitch.sentFrames.isEmpty)
+        #expect(webSwitch.sentFrames == [frame])
     }
 
     @Test
@@ -1428,7 +1428,7 @@ struct OkrunVMTests {
     }
 
     @Test
-    func privateNetworkRouterMovesBackToLocalSwitchWhenItReturns() throws {
+    func privateNetworkRouterKeepsDiscoveryFramesOnWebSwitchWhenLocalSwitchReturns() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let localSwitch = MockRoutableTransport()
         let webSwitch = MockRoutableTransport()
@@ -1451,12 +1451,12 @@ struct OkrunVMTests {
         )
         router.routeLocalFrame(afterLocalReturn)
 
-        #expect(webSwitch.sentFrames == [whileLocalDown])
-        #expect(localSwitch.sentFrames == [afterLocalReturn])
+        #expect(webSwitch.sentFrames == [whileLocalDown, afterLocalReturn])
+        #expect(localSwitch.sentFrames.isEmpty)
     }
 
     @Test
-    func privateNetworkRouterMovesKnownRemoteFramesToLocalSwitchWhenAvailable() throws {
+    func privateNetworkRouterKeepsWebLearnedRemoteFramesOnWebSwitch() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let localSwitch = MockRoutableTransport()
         let webSwitch = MockRoutableTransport()
@@ -1471,8 +1471,71 @@ struct OkrunVMTests {
         let reply = ethernetFrame(destination: remoteMAC, source: localMAC, payload: [0x03])
         router.routeLocalFrame(reply)
 
+        #expect(localSwitch.sentFrames.isEmpty)
+        #expect(webSwitch.sentFrames == [reply])
+    }
+
+    @Test
+    func privateNetworkRouterUsesLocalSwitchForLocalLearnedRemoteFrames() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let localSwitch = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setLocalSwitch(localSwitch)
+        router.setWebSwitch(webSwitch)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x21]
+        let remoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x21]
+        let remoteFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+        router.receiveRemoteFrame(remoteFrame, via: .localSwitch)
+
+        let reply = ethernetFrame(destination: remoteMAC, source: localMAC, payload: [0x03])
+        router.routeLocalFrame(reply)
+
         #expect(localSwitch.sentFrames == [reply])
         #expect(webSwitch.sentFrames.isEmpty)
+    }
+
+    @Test
+    func privateNetworkRouterPrefersLocalSwitchAfterSameRemoteIsLearnedLocally() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let localSwitch = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setLocalSwitch(localSwitch)
+        router.setWebSwitch(webSwitch)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x23]
+        let remoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x23]
+        let webFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+        let localFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x04])
+        router.receiveRemoteFrame(webFrame, via: .webSwitch)
+        router.receiveRemoteFrame(localFrame, via: .localSwitch)
+
+        let reply = ethernetFrame(destination: remoteMAC, source: localMAC, payload: [0x03])
+        router.routeLocalFrame(reply)
+
+        #expect(localSwitch.sentFrames == [reply])
+        #expect(webSwitch.sentFrames.isEmpty)
+    }
+
+    @Test
+    func privateNetworkRouterFallsBackToWebSwitchForLocalLearnedRemoteWhenLocalIsUnavailable() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let localSwitch = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setLocalSwitch(localSwitch)
+        router.setWebSwitch(webSwitch)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x22]
+        let remoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x22]
+        let remoteFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+        router.receiveRemoteFrame(remoteFrame, via: .localSwitch)
+
+        localSwitch.canSendPrivateNetworkFrames = false
+        let reply = ethernetFrame(destination: remoteMAC, source: localMAC, payload: [0x03])
+        router.routeLocalFrame(reply)
+
+        #expect(localSwitch.sentFrames.isEmpty)
+        #expect(webSwitch.sentFrames == [reply])
     }
 
     @Test
@@ -1578,8 +1641,7 @@ struct OkrunVMTests {
             caCert: "/tmp/ca-cert.pem",
             clientCert: "/tmp/client-cert.pem",
             clientKey: "/tmp/client-key.pem",
-            credentialFingerprint: "bundle-a",
-            multipath: false
+            credentialFingerprint: "bundle-a"
         )
         let localSwitchConfig = PrivateNetworkLocalSwitchConfig(
             enabled: true,
@@ -1600,8 +1662,7 @@ struct OkrunVMTests {
             caCert: "/tmp/ca-cert.pem",
             clientCert: "/tmp/client-cert.pem",
             clientKey: "/tmp/client-key.pem",
-            credentialFingerprint: "bundle-b",
-            multipath: false
+            credentialFingerprint: "bundle-b"
         )
         #expect(changedCredentials != switchConfig)
 
@@ -1612,11 +1673,21 @@ struct OkrunVMTests {
           "caCert": "/tmp/ca-cert.pem",
           "clientCert": "/tmp/client-cert.pem",
           "clientKey": "/tmp/client-key.pem",
-          "multipath": false
+          "multipath": true
         }
         """
         let legacySwitchConfig = try JSONDecoder().decode(PrivateNetworkSwitchConfig.self, from: Data(legacyJSON.utf8))
         #expect(legacySwitchConfig.credentialFingerprint == "")
+    }
+
+    @Test
+    func localSwitchConfigRejectsWildcardBindAddressAsServer() throws {
+        #expect(throws: (any Error).self) {
+            try PrivateNetworkLocalSwitchConfig(
+                enabled: true,
+                server: "0.0.0.0:9444"
+            ).validated()
+        }
     }
 
     private func readFrame(on descriptor: Int32) -> Data? {
