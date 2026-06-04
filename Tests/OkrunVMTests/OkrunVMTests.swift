@@ -1387,7 +1387,7 @@ struct OkrunVMTests {
     }
 
     @Test
-    func privateNetworkRouterSendsDiscoveryFramesToWebSwitchWhenLocalSwitchIsAvailable() throws {
+    func privateNetworkRouterSendsDiscoveryFramesToWebAndLocalSwitchesWhenBothAreAvailable() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let localSwitch = MockRoutableTransport()
         let webSwitch = MockRoutableTransport()
@@ -1402,7 +1402,7 @@ struct OkrunVMTests {
 
         router.routeLocalFrame(frame)
 
-        #expect(localSwitch.sentFrames.isEmpty)
+        #expect(localSwitch.sentFrames == [frame])
         #expect(webSwitch.sentFrames == [frame])
     }
 
@@ -1428,7 +1428,7 @@ struct OkrunVMTests {
     }
 
     @Test
-    func privateNetworkRouterKeepsDiscoveryFramesOnWebSwitchWhenLocalSwitchReturns() throws {
+    func privateNetworkRouterProbesLocalSwitchWhenItReturns() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let localSwitch = MockRoutableTransport()
         let webSwitch = MockRoutableTransport()
@@ -1452,7 +1452,7 @@ struct OkrunVMTests {
         router.routeLocalFrame(afterLocalReturn)
 
         #expect(webSwitch.sentFrames == [whileLocalDown, afterLocalReturn])
-        #expect(localSwitch.sentFrames.isEmpty)
+        #expect(localSwitch.sentFrames == [afterLocalReturn])
     }
 
     @Test
@@ -1476,6 +1476,27 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRouterFallsBackToLocalSwitchForWebLearnedRemoteWhenWebIsUnavailable() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let localSwitch = MockRoutableTransport()
+        let webSwitch = MockRoutableTransport()
+        router.setLocalSwitch(localSwitch)
+        router.setWebSwitch(webSwitch)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x24]
+        let remoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x24]
+        let remoteFrame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+        router.receiveRemoteFrame(remoteFrame, via: .webSwitch)
+
+        webSwitch.canSendPrivateNetworkFrames = false
+        let reply = ethernetFrame(destination: remoteMAC, source: localMAC, payload: [0x03])
+        router.routeLocalFrame(reply)
+
+        #expect(localSwitch.sentFrames == [reply])
+        #expect(webSwitch.sentFrames.isEmpty)
+    }
+
+    @Test
     func privateNetworkRouterUsesLocalSwitchForLocalLearnedRemoteFrames() throws {
         let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
         let localSwitch = MockRoutableTransport()
@@ -1493,6 +1514,42 @@ struct OkrunVMTests {
 
         #expect(localSwitch.sentFrames == [reply])
         #expect(webSwitch.sentFrames.isEmpty)
+    }
+
+    @Test
+    func privateNetworkRouterDeduplicatesSameRemoteFrameAcrossSwitches() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let runtime = try PrivateNetworkRuntime(identifier: "router-runtime-\(UUID().uuidString)")
+        router.addRuntime(runtime)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x30]
+        let remoteMAC: [UInt8] = [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x30]
+        let frame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+
+        router.receiveRemoteFrame(frame, via: .webSwitch)
+        router.receiveRemoteFrame(frame, via: .localSwitch)
+
+        #expect(try waitForFrame(on: runtime.fileHandle.fileDescriptor, timeout: 1) == frame)
+        #expect(readFrame(on: runtime.fileHandle.fileDescriptor) == nil)
+        withExtendedLifetime((router, runtime)) {}
+    }
+
+    @Test
+    func privateNetworkRouterAllowsSameRemoteFrameTwiceOnSameSwitch() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let runtime = try PrivateNetworkRuntime(identifier: "router-runtime-\(UUID().uuidString)")
+        router.addRuntime(runtime)
+
+        let localMAC: [UInt8] = [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x31]
+        let remoteMAC: [UInt8] = [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x31]
+        let frame = ethernetFrame(destination: localMAC, source: remoteMAC, payload: [0x02])
+
+        router.receiveRemoteFrame(frame, via: .webSwitch)
+        router.receiveRemoteFrame(frame, via: .webSwitch)
+
+        #expect(try waitForFrame(on: runtime.fileHandle.fileDescriptor, timeout: 1) == frame)
+        #expect(try waitForFrame(on: runtime.fileHandle.fileDescriptor, timeout: 1) == frame)
+        withExtendedLifetime((router, runtime)) {}
     }
 
     @Test

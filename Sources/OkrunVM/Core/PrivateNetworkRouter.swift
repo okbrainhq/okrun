@@ -79,24 +79,36 @@ final class PrivateNetworkTransportRouter {
         }
     }
 
-    private struct LocalFrameSendPlan {
+    private struct RemoteFrameFingerprint: Hashable {
+        var hash: UInt64
+        var byteCount: Int
+    }
+
+    private struct RemoteFrameObservation {
+        var route: PrivateNetworkTransportRoute
+        var updatedAt: Date
+    }
+
+    private struct TransportCandidate {
         var transport: PrivateNetworkRoutableTransport?
         var route: PrivateNetworkTransportRoute?
-        var fallbackTransport: PrivateNetworkRoutableTransport?
-        var fallbackRoute: PrivateNetworkTransportRoute?
+    }
+
+    private struct LocalFrameSendPlan {
+        var candidates: [TransportCandidate]
+        var sendsToAllReachable: Bool
         var logsNoReachableTransport: Bool
 
         static let none = LocalFrameSendPlan(
-            transport: nil,
-            route: nil,
-            fallbackTransport: nil,
-            fallbackRoute: nil,
+            candidates: [],
+            sendsToAllReachable: false,
             logsNoReachableTransport: false
         )
     }
 
     private static let queueKey = DispatchSpecificKey<UUID>()
     private static let defaultMacTtl: TimeInterval = 5 * 60
+    private static let remoteFrameDedupTtl: TimeInterval = 0.25
 
     private let identifier: String
     private let queueID = UUID()
@@ -108,6 +120,7 @@ final class PrivateNetworkTransportRouter {
     private var webSwitch: PrivateNetworkRoutableTransport?
     private var localMACs: [EthernetAddress: Date] = [:]
     private var remoteRoutes: [EthernetAddress: RemoteRouteEntry] = [:]
+    private var remoteFrameFingerprints: [RemoteFrameFingerprint: RemoteFrameObservation] = [:]
 
     init(
         identifier: String,
@@ -197,6 +210,7 @@ final class PrivateNetworkTransportRouter {
     private func localFrameSendPlanOnQueue(_ frame: Data) -> LocalFrameSendPlan {
         let currentDate = now()
         expireMacsOnQueue(now: currentDate)
+        expireRemoteFrameFingerprintsOnQueue(now: currentDate)
         guard let header = EthernetFrameHeader.parse(frame) else {
             return webFirstSendPlanOnQueue(logsNoReachableTransport: true)
         }
@@ -207,11 +221,11 @@ final class PrivateNetworkTransportRouter {
         }
 
         guard header.destination.isUnicast else {
-            return webFirstSendPlanOnQueue(logsNoReachableTransport: true)
+            return discoverySendPlanOnQueue(logsNoReachableTransport: true)
         }
 
         guard let remoteRoute = remoteRoutes[header.destination] else {
-            return webFirstSendPlanOnQueue(logsNoReachableTransport: true)
+            return discoverySendPlanOnQueue(logsNoReachableTransport: true)
         }
 
         return sendPlanOnQueue(for: remoteRoute, logsNoReachableTransport: false)
@@ -220,8 +234,10 @@ final class PrivateNetworkTransportRouter {
     private func remoteFrameActionOnQueue(_ frame: Data, via route: PrivateNetworkTransportRoute) -> RemoteFrameAction {
         let currentDate = now()
         expireMacsOnQueue(now: currentDate)
+        expireRemoteFrameFingerprintsOnQueue(now: currentDate)
+        let shouldInject = shouldInjectRemoteFrameOnQueue(frame, via: route, now: currentDate)
         guard let header = EthernetFrameHeader.parse(frame) else {
-            return .inject(localGuestRuntimesOnQueue())
+            return shouldInject ? .inject(localGuestRuntimesOnQueue()) : .drop
         }
 
         if localMACs[header.source] != nil {
@@ -231,7 +247,7 @@ final class PrivateNetworkTransportRouter {
         var entry = remoteRoutes[header.source] ?? RemoteRouteEntry()
         entry.record(route, at: currentDate)
         remoteRoutes[header.source] = entry
-        return .inject(localGuestRuntimesOnQueue())
+        return shouldInject ? .inject(localGuestRuntimesOnQueue()) : .drop
     }
 
     private func sendPlanOnQueue(
@@ -240,20 +256,22 @@ final class PrivateNetworkTransportRouter {
     ) -> LocalFrameSendPlan {
         if remoteRoute.hasLocalRoute {
             return LocalFrameSendPlan(
-                transport: localSwitch,
-                route: .localSwitch,
-                fallbackTransport: webSwitch,
-                fallbackRoute: .webSwitch,
+                candidates: [
+                    TransportCandidate(transport: localSwitch, route: .localSwitch),
+                    TransportCandidate(transport: webSwitch, route: .webSwitch)
+                ],
+                sendsToAllReachable: false,
                 logsNoReachableTransport: logsNoReachableTransport
             )
         }
 
         if remoteRoute.hasWebRoute {
             return LocalFrameSendPlan(
-                transport: webSwitch,
-                route: .webSwitch,
-                fallbackTransport: nil,
-                fallbackRoute: nil,
+                candidates: [
+                    TransportCandidate(transport: webSwitch, route: .webSwitch),
+                    TransportCandidate(transport: localSwitch, route: .localSwitch)
+                ],
+                sendsToAllReachable: false,
                 logsNoReachableTransport: logsNoReachableTransport
             )
         }
@@ -263,27 +281,43 @@ final class PrivateNetworkTransportRouter {
 
     private func webFirstSendPlanOnQueue(logsNoReachableTransport: Bool) -> LocalFrameSendPlan {
         LocalFrameSendPlan(
-            transport: webSwitch,
-            route: .webSwitch,
-            fallbackTransport: localSwitch,
-            fallbackRoute: .localSwitch,
+            candidates: [
+                TransportCandidate(transport: webSwitch, route: .webSwitch),
+                TransportCandidate(transport: localSwitch, route: .localSwitch)
+            ],
+            sendsToAllReachable: false,
+            logsNoReachableTransport: logsNoReachableTransport
+        )
+    }
+
+    private func discoverySendPlanOnQueue(logsNoReachableTransport: Bool) -> LocalFrameSendPlan {
+        LocalFrameSendPlan(
+            candidates: [
+                TransportCandidate(transport: webSwitch, route: .webSwitch),
+                TransportCandidate(transport: localSwitch, route: .localSwitch)
+            ],
+            sendsToAllReachable: true,
             logsNoReachableTransport: logsNoReachableTransport
         )
     }
 
     private func sendFrame(_ frame: Data, using plan: LocalFrameSendPlan) {
-        guard let transport = firstReachableTransport(in: plan) else {
+        let transports = reachableTransports(in: plan)
+        guard !transports.isEmpty else {
             if plan.logsNoReachableTransport {
                 logNoReachableTransport()
             }
             return
         }
 
-        let routeName = transport.route.logName
-        AppLog.virtualMachine.debug(
-            "Private network router sending frame privateNetwork=\(self.identifier, privacy: .public) route=\(routeName, privacy: .public) bytes=\(frame.count, privacy: .public)"
-        )
-        transport.transport.sendFrameToRemote(frame)
+        let selectedTransports = plan.sendsToAllReachable ? transports : [transports[0]]
+        for transport in selectedTransports {
+            let routeName = transport.route.logName
+            AppLog.virtualMachine.debug(
+                "Private network router sending frame privateNetwork=\(self.identifier, privacy: .public) route=\(routeName, privacy: .public) bytes=\(frame.count, privacy: .public)"
+            )
+            transport.transport.sendFrameToRemote(frame)
+        }
     }
 
     private func removeRemoteRoutesOnQueue(_ route: PrivateNetworkTransportRoute) {
@@ -303,22 +337,46 @@ final class PrivateNetworkTransportRouter {
         }
     }
 
-    private func firstReachableTransport(
+    private func shouldInjectRemoteFrameOnQueue(
+        _ frame: Data,
+        via route: PrivateNetworkTransportRoute,
+        now currentDate: Date
+    ) -> Bool {
+        let fingerprint = RemoteFrameFingerprint(
+            hash: FNV1a64.hash(Array(frame)),
+            byteCount: frame.count
+        )
+
+        if let previous = remoteFrameFingerprints[fingerprint],
+           currentDate.timeIntervalSince(previous.updatedAt) <= Self.remoteFrameDedupTtl,
+           previous.route != route {
+            remoteFrameFingerprints[fingerprint] = RemoteFrameObservation(route: route, updatedAt: currentDate)
+            return false
+        }
+
+        remoteFrameFingerprints[fingerprint] = RemoteFrameObservation(route: route, updatedAt: currentDate)
+        return true
+    }
+
+    private func expireRemoteFrameFingerprintsOnQueue(now currentDate: Date) {
+        remoteFrameFingerprints = remoteFrameFingerprints.filter {
+            currentDate.timeIntervalSince($0.value.updatedAt) <= Self.remoteFrameDedupTtl
+        }
+    }
+
+    private func reachableTransports(
         in plan: LocalFrameSendPlan
-    ) -> (transport: PrivateNetworkRoutableTransport, route: PrivateNetworkTransportRoute)? {
-        if let transport = plan.transport,
-           let route = plan.route,
-           transport.canSendPrivateNetworkFrames {
-            return (transport, route)
+    ) -> [(transport: PrivateNetworkRoutableTransport, route: PrivateNetworkTransportRoute)] {
+        var result: [(transport: PrivateNetworkRoutableTransport, route: PrivateNetworkTransportRoute)] = []
+        for candidate in plan.candidates {
+            guard let transport = candidate.transport,
+                  let route = candidate.route,
+                  transport.canSendPrivateNetworkFrames else {
+                continue
+            }
+            result.append((transport, route))
         }
-
-        if let transport = plan.fallbackTransport,
-           let route = plan.fallbackRoute,
-           transport.canSendPrivateNetworkFrames {
-            return (transport, route)
-        }
-
-        return nil
+        return result
     }
 
     private func logNoReachableTransport() {
