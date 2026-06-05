@@ -12,15 +12,113 @@ struct HostPrivateNetworkConfig: Codable, Equatable {
     var dhcp: PrivateNetworkDHCPConfig?
     var `switch`: PrivateNetworkSwitchConfig?
     var localSwitch: PrivateNetworkLocalSwitchConfig?
+    var hostSSH: PrivateNetworkHostSSHConfig?
 
     init(
         dhcp: PrivateNetworkDHCPConfig?,
         switch switchConfig: PrivateNetworkSwitchConfig? = nil,
-        localSwitch: PrivateNetworkLocalSwitchConfig? = nil
+        localSwitch: PrivateNetworkLocalSwitchConfig? = nil,
+        hostSSH: PrivateNetworkHostSSHConfig? = nil
     ) {
         self.dhcp = dhcp
         self.switch = switchConfig
         self.localSwitch = localSwitch
+        self.hostSSH = hostSSH
+    }
+}
+
+struct PrivateNetworkHostSSHConfig: Codable, Equatable {
+    static let defaultListenPort: UInt16 = 22
+    static let defaultTargetHost = "127.0.0.1"
+    static let defaultTargetPort: UInt16 = 22
+
+    var enabled: Bool
+    var ipAddress: String
+    var listenPort: UInt16
+    var targetHost: String
+    var targetPort: UInt16
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case ipAddress
+        case listenPort
+        case targetHost
+        case targetPort
+    }
+
+    init(
+        enabled: Bool = false,
+        ipAddress: String = "",
+        listenPort: UInt16 = Self.defaultListenPort,
+        targetHost: String = Self.defaultTargetHost,
+        targetPort: UInt16 = Self.defaultTargetPort
+    ) {
+        self.enabled = enabled
+        self.ipAddress = ipAddress
+        self.listenPort = listenPort
+        self.targetHost = targetHost
+        self.targetPort = targetPort
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        ipAddress = try container.decodeIfPresent(String.self, forKey: .ipAddress) ?? ""
+        listenPort = try container.decodeIfPresent(UInt16.self, forKey: .listenPort) ?? Self.defaultListenPort
+        targetHost = try container.decodeIfPresent(String.self, forKey: .targetHost) ?? Self.defaultTargetHost
+        targetPort = try container.decodeIfPresent(UInt16.self, forKey: .targetPort) ?? Self.defaultTargetPort
+    }
+
+    func validated(dhcp: PrivateNetworkDHCPConfig?) throws -> PrivateNetworkHostSSHConfig {
+        guard enabled else { return self }
+
+        let trimmedIP = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedIP.isEmpty else {
+            throw AppError("private network host SSH ipAddress must not be empty when enabled.")
+        }
+        let hostIP = try IPv4Address(trimmedIP)
+
+        let trimmedTargetHost = targetHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTargetHost.isEmpty else {
+            throw AppError("private network host SSH targetHost must not be empty when enabled.")
+        }
+        guard trimmedTargetHost.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
+            throw AppError("private network host SSH targetHost must not contain NUL.")
+        }
+        guard listenPort > 0, targetPort > 0 else {
+            throw AppError("private network host SSH ports must be between 1 and 65535.")
+        }
+
+        if let dhcp, dhcp.enabled {
+            let validatedDHCP = try dhcp.validated()
+            let network = try IPv4CIDR(validatedDHCP.cidr)
+            guard network.contains(hostIP) else {
+                throw AppError("private network host SSH ipAddress must be inside \(validatedDHCP.cidr).")
+            }
+            guard hostIP != network.networkAddress,
+                  hostIP != network.broadcastAddress,
+                  hostIP != network.serverAddress else {
+                throw AppError("private network host SSH ipAddress must not use the network, broadcast, or DHCP server address.")
+            }
+            let rangeStart = try IPv4Address(validatedDHCP.rangeStart)
+            let rangeEnd = try IPv4Address(validatedDHCP.rangeEnd)
+            guard hostIP.value < rangeStart.value || hostIP.value > rangeEnd.value else {
+                throw AppError("private network host SSH ipAddress must be outside the DHCP lease range.")
+            }
+        }
+
+        return PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: trimmedIP,
+            listenPort: listenPort,
+            targetHost: trimmedTargetHost,
+            targetPort: targetPort
+        )
+    }
+
+    static func defaultIPAddress(cidr: String) throws -> String {
+        let network = try IPv4CIDR(cidr)
+        return IPv4Address(value: network.networkAddress.value + 2).description
     }
 }
 
@@ -116,6 +214,7 @@ final class HostNetworkConfigStore {
             _ = try privateNetwork.dhcp?.validated()
             _ = try privateNetwork.switch?.validated()
             _ = try privateNetwork.localSwitch?.validated()
+            _ = try privateNetwork.hostSSH?.validated(dhcp: privateNetwork.dhcp)
         }
         return config
     }
@@ -151,11 +250,21 @@ final class HostNetworkConfigStore {
         return validated.enabled ? validated : nil
     }
 
+    func hostSSHConfigForPrivateNetwork(identifier: String) throws -> PrivateNetworkHostSSHConfig? {
+        let privateNetwork = try load().privateNetworks[identifier]
+        guard let hostSSHConfig = privateNetwork?.hostSSH else {
+            return nil
+        }
+        let validated = try hostSSHConfig.validated(dhcp: privateNetwork?.dhcp)
+        return validated.enabled ? validated : nil
+    }
+
     func save(_ config: HostNetworkConfig) throws {
         for (_, privateNetwork) in config.privateNetworks {
             _ = try privateNetwork.dhcp?.validated()
             _ = try privateNetwork.switch?.validated()
             _ = try privateNetwork.localSwitch?.validated()
+            _ = try privateNetwork.hostSSH?.validated(dhcp: privateNetwork.dhcp)
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

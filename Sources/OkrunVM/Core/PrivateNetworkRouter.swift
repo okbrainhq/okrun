@@ -20,14 +20,24 @@ protocol PrivateNetworkRoutableTransport: AnyObject {
     func sendFrameToRemote(_ frame: Data)
 }
 
+protocol PrivateNetworkLocalEndpoint: AnyObject {
+    var privateNetworkMACAddress: EthernetAddress { get }
+
+    func receivePrivateNetworkFrame(_ frame: Data)
+}
+
 final class PrivateNetworkTransportRouter {
     private struct WeakRuntime {
         weak var runtime: PrivateNetworkRuntime?
     }
 
+    private struct WeakLocalEndpoint {
+        weak var endpoint: PrivateNetworkLocalEndpoint?
+    }
+
     private enum RemoteFrameAction {
         case drop
-        case inject([PrivateNetworkRuntime])
+        case inject(runtimes: [PrivateNetworkRuntime], endpoints: [PrivateNetworkLocalEndpoint])
     }
 
     private struct RemoteRouteEntry {
@@ -116,6 +126,7 @@ final class PrivateNetworkTransportRouter {
     private let macTtl: TimeInterval
     private let now: () -> Date
     private var runtimes: [WeakRuntime] = []
+    private var localEndpoints: [WeakLocalEndpoint] = []
     private var localSwitch: PrivateNetworkRoutableTransport?
     private var webSwitch: PrivateNetworkRoutableTransport?
     private var localMACs: [EthernetAddress: Date] = [:]
@@ -170,6 +181,26 @@ final class PrivateNetworkTransportRouter {
         }
     }
 
+    func addLocalEndpoint(_ endpoint: PrivateNetworkLocalEndpoint) {
+        runOnQueue {
+            self.localEndpoints.removeAll { $0.endpoint == nil || $0.endpoint === endpoint }
+            self.localEndpoints.append(WeakLocalEndpoint(endpoint: endpoint))
+        }
+    }
+
+    func removeLocalEndpoint(_ endpoint: PrivateNetworkLocalEndpoint) {
+        runOnQueue {
+            self.localEndpoints.removeAll { $0.endpoint == nil || $0.endpoint === endpoint }
+        }
+    }
+
+    func hasLocalEndpoints() -> Bool {
+        runOnQueue {
+            self.localEndpoints.removeAll { $0.endpoint == nil }
+            return !self.localEndpoints.isEmpty
+        }
+    }
+
     func hasRuntimes() -> Bool {
         runOnQueue {
             self.runtimes.removeAll { $0.runtime == nil }
@@ -178,10 +209,25 @@ final class PrivateNetworkTransportRouter {
     }
 
     func routeLocalFrame(_ frame: Data) {
-        let plan = runOnQueue {
-            self.localFrameSendPlanOnQueue(frame)
+        let result: (plan: LocalFrameSendPlan, endpoints: [PrivateNetworkLocalEndpoint]) = runOnQueue {
+            (
+                plan: self.localFrameSendPlanOnQueue(frame),
+                endpoints: self.localEndpointsForFrameOnQueue(frame)
+            )
         }
-        sendFrame(frame, using: plan)
+        deliverFrame(frame, to: result.endpoints)
+        sendFrame(frame, using: result.plan)
+    }
+
+    func routeLocalEndpointFrame(_ frame: Data) {
+        let result: (runtimes: [PrivateNetworkRuntime], plan: LocalFrameSendPlan) = runOnQueue {
+            (
+                runtimes: self.localGuestRuntimesOnQueue(),
+                plan: self.localFrameSendPlanOnQueue(frame)
+            )
+        }
+        injectFrame(frame, to: result.runtimes)
+        sendFrame(frame, using: result.plan)
     }
 
     func receiveRemoteFrame(_ frame: Data, via route: PrivateNetworkTransportRoute) {
@@ -192,19 +238,24 @@ final class PrivateNetworkTransportRouter {
         switch action {
         case .drop:
             return
-        case .inject(let runtimes):
+        case .inject(let runtimes, let endpoints):
+            deliverFrame(frame, to: endpoints)
             injectFrame(frame, to: runtimes)
         }
     }
 
     private func routeLocalFrame(_ frame: Data, from runtime: PrivateNetworkRuntime) {
-        let plan = runOnQueue {
+        let result: (plan: LocalFrameSendPlan, endpoints: [PrivateNetworkLocalEndpoint]) = runOnQueue {
             guard self.runtimes.contains(where: { $0.runtime === runtime }) else {
-                return LocalFrameSendPlan.none
+                return (plan: LocalFrameSendPlan.none, endpoints: [] as [PrivateNetworkLocalEndpoint])
             }
-            return self.localFrameSendPlanOnQueue(frame)
+            return (
+                plan: self.localFrameSendPlanOnQueue(frame),
+                endpoints: self.localEndpointsForFrameOnQueue(frame)
+            )
         }
-        sendFrame(frame, using: plan)
+        deliverFrame(frame, to: result.endpoints)
+        sendFrame(frame, using: result.plan)
     }
 
     private func localFrameSendPlanOnQueue(_ frame: Data) -> LocalFrameSendPlan {
@@ -216,7 +267,8 @@ final class PrivateNetworkTransportRouter {
         }
 
         localMACs[header.source] = currentDate
-        if header.destination.isUnicast, localMACs[header.destination] != nil {
+        if header.destination.isUnicast,
+           localMACs[header.destination] != nil || localEndpointMACsOnQueue().contains(header.destination) {
             return .none
         }
 
@@ -237,17 +289,27 @@ final class PrivateNetworkTransportRouter {
         expireRemoteFrameFingerprintsOnQueue(now: currentDate)
         let shouldInject = shouldInjectRemoteFrameOnQueue(frame, via: route, now: currentDate)
         guard let header = EthernetFrameHeader.parse(frame) else {
-            return shouldInject ? .inject(localGuestRuntimesOnQueue()) : .drop
+            return shouldInject
+                ? .inject(runtimes: localGuestRuntimesOnQueue(), endpoints: localEndpointObjectsOnQueue())
+                : .drop
         }
 
-        if localMACs[header.source] != nil {
+        if localMACs[header.source] != nil || localEndpointMACsOnQueue().contains(header.source) {
             return .drop
         }
 
         var entry = remoteRoutes[header.source] ?? RemoteRouteEntry()
         entry.record(route, at: currentDate)
         remoteRoutes[header.source] = entry
-        return shouldInject ? .inject(localGuestRuntimesOnQueue()) : .drop
+        guard shouldInject else { return .drop }
+
+        let endpoints = localEndpointsForFrameOnQueue(frame)
+        let endpointMACs = localEndpointMACsOnQueue()
+        let shouldInjectRuntimes = !(header.destination.isUnicast && endpointMACs.contains(header.destination))
+        return .inject(
+            runtimes: shouldInjectRuntimes ? localGuestRuntimesOnQueue() : [],
+            endpoints: endpoints
+        )
     }
 
     private func sendPlanOnQueue(
@@ -389,6 +451,29 @@ final class PrivateNetworkTransportRouter {
         for runtime in runtimes {
             runtime.injectFrameToGuest(frame)
         }
+    }
+
+    private func deliverFrame(_ frame: Data, to endpoints: [PrivateNetworkLocalEndpoint]) {
+        for endpoint in endpoints {
+            endpoint.receivePrivateNetworkFrame(frame)
+        }
+    }
+
+    private func localEndpointsForFrameOnQueue(_ frame: Data) -> [PrivateNetworkLocalEndpoint] {
+        let endpoints = localEndpointObjectsOnQueue()
+        guard let header = EthernetFrameHeader.parse(frame), header.destination.isUnicast else {
+            return endpoints
+        }
+        return endpoints.filter { $0.privateNetworkMACAddress == header.destination }
+    }
+
+    private func localEndpointObjectsOnQueue() -> [PrivateNetworkLocalEndpoint] {
+        localEndpoints.removeAll { $0.endpoint == nil }
+        return localEndpoints.compactMap(\.endpoint)
+    }
+
+    private func localEndpointMACsOnQueue() -> Set<EthernetAddress> {
+        Set(localEndpointObjectsOnQueue().map(\.privateNetworkMACAddress))
     }
 
     private func localGuestRuntimesOnQueue() -> [PrivateNetworkRuntime] {

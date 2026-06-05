@@ -379,6 +379,17 @@ When both Local Switch and Web Switch are configured, Okrun uses Local Switch
 while it is connected and falls back to Web Switch if the local listener is not
 available.
 
+**Host SSH** lets VMs SSH back into the running Mac over the same private subnet.
+Enable it in **Private Network > Host** and keep the host IP outside the DHCP
+lease range, for example `10.77.0.2`. From a VM, connect with:
+
+```sh
+ssh <mac-user>@10.77.0.2
+```
+
+This exposes only `127.0.0.1:22` through a user-space private-network endpoint;
+it does not create a macOS TAP/bridge interface.
+
 See [web-switch/README.md](web-switch/README.md) for full server deployment,
 certificate, revocation, and LaunchAgent setup.
 

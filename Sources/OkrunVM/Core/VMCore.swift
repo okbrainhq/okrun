@@ -827,12 +827,14 @@ enum NetworkDeviceFactory {
             .map { try PrivateNetworkDHCPLeaseRange(config: $0) }
         let localSwitchConfig = try hostNetworkConfigStore.localSwitchConfigForPrivateNetwork(identifier: identifier)
         let switchConfig = try hostNetworkConfigStore.switchConfigForPrivateNetwork(identifier: identifier)
+        let hostSSHConfig = try hostNetworkConfigStore.hostSSHConfigForPrivateNetwork(identifier: identifier)
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
         try PrivateNetworkRuntimeRegistry.shared.retain(
             runtime,
             localSwitchConfig: localSwitchConfig,
             switchConfig: switchConfig,
-            dhcpRange: dhcpRange
+            dhcpRange: dhcpRange,
+            hostSSHConfig: hostSSHConfig
         )
         onRetainPrivateNetworkRuntime?(runtime)
         return networkDevice
@@ -866,6 +868,7 @@ final class PrivateNetworkRuntimeRegistry {
     private var localSwitches: [String: PrivateNetworkSwitchTransport] = [:]
     private var switchFailures: [String: PrivateNetworkSwitchStatus] = [:]
     private var localSwitchFailures: [String: PrivateNetworkSwitchStatus] = [:]
+    private var hostSSHServices: [String: PrivateNetworkHostSSHService] = [:]
     private var routers: [String: PrivateNetworkTransportRouter] = [:]
     private var nodeIDs: [String: UUID] = [:]
 
@@ -875,11 +878,13 @@ final class PrivateNetworkRuntimeRegistry {
         _ runtime: PrivateNetworkRuntime,
         localSwitchConfig: PrivateNetworkLocalSwitchConfig? = nil,
         switchConfig: PrivateNetworkSwitchConfig? = nil,
-        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil
+        dhcpRange: PrivateNetworkDHCPLeaseRange? = nil,
+        hostSSHConfig: PrivateNetworkHostSSHConfig? = nil
     ) throws {
         runtimes.append(runtime)
         let router = router(for: runtime.identifier)
         router.addRuntime(runtime)
+        try configureHostSSH(identifier: runtime.identifier, hostSSHConfig: hostSSHConfig)
 
         var retainedTransport = false
         var retainedError: Error?
@@ -986,6 +991,34 @@ final class PrivateNetworkRuntimeRegistry {
         }
     }
 
+    func configureHostSSH(identifier: String, hostSSHConfig: PrivateNetworkHostSSHConfig?) throws {
+        if let existing = hostSSHServices[identifier],
+           let hostSSHConfig,
+           hostSSHConfig.enabled,
+           existing.matches(config: hostSSHConfig) {
+            router(for: identifier).addLocalEndpoint(existing)
+            return
+        }
+
+        if let existing = hostSSHServices[identifier] {
+            routers[identifier]?.removeLocalEndpoint(existing)
+            existing.stop()
+            hostSSHServices[identifier] = nil
+        }
+
+        guard let hostSSHConfig, hostSSHConfig.enabled else { return }
+        let transportRouter = router(for: identifier)
+        let service = try PrivateNetworkHostSSHService(
+            identifier: identifier,
+            config: hostSSHConfig,
+            emitFrame: { [weak transportRouter] frame in
+                transportRouter?.routeLocalEndpointFrame(frame)
+            }
+        )
+        hostSSHServices[identifier] = service
+        transportRouter.addLocalEndpoint(service)
+    }
+
     func hasSwitch(identifier: String) -> Bool {
         switches[identifier] != nil
     }
@@ -1010,11 +1043,15 @@ final class PrivateNetworkRuntimeRegistry {
         for runtime in runtimes {
             routers[runtime.identifier]?.removeRuntime(runtime)
         }
+        for service in hostSSHServices.values {
+            service.stop()
+        }
         runtimes.removeAll()
         switches.removeAll()
         localSwitches.removeAll()
         switchFailures.removeAll()
         localSwitchFailures.removeAll()
+        hostSSHServices.removeAll()
         routers.removeAll()
         nodeIDs.removeAll()
     }
@@ -1027,18 +1064,22 @@ final class PrivateNetworkRuntimeRegistry {
         runtimes.removeAll { runtime in
             ownedRuntimes.contains { $0 === runtime }
         }
-        for identifier in Array(switches.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
+        for identifier in Array(switches.keys) where !hasLocalPresence(identifier: identifier) {
             switches[identifier] = nil
         }
-        for identifier in Array(localSwitches.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
+        for identifier in Array(localSwitches.keys) where !hasLocalPresence(identifier: identifier) {
             localSwitches[identifier] = nil
         }
-        for identifier in Array(routers.keys) where routers[identifier]?.hasRuntimes() != true {
+        for identifier in Array(routers.keys) where !hasLocalPresence(identifier: identifier) {
             routers[identifier] = nil
         }
-        for identifier in Array(nodeIDs.keys) where !runtimes.contains(where: { $0.identifier == identifier }) {
+        for identifier in Array(nodeIDs.keys) where !hasLocalPresence(identifier: identifier) {
             nodeIDs[identifier] = nil
         }
+    }
+
+    private func hasLocalPresence(identifier: String) -> Bool {
+        runtimes.contains { $0.identifier == identifier } || hostSSHServices[identifier] != nil
     }
 
     @discardableResult
@@ -1162,6 +1203,9 @@ final class PrivateNetworkRuntimeRegistry {
         }
         if let switchTransport = switches[identifier] {
             router.setWebSwitch(switchTransport)
+        }
+        if let hostSSHService = hostSSHServices[identifier] {
+            router.addLocalEndpoint(hostSSHService)
         }
         routers[identifier] = router
         return router
