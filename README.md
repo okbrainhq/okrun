@@ -388,6 +388,14 @@ will not offer the host IP to VMs. From a VM, connect with the assigned address:
 ssh <mac-user>@<host-ssh-ip>
 ```
 
+You can also leave Hostname blank to use this Mac's hostname. Okrun answers
+mDNS/Bonjour-style `.local` queries on the private network, so guests with mDNS
+resolution can connect with:
+
+```sh
+ssh <mac-user>@<hostname>.local
+```
+
 This exposes only `127.0.0.1:22` through a user-space private-network endpoint;
 it does not create a macOS TAP/bridge interface.
 

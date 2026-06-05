@@ -1858,6 +1858,44 @@ struct OkrunVMTests {
     }
 
     @Test
+    func hostSSHServiceAnswersMDNSHostnameQueries() throws {
+        let collector = FrameCollector()
+        let config = PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: "10.77.0.20",
+            hostname: "Test Mac.local"
+        )
+        let service = try PrivateNetworkHostSSHService(identifier: "host-ssh-mdns-test", config: config) { frame in
+            collector.append(frame)
+        }
+        defer { service.stop() }
+
+        let hostIP = try IPv4Address("10.77.0.20")
+        let clientIP = try IPv4Address("10.77.0.21")
+        let clientMAC: [UInt8] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x41]
+        let multicastMAC: [UInt8] = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb]
+
+        service.receivePrivateNetworkFrame(udpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: multicastMAC,
+            sourceIP: clientIP,
+            destinationIP: try IPv4Address("224.0.0.251"),
+            sourcePort: 5353,
+            destinationPort: 5353,
+            payload: mdnsQuery(name: "test-mac.local", qtype: 1)
+        ))
+
+        let response = try collector.waitForFrame(timeout: 1) { frame in
+            (try? mdnsAnswerAddress(frame, name: "test-mac.local")) == hostIP
+        }
+        let responseBytes = [UInt8](response)
+        #expect(Array(responseBytes[0..<6]) == multicastMAC)
+        #expect(Array(responseBytes[6..<12]) == service.privateNetworkMACAddress.bytes)
+        #expect(try udpDestinationPort(response) == 5353)
+        #expect(try mdnsAnswerAddress(response, name: "test-mac.local") == hostIP)
+    }
+
+    @Test
     func hostNetworkConfigLoadsAndValidatesHostSSHConfig() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
@@ -1871,12 +1909,17 @@ struct OkrunVMTests {
             rangeEnd: "10.77.0.200",
             leaseSeconds: 3600
         )
-        let hostSSH = PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.20")
+        let hostSSH = try PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: "10.77.0.20",
+            hostname: "Test Mac.local"
+        ).validated(dhcp: dhcp)
         try store.save(HostNetworkConfig(version: 1, privateNetworks: [
             "okrun": HostPrivateNetworkConfig(dhcp: dhcp, hostSSH: hostSSH)
         ]))
 
         #expect(try store.hostSSHConfigForPrivateNetwork(identifier: "okrun") == hostSSH)
+        #expect(hostSSH.hostname == "test-mac")
         #expect(try PrivateNetworkHostSSHConfig.defaultIPAddress(dhcp: dhcp) == "10.77.0.20")
         #expect(throws: (any Error).self) {
             _ = try PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.2").validated(dhcp: dhcp)
@@ -2078,6 +2121,66 @@ struct OkrunVMTests {
         return frame
     }
 
+    private func udpFrame(
+        sourceMAC: [UInt8],
+        destinationMAC: [UInt8],
+        sourceIP: IPv4Address,
+        destinationIP: IPv4Address,
+        sourcePort: UInt16,
+        destinationPort: UInt16,
+        payload: Data
+    ) -> Data {
+        var udp = Data()
+        appendTestUInt16(sourcePort, to: &udp)
+        appendTestUInt16(destinationPort, to: &udp)
+        appendTestUInt16(UInt16(8 + payload.count), to: &udp)
+        appendTestUInt16(0, to: &udp)
+        udp.append(payload)
+
+        var ip = Data()
+        ip.append(0x45)
+        ip.append(0)
+        appendTestUInt16(UInt16(20 + udp.count), to: &ip)
+        appendTestUInt16(0, to: &ip)
+        appendTestUInt16(0x4000, to: &ip)
+        ip.append(255)
+        ip.append(17)
+        appendTestUInt16(0, to: &ip)
+        appendTestUInt32(sourceIP.value, to: &ip)
+        appendTestUInt32(destinationIP.value, to: &ip)
+
+        var frame = Data()
+        frame.append(contentsOf: destinationMAC.prefix(6))
+        frame.append(contentsOf: sourceMAC.prefix(6))
+        frame.append(contentsOf: [0x08, 0x00])
+        frame.append(ip)
+        frame.append(udp)
+        return frame
+    }
+
+    private func mdnsQuery(name: String, qtype: UInt16, unicast: Bool = false) -> Data {
+        var payload = Data()
+        appendTestUInt16(0, to: &payload)
+        appendTestUInt16(0, to: &payload)
+        appendTestUInt16(1, to: &payload)
+        appendTestUInt16(0, to: &payload)
+        appendTestUInt16(0, to: &payload)
+        appendTestUInt16(0, to: &payload)
+        appendDNSName(name, to: &payload)
+        appendTestUInt16(qtype, to: &payload)
+        appendTestUInt16(unicast ? 0x8001 : 1, to: &payload)
+        return payload
+    }
+
+    private func appendDNSName(_ name: String, to data: inout Data) {
+        for label in name.split(separator: ".", omittingEmptySubsequences: true) {
+            let bytes = Array(label.utf8.prefix(63))
+            data.append(UInt8(bytes.count))
+            data.append(contentsOf: bytes)
+        }
+        data.append(0)
+    }
+
     private func frameEtherType(_ frame: Data) -> UInt16? {
         let bytes = [UInt8](frame)
         guard bytes.count >= 14 else { return nil }
@@ -2114,6 +2217,56 @@ struct OkrunVMTests {
         return Data(bytes[payloadStart..<payloadEnd])
     }
 
+    private func udpDestinationPort(_ frame: Data) throws -> UInt16 {
+        let bytes = [UInt8](frame)
+        let offset = try #require(udpHeaderOffset(bytes))
+        return dhcpReadUInt16(bytes, offset + 2)
+    }
+
+    private func udpPayload(_ frame: Data) throws -> Data {
+        let bytes = [UInt8](frame)
+        let udpOffset = try #require(udpHeaderOffset(bytes))
+        let udpLength = Int(dhcpReadUInt16(bytes, udpOffset + 4))
+        let payloadStart = udpOffset + 8
+        let payloadEnd = udpOffset + udpLength
+        guard payloadEnd >= payloadStart, bytes.count >= payloadEnd else { return Data() }
+        return Data(bytes[payloadStart..<payloadEnd])
+    }
+
+    private func mdnsAnswerAddress(_ frame: Data, name: String) throws -> IPv4Address? {
+        let payload = try udpPayload(frame)
+        let bytes = [UInt8](payload)
+        guard bytes.count >= 12 else { return nil }
+        var offset = 12
+        let questionCount = Int(dhcpReadUInt16(bytes, 4))
+        let answerCount = Int(dhcpReadUInt16(bytes, 6))
+
+        for _ in 0..<questionCount {
+            _ = try #require(readDNSName(bytes, offset: &offset))
+            guard offset + 4 <= bytes.count else { return nil }
+            offset += 4
+        }
+
+        for _ in 0..<answerCount {
+            let labels = try #require(readDNSName(bytes, offset: &offset))
+            guard offset + 10 <= bytes.count else { return nil }
+            let answerName = labels.map { $0.lowercased() }.joined(separator: ".")
+            let answerType = dhcpReadUInt16(bytes, offset)
+            let answerClass = dhcpReadUInt16(bytes, offset + 2)
+            let dataLength = Int(dhcpReadUInt16(bytes, offset + 8))
+            offset += 10
+            guard offset + dataLength <= bytes.count else { return nil }
+            if answerName == name.lowercased(),
+               answerType == 1,
+               (answerClass & 0x7fff) == 1,
+               dataLength == 4 {
+                return IPv4Address(value: testReadUInt32(bytes, offset))
+            }
+            offset += dataLength
+        }
+        return nil
+    }
+
     private func tcpHeaderOffset(_ bytes: [UInt8]) -> Int? {
         let ipOffset = 14
         guard bytes.count >= ipOffset + 20,
@@ -2123,6 +2276,59 @@ struct OkrunVMTests {
         let headerLength = Int(bytes[ipOffset] & 0x0f) * 4
         guard headerLength >= 20, bytes.count >= ipOffset + headerLength + 20 else { return nil }
         return ipOffset + headerLength
+    }
+
+    private func udpHeaderOffset(_ bytes: [UInt8]) -> Int? {
+        let ipOffset = 14
+        guard bytes.count >= ipOffset + 20,
+              dhcpReadUInt16(bytes, 12) == 0x0800,
+              bytes[ipOffset + 9] == 17 else {
+            return nil
+        }
+        let headerLength = Int(bytes[ipOffset] & 0x0f) * 4
+        guard headerLength >= 20, bytes.count >= ipOffset + headerLength + 8 else { return nil }
+        return ipOffset + headerLength
+    }
+
+    private func readDNSName(_ bytes: [UInt8], offset: inout Int, depth: Int = 0) -> [String]? {
+        guard depth < 8 else { return nil }
+        var labels: [String] = []
+        var cursor = offset
+        var jumped = false
+
+        while true {
+            guard cursor < bytes.count else { return nil }
+            let length = bytes[cursor]
+            if length == 0 {
+                cursor += 1
+                if !jumped { offset = cursor }
+                return labels
+            }
+            if (length & 0xc0) == 0xc0 {
+                guard cursor + 1 < bytes.count else { return nil }
+                let pointer = Int(dhcpReadUInt16(bytes, cursor) & 0x3fff)
+                cursor += 2
+                if !jumped {
+                    offset = cursor
+                    jumped = true
+                }
+                var pointerOffset = pointer
+                guard let suffix = readDNSName(bytes, offset: &pointerOffset, depth: depth + 1) else {
+                    return nil
+                }
+                labels.append(contentsOf: suffix)
+                return labels
+            }
+            guard (length & 0xc0) == 0 else { return nil }
+            let labelLength = Int(length)
+            guard cursor + 1 + labelLength <= bytes.count else { return nil }
+            guard let label = String(data: Data(bytes[(cursor + 1)..<(cursor + 1 + labelLength)]), encoding: .utf8) else {
+                return nil
+            }
+            labels.append(label)
+            cursor += 1 + labelLength
+            if !jumped { offset = cursor }
+        }
     }
 
     private func appendTestUInt16(_ value: UInt16, to data: inout Data) {

@@ -37,6 +37,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
     var listenPort: UInt16
     var targetHost: String
     var targetPort: UInt16
+    var hostname: String
 
     enum CodingKeys: String, CodingKey {
         case enabled
@@ -44,6 +45,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         case listenPort
         case targetHost
         case targetPort
+        case hostname
     }
 
     init(
@@ -51,13 +53,15 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         ipAddress: String = "",
         listenPort: UInt16 = Self.defaultListenPort,
         targetHost: String = Self.defaultTargetHost,
-        targetPort: UInt16 = Self.defaultTargetPort
+        targetPort: UInt16 = Self.defaultTargetPort,
+        hostname: String = Self.defaultHostname()
     ) {
         self.enabled = enabled
         self.ipAddress = ipAddress
         self.listenPort = listenPort
         self.targetHost = targetHost
         self.targetPort = targetPort
+        self.hostname = hostname
     }
 
     init(from decoder: Decoder) throws {
@@ -67,6 +71,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         listenPort = try container.decodeIfPresent(UInt16.self, forKey: .listenPort) ?? Self.defaultListenPort
         targetHost = try container.decodeIfPresent(String.self, forKey: .targetHost) ?? Self.defaultTargetHost
         targetPort = try container.decodeIfPresent(UInt16.self, forKey: .targetPort) ?? Self.defaultTargetPort
+        hostname = try container.decodeIfPresent(String.self, forKey: .hostname) ?? Self.defaultHostname()
     }
 
     func validated(dhcp: PrivateNetworkDHCPConfig?) throws -> PrivateNetworkHostSSHConfig {
@@ -83,6 +88,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         guard listenPort > 0, targetPort > 0 else {
             throw AppError("private network host SSH ports must be between 1 and 65535.")
         }
+        let normalizedHostname = try Self.normalizedHostname(hostname)
 
         if let dhcp {
             guard dhcp.enabled else {
@@ -95,7 +101,8 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
                     ipAddress: "",
                     listenPort: listenPort,
                     targetHost: trimmedTargetHost,
-                    targetPort: targetPort
+                    targetPort: targetPort,
+                    hostname: normalizedHostname
                 )
             }
 
@@ -126,7 +133,8 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
             ipAddress: trimmedIP,
             listenPort: listenPort,
             targetHost: trimmedTargetHost,
-            targetPort: targetPort
+            targetPort: targetPort,
+            hostname: normalizedHostname
         )
     }
 
@@ -149,6 +157,66 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
     static func defaultIPAddress(cidr: String) throws -> String {
         let network = try IPv4CIDR(cidr)
         return IPv4Address(value: network.networkAddress.value + 20).description
+    }
+
+    static func defaultHostname() -> String {
+        var buffer = [CChar](repeating: 0, count: 256)
+        if gethostname(&buffer, buffer.count) == 0 {
+            let hostname = String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !hostname.isEmpty {
+                return hostname
+            }
+        }
+        let processHostname = ProcessInfo.processInfo.hostName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !processHostname.isEmpty {
+            return processHostname
+        }
+        return "okrun-host"
+    }
+
+    static func normalizedHostname(_ rawHostname: String) throws -> String {
+        var hostname = rawHostname.trimmingCharacters(in: .whitespacesAndNewlines)
+        if hostname.isEmpty {
+            hostname = defaultHostname()
+        }
+
+        while hostname.hasSuffix(".") {
+            hostname.removeLast()
+        }
+
+        if hostname.lowercased().hasSuffix(".local") {
+            hostname = String(hostname.dropLast(6))
+        }
+        if let firstLabel = hostname.split(separator: ".", omittingEmptySubsequences: true).first {
+            hostname = String(firstLabel)
+        }
+
+        var sanitized = ""
+        var previousWasHyphen = false
+        for scalar in hostname.unicodeScalars {
+            let value = scalar.value
+            let isDigit = value >= 48 && value <= 57
+            let isUppercase = value >= 65 && value <= 90
+            let isLowercase = value >= 97 && value <= 122
+            if isDigit || isUppercase || isLowercase {
+                sanitized.unicodeScalars.append(UnicodeScalar(value)!)
+                previousWasHyphen = false
+            } else if !previousWasHyphen {
+                sanitized.append("-")
+                previousWasHyphen = true
+            }
+        }
+        sanitized = sanitized
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            .lowercased()
+
+        guard !sanitized.isEmpty else {
+            throw AppError("private network host SSH hostname must contain at least one letter or number.")
+        }
+        guard sanitized.count <= 63 else {
+            throw AppError("private network host SSH hostname must be 63 characters or fewer.")
+        }
+        return sanitized
     }
 }
 
@@ -331,7 +399,8 @@ final class HostNetworkConfigStore {
                 ipAddress: "",
                 listenPort: legacyValidated.listenPort,
                 targetHost: legacyValidated.targetHost,
-                targetPort: legacyValidated.targetPort
+                targetPort: legacyValidated.targetPort,
+                hostname: legacyValidated.hostname
             )
         }
         let requestedIP: IPv4Address? = hostSSHConfig.ipAddress.isEmpty
@@ -350,7 +419,8 @@ final class HostNetworkConfigStore {
             ipAddress: lease.ipAddress.description,
             listenPort: hostSSHConfig.listenPort,
             targetHost: hostSSHConfig.targetHost,
-            targetPort: hostSSHConfig.targetPort
+            targetPort: hostSSHConfig.targetPort,
+            hostname: hostSSHConfig.hostname
         ).validated(dhcp: validatedDHCP)
     }
 

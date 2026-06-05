@@ -100,6 +100,8 @@ extension AppDelegate {
         let hostSSHEnabled = makeNetworkCheckbox("Allow VMs to SSH into this Mac", identifier: "okrun.network.host-ssh.enabled")
         let hostSSHIPAddressField = makeNetworkField(identifier: "okrun.network.host-ssh.ip-address")
         setNetworkPlaceholder("Auto-select from DHCP range", on: hostSSHIPAddressField)
+        let hostSSHHostnameField = makeNetworkField(identifier: "okrun.network.host-ssh.hostname")
+        setNetworkPlaceholder("Auto-use this Mac's hostname", on: hostSSHHostnameField)
 
         let localSwitchEnabled = makeNetworkCheckbox("Local Switch", identifier: "okrun.network.local-switch.enabled")
         let localSwitchServerField = makeNetworkField(identifier: "okrun.network.local-switch.server")
@@ -161,11 +163,12 @@ extension AppDelegate {
 
         let hostSSHGrid = NSGridView(views: [
             [makeNetworkLabel("Enabled"), hostSSHEnabled],
-            [makeNetworkLabel("Host IP"), hostSSHIPAddressField]
+            [makeNetworkLabel("Host IP"), hostSSHIPAddressField],
+            [makeNetworkLabel("Hostname"), hostSSHHostnameField]
         ])
         configureNetworkGrid(hostSSHGrid)
         let hostSSHHelp = makeNetworkHelpLabel(
-            "Exposes this Mac's 127.0.0.1:22 as a private-network host. Leave Host IP blank to reserve the first available DHCP-range address. DHCP will not offer the reserved host IP to VMs."
+            "Exposes this Mac's 127.0.0.1:22 as a private-network host. Leave Host IP blank to reserve the first available DHCP-range address. Leave Hostname blank to use this Mac's hostname and answer <hostname>.local via mDNS."
         )
         let hostSSHStack = makeNetworkSettingsStack([
             makeNetworkSettingsSection(title: "Host SSH", contentView: hostSSHGrid),
@@ -280,6 +283,7 @@ extension AppDelegate {
             hostSSHEnabled.isEnabled = true
 
             hostSSHIPAddressField.isEnabled = hostSSHOn
+            hostSSHHostnameField.isEnabled = hostSSHOn
             localSwitchServerField.isEnabled = localSwitchOn
             switchServerField.isEnabled = switchOn
             bundleTextView.isEditable = true
@@ -306,11 +310,14 @@ extension AppDelegate {
                 leaseField.stringValue = "\(dhcp.leaseSeconds)"
 
                 if let hostSSHConfig = resolvedHostSSHConfig ?? privateNetwork?.hostSSH {
-                    hostSSHEnabled.state = hostSSHConfig.enabled ? .on : .off
-                    hostSSHIPAddressField.stringValue = hostSSHConfig.ipAddress
+                    let validatedHostSSH = try hostSSHConfig.validatedForLoad(dhcp: dhcp)
+                    hostSSHEnabled.state = validatedHostSSH.enabled ? .on : .off
+                    hostSSHIPAddressField.stringValue = validatedHostSSH.ipAddress
+                    hostSSHHostnameField.stringValue = validatedHostSSH.hostname
                 } else {
                     hostSSHEnabled.state = .off
                     hostSSHIPAddressField.stringValue = ""
+                    hostSSHHostnameField.stringValue = ""
                 }
 
                 if let localSwitchConfig = privateNetwork?.localSwitch {
@@ -465,9 +472,11 @@ extension AppDelegate {
         func readHostSSHConfig(dhcp: PrivateNetworkDHCPConfig) throws -> PrivateNetworkHostSSHConfig? {
             guard hostSSHEnabled.state == .on else { return nil }
             let ipAddress = hostSSHIPAddressField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hostname = hostSSHHostnameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             return try PrivateNetworkHostSSHConfig(
                 enabled: true,
-                ipAddress: ipAddress
+                ipAddress: ipAddress,
+                hostname: hostname.isEmpty ? PrivateNetworkHostSSHConfig.defaultHostname() : hostname
             ).validated(dhcp: dhcp)
         }
 
@@ -604,6 +613,7 @@ extension AppDelegate {
                 try store.save(config)
                 if let hostSSHConfig = privateNetwork.hostSSH, hostSSHConfig.enabled {
                     hostSSHIPAddressField.stringValue = hostSSHConfig.ipAddress
+                    hostSSHHostnameField.stringValue = hostSSHConfig.hostname
                 }
                 let dhcpRange = try privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                     dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil

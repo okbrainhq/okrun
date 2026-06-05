@@ -3,12 +3,18 @@ import Network
 
 final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
     private static let maxTCPPayloadPerSegment = 1_400
+    private static let mdnsPort: UInt16 = 5353
+    private static let mdnsTTL: UInt8 = 255
+    fileprivate static let mdnsRecordTTL: UInt32 = 120
+    private static let mdnsMulticastIP = IPv4Address(value: 0xe000_00fb)
+    private static let mdnsMulticastMAC = EthernetAddress([0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb])
 
     let privateNetworkMACAddress: EthernetAddress
 
     private let identifier: String
     private let config: PrivateNetworkHostSSHConfig
     private let hostIP: IPv4Address
+    private let mdnsHostname: String
     private let queue: DispatchQueue
     private let emitFrame: (Data) -> Void
     private var sessions: [TCPSessionKey: TCPSession] = [:]
@@ -26,6 +32,7 @@ final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
         self.identifier = identifier
         self.config = validated
         hostIP = try IPv4Address(validated.ipAddress)
+        mdnsHostname = validated.hostname
         privateNetworkMACAddress = Self.deterministicMACAddress(identifier: identifier, ipAddress: hostIP)
         queue = DispatchQueue(label: "okrun.private-network-host-ssh.\(identifier).\(UUID().uuidString)")
         self.emitFrame = emitFrame
@@ -63,7 +70,9 @@ final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
         case 0x0806:
             handleARPFrame(bytes, sourceMAC: sourceMAC)
         case 0x0800:
-            guard destinationMAC == privateNetworkMACAddress || destinationMAC == .broadcast else { return }
+            guard destinationMAC == privateNetworkMACAddress
+                || destinationMAC == .broadcast
+                || destinationMAC == Self.mdnsMulticastMAC else { return }
             handleIPv4Frame(bytes, sourceMAC: sourceMAC)
         default:
             return
@@ -94,12 +103,21 @@ final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
     }
 
     private func handleIPv4Frame(_ bytes: [UInt8], sourceMAC: EthernetAddress) {
-        guard let packet = TCPPacket.parse(bytes, sourceMAC: sourceMAC),
-              packet.destinationIP == hostIP,
-              packet.destinationPort == config.listenPort else {
+        if let packet = TCPPacket.parse(bytes, sourceMAC: sourceMAC),
+           packet.destinationIP == hostIP,
+           packet.destinationPort == config.listenPort {
+            handleTCPPacket(packet)
             return
         }
 
+        if let packet = UDPPacket.parse(bytes, sourceMAC: sourceMAC),
+           packet.destinationIP == Self.mdnsMulticastIP,
+           packet.destinationPort == Self.mdnsPort {
+            handleMDNSPacket(packet)
+        }
+    }
+
+    private func handleTCPPacket(_ packet: TCPPacket) {
         let key = TCPSessionKey(
             clientMAC: packet.sourceMAC,
             clientIP: packet.sourceIP,
@@ -323,6 +341,27 @@ final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
         emitFrame(frame)
     }
 
+    private func handleMDNSPacket(_ packet: UDPPacket) {
+        guard let response = MDNSMessage.responsePayload(
+            for: packet.payload,
+            hostname: mdnsHostname,
+            hostIP: hostIP
+        ) else {
+            return
+        }
+
+        let sendsUnicast = response.prefersUnicast || packet.sourcePort != Self.mdnsPort
+        let frame = makeUDPFrame(
+            destinationMAC: sendsUnicast ? packet.sourceMAC : Self.mdnsMulticastMAC,
+            destinationIP: sendsUnicast ? packet.sourceIP : Self.mdnsMulticastIP,
+            destinationPort: sendsUnicast ? packet.sourcePort : Self.mdnsPort,
+            sourcePort: Self.mdnsPort,
+            payload: response.payload,
+            ttl: Self.mdnsTTL
+        )
+        emitFrame(frame)
+    }
+
     private func makeTCPFrame(
         destinationMAC: EthernetAddress,
         destinationIP: IPv4Address,
@@ -369,6 +408,48 @@ final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
         appendUInt16(0x0800, to: &frame)
         frame.append(ip)
         frame.append(tcp)
+        return frame
+    }
+
+    private func makeUDPFrame(
+        destinationMAC: EthernetAddress,
+        destinationIP: IPv4Address,
+        destinationPort: UInt16,
+        sourcePort: UInt16,
+        payload: Data,
+        ttl: UInt8
+    ) -> Data {
+        var udp = Data()
+        appendUInt16(sourcePort, to: &udp)
+        appendUInt16(destinationPort, to: &udp)
+        appendUInt16(UInt16(8 + payload.count), to: &udp)
+        appendUInt16(0, to: &udp)
+        udp.append(payload)
+        let udpChecksum = udpIPv4Checksum(sourceIP: hostIP, destinationIP: destinationIP, udpDatagram: [UInt8](udp))
+        udp.replaceSubrange(6..<8, with: [UInt8(udpChecksum >> 8), UInt8(udpChecksum & 0xff)])
+
+        let ipLength = UInt16(20 + udp.count)
+        var ip = Data()
+        ip.append(0x45)
+        ip.append(0)
+        appendUInt16(ipLength, to: &ip)
+        appendUInt16(nextIPIdentifier, to: &ip)
+        nextIPIdentifier &+= 1
+        appendUInt16(0x4000, to: &ip)
+        ip.append(ttl)
+        ip.append(17)
+        appendUInt16(0, to: &ip)
+        appendUInt32(hostIP.value, to: &ip)
+        appendUInt32(destinationIP.value, to: &ip)
+        let ipChecksum = internetChecksum([UInt8](ip))
+        ip.replaceSubrange(10..<12, with: [UInt8(ipChecksum >> 8), UInt8(ipChecksum & 0xff)])
+
+        var frame = Data()
+        frame.append(contentsOf: destinationMAC.bytes)
+        frame.append(contentsOf: privateNetworkMACAddress.bytes)
+        appendUInt16(0x0800, to: &frame)
+        frame.append(ip)
+        frame.append(udp)
         return frame
     }
 
@@ -552,6 +633,176 @@ private struct TCPPacket {
     }
 }
 
+private struct UDPPacket {
+    var sourceMAC: EthernetAddress
+    var sourceIP: IPv4Address
+    var destinationIP: IPv4Address
+    var sourcePort: UInt16
+    var destinationPort: UInt16
+    var payload: Data
+
+    static func parse(_ bytes: [UInt8], sourceMAC: EthernetAddress) -> UDPPacket? {
+        guard bytes.count >= 14 + 20,
+              readUInt16(bytes, 12) == 0x0800 else {
+            return nil
+        }
+        let ipOffset = 14
+        let version = bytes[ipOffset] >> 4
+        let ihl = Int(bytes[ipOffset] & 0x0f) * 4
+        guard version == 4,
+              ihl >= 20,
+              bytes.count >= ipOffset + ihl,
+              bytes[ipOffset + 9] == 17 else {
+            return nil
+        }
+        let totalLength = Int(readUInt16(bytes, ipOffset + 2))
+        guard totalLength >= ihl + 8,
+              bytes.count >= ipOffset + totalLength else {
+            return nil
+        }
+        let fragment = readUInt16(bytes, ipOffset + 6) & 0x1fff
+        guard fragment == 0 else { return nil }
+
+        let udpOffset = ipOffset + ihl
+        let udpLength = Int(readUInt16(bytes, udpOffset + 4))
+        guard udpLength >= 8,
+              totalLength >= ihl + udpLength,
+              bytes.count >= udpOffset + udpLength else {
+            return nil
+        }
+        let payloadStart = udpOffset + 8
+        let payloadEnd = udpOffset + udpLength
+        let payload = payloadEnd > payloadStart
+            ? Data(bytes[payloadStart..<payloadEnd])
+            : Data()
+
+        return UDPPacket(
+            sourceMAC: sourceMAC,
+            sourceIP: IPv4Address(value: readUInt32(bytes, ipOffset + 12)),
+            destinationIP: IPv4Address(value: readUInt32(bytes, ipOffset + 16)),
+            sourcePort: readUInt16(bytes, udpOffset),
+            destinationPort: readUInt16(bytes, udpOffset + 2),
+            payload: payload
+        )
+    }
+}
+
+private struct MDNSResponse {
+    var payload: Data
+    var prefersUnicast: Bool
+}
+
+private struct MDNSMessage {
+    static func responsePayload(for query: Data, hostname: String, hostIP: IPv4Address) -> MDNSResponse? {
+        let bytes = [UInt8](query)
+        guard bytes.count >= 12 else { return nil }
+        let flags = readUInt16(bytes, 2)
+        guard (flags & 0x8000) == 0 else { return nil }
+
+        let questionCount = Int(readUInt16(bytes, 4))
+        guard questionCount > 0 else { return nil }
+
+        let targetName = "\(hostname.lowercased()).local"
+        var offset = 12
+        var prefersUnicast = false
+        var hasMatchingQuestion = false
+
+        for _ in 0..<questionCount {
+            guard let labels = readName(bytes, offset: &offset), offset + 4 <= bytes.count else {
+                return nil
+            }
+            let queryName = labels.map { $0.lowercased() }.joined(separator: ".")
+            let queryType = readUInt16(bytes, offset)
+            let queryClass = readUInt16(bytes, offset + 2)
+            offset += 4
+
+            let isInternetClass = (queryClass & 0x7fff) == 1
+            let asksForAddress = queryType == 1 || queryType == 255
+            if queryName == targetName, isInternetClass, asksForAddress {
+                hasMatchingQuestion = true
+                prefersUnicast = prefersUnicast || ((queryClass & 0x8000) != 0)
+            }
+        }
+
+        guard hasMatchingQuestion else { return nil }
+
+        var response = Data()
+        appendUInt16(readUInt16(bytes, 0), to: &response)
+        appendUInt16(0x8400, to: &response)
+        appendUInt16(0, to: &response)
+        appendUInt16(1, to: &response)
+        appendUInt16(0, to: &response)
+        appendUInt16(0, to: &response)
+        appendName([hostname, "local"], to: &response)
+        appendUInt16(1, to: &response)
+        appendUInt16(0x8001, to: &response)
+        appendUInt32(PrivateNetworkHostSSHService.mdnsRecordTTL, to: &response)
+        appendUInt16(4, to: &response)
+        appendUInt32(hostIP.value, to: &response)
+        return MDNSResponse(payload: response, prefersUnicast: prefersUnicast)
+    }
+
+    private static func readName(_ bytes: [UInt8], offset: inout Int, depth: Int = 0) -> [String]? {
+        guard depth < 8 else { return nil }
+        var labels: [String] = []
+        var cursor = offset
+        var jumped = false
+
+        while true {
+            guard cursor < bytes.count else { return nil }
+            let length = bytes[cursor]
+            if length == 0 {
+                cursor += 1
+                if !jumped {
+                    offset = cursor
+                }
+                return labels
+            }
+
+            if (length & 0xc0) == 0xc0 {
+                guard cursor + 1 < bytes.count else { return nil }
+                let pointer = Int(readUInt16(bytes, cursor) & 0x3fff)
+                cursor += 2
+                if !jumped {
+                    offset = cursor
+                    jumped = true
+                }
+                var pointerOffset = pointer
+                guard let suffix = readName(bytes, offset: &pointerOffset, depth: depth + 1) else {
+                    return nil
+                }
+                labels.append(contentsOf: suffix)
+                return labels
+            }
+
+            guard (length & 0xc0) == 0 else { return nil }
+            let labelLength = Int(length)
+            guard labelLength <= 63,
+                  cursor + 1 + labelLength <= bytes.count else {
+                return nil
+            }
+            let labelBytes = bytes[(cursor + 1)..<(cursor + 1 + labelLength)]
+            guard let label = String(data: Data(labelBytes), encoding: .utf8) else {
+                return nil
+            }
+            labels.append(label)
+            cursor += 1 + labelLength
+            if !jumped {
+                offset = cursor
+            }
+        }
+    }
+
+    private static func appendName(_ labels: [String], to data: inout Data) {
+        for label in labels {
+            let bytes = Array(label.utf8.prefix(63))
+            data.append(UInt8(bytes.count))
+            data.append(contentsOf: bytes)
+        }
+        data.append(0)
+    }
+}
+
 private func appendUInt16(_ value: UInt16, to data: inout Data) {
     data.append(UInt8((value >> 8) & 0xff))
     data.append(UInt8(value & 0xff))
@@ -611,6 +862,18 @@ private func tcpIPv4Checksum(sourceIP: IPv4Address, destinationIP: IPv4Address, 
     pseudo.append(6)
     appendUInt16(UInt16(tcpSegment.count), to: &pseudo)
     pseudo.append(contentsOf: tcpSegment)
+    let checksum = internetChecksum([UInt8](pseudo))
+    return checksum == 0 ? 0xffff : checksum
+}
+
+private func udpIPv4Checksum(sourceIP: IPv4Address, destinationIP: IPv4Address, udpDatagram: [UInt8]) -> UInt16 {
+    var pseudo = Data()
+    appendUInt32(sourceIP.value, to: &pseudo)
+    appendUInt32(destinationIP.value, to: &pseudo)
+    pseudo.append(0)
+    pseudo.append(17)
+    appendUInt16(UInt16(udpDatagram.count), to: &pseudo)
+    pseudo.append(contentsOf: udpDatagram)
     let checksum = internetChecksum([UInt8](pseudo))
     return checksum == 0 ? 0xffff : checksum
 }
