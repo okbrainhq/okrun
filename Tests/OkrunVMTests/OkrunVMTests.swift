@@ -834,6 +834,40 @@ struct OkrunVMTests {
     }
 
     @Test
+    func dhcpLeaseAllocatorReservesHostSSHAddressInsideRange() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let config = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.22",
+            leaseSeconds: 3600
+        )
+        let store = DHCPLeaseStore(stateDirectory: root)
+        let allocator = try DHCPLeaseAllocator(config: config, store: store)
+        let identity = HostNetworkConfigStore.hostSSHReservationIdentity(identifier: "okrun")
+
+        let reservation = try allocator.reserve(for: identity, requestedIP: nil)
+        let firstClient = try allocator.lease(for: "client-a", requestedIP: nil)
+        let reservedAddress = try IPv4Address("10.77.0.20")
+        let firstClientAddress = try IPv4Address("10.77.0.21")
+
+        #expect(reservation.identity == identity)
+        #expect(reservation.ipAddress == reservedAddress)
+        #expect(firstClient.ipAddress == firstClientAddress)
+        #expect(throws: (any Error).self) {
+            _ = try allocator.requestedLease(for: "client-b", requestedIP: reservedAddress)
+        }
+
+        let movedHostAddress = try IPv4Address("10.77.0.22")
+        let movedReservation = try allocator.reserve(for: identity, requestedIP: movedHostAddress)
+        #expect(movedReservation.ipAddress == movedHostAddress)
+        #expect(try store.load().contains { $0.identity == identity && $0.ipAddress == movedReservation.ipAddress })
+    }
+
+    @Test
     func dhcpLeaseIdentityUsesHardwareAddressForClonedGuests() throws {
         let sharedClientIdentifier = Data([1, 2, 3, 4])
         let first = DHCPMessage(
@@ -1837,16 +1871,88 @@ struct OkrunVMTests {
             rangeEnd: "10.77.0.200",
             leaseSeconds: 3600
         )
-        let hostSSH = PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.2")
+        let hostSSH = PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.20")
         try store.save(HostNetworkConfig(version: 1, privateNetworks: [
             "okrun": HostPrivateNetworkConfig(dhcp: dhcp, hostSSH: hostSSH)
         ]))
 
         #expect(try store.hostSSHConfigForPrivateNetwork(identifier: "okrun") == hostSSH)
-        #expect(try PrivateNetworkHostSSHConfig.defaultIPAddress(cidr: dhcp.cidr) == "10.77.0.2")
+        #expect(try PrivateNetworkHostSSHConfig.defaultIPAddress(dhcp: dhcp) == "10.77.0.20")
         #expect(throws: (any Error).self) {
-            _ = try PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.20").validated(dhcp: dhcp)
+            _ = try PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.2").validated(dhcp: dhcp)
         }
+    }
+
+    @Test
+    func hostNetworkConfigAutoPicksAndReservesHostSSHAddress() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
+        let dhcp = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.22",
+            leaseSeconds: 3600
+        )
+        let leaseStore = DHCPLeaseStore(stateDirectory: store.home.privateNetworkStateDirectory(identifier: "okrun"))
+        try leaseStore.save([
+            DHCPLease(
+                identity: "client-a",
+                ipAddress: try IPv4Address("10.77.0.20"),
+                expiresAt: Date().addingTimeInterval(3600)
+            )
+        ])
+
+        var privateNetwork = HostPrivateNetworkConfig(
+            dhcp: dhcp,
+            hostSSH: PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "")
+        )
+        try store.prepareHostSSHConfigForPrivateNetwork(identifier: "okrun", privateNetwork: &privateNetwork)
+        try store.save(HostNetworkConfig(version: 1, privateNetworks: ["okrun": privateNetwork]))
+
+        let reservedHostIP = try IPv4Address("10.77.0.21")
+        let loadedHostSSH = try #require(try store.hostSSHConfigForPrivateNetwork(identifier: "okrun"))
+        #expect(privateNetwork.hostSSH?.ipAddress == reservedHostIP.description)
+        #expect(loadedHostSSH.ipAddress == reservedHostIP.description)
+
+        let allocator = try DHCPLeaseAllocator(config: dhcp, store: leaseStore)
+        let nextGuestLease = try allocator.lease(for: "client-b", requestedIP: nil)
+        let expectedGuestIP = try IPv4Address("10.77.0.22")
+        #expect(nextGuestLease.ipAddress == expectedGuestIP)
+    }
+
+    @Test
+    func hostNetworkConfigMigratesLegacyOutOfRangeHostSSHAddress() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let configURL = root.appendingPathComponent("private-networks.json")
+        let store = HostNetworkConfigStore(url: configURL)
+        let dhcp = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.22",
+            leaseSeconds: 3600
+        )
+        let legacyConfig = HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(
+                dhcp: dhcp,
+                hostSSH: PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.2")
+            )
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(legacyConfig).write(to: configURL, options: .atomic)
+
+        let migratedHostSSH = try #require(try store.hostSSHConfigForPrivateNetwork(identifier: "okrun"))
+        let savedMigratedHostSSH = try #require(try store.load().privateNetworks["okrun"]?.hostSSH)
+        #expect(migratedHostSSH.ipAddress == "10.77.0.20")
+        #expect(savedMigratedHostSSH.ipAddress == "10.77.0.20")
     }
 
     @Test

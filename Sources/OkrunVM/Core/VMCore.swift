@@ -814,7 +814,9 @@ enum NetworkDeviceFactory {
             networkDevice.macAddress = macAddress
         }
         let runtime = try PrivateNetworkRuntime(identifier: identifier)
-        if let dhcpConfig = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier) {
+        let dhcpConfig = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier)
+        let hostSSHConfig = try hostNetworkConfigStore.hostSSHConfigForPrivateNetwork(identifier: identifier)
+        if let dhcpConfig {
             let server = try HostDHCPServer(
                 privateNetworkIdentifier: identifier,
                 config: dhcpConfig,
@@ -823,11 +825,9 @@ enum NetworkDeviceFactory {
             )
             runtime.retainHostService(server)
         }
-        let dhcpRange = try hostNetworkConfigStore.dhcpConfigForPrivateNetwork(identifier: identifier)
-            .map { try PrivateNetworkDHCPLeaseRange(config: $0) }
+        let dhcpRange = try dhcpConfig.map { try PrivateNetworkDHCPLeaseRange(config: $0) }
         let localSwitchConfig = try hostNetworkConfigStore.localSwitchConfigForPrivateNetwork(identifier: identifier)
         let switchConfig = try hostNetworkConfigStore.switchConfigForPrivateNetwork(identifier: identifier)
-        let hostSSHConfig = try hostNetworkConfigStore.hostSSHConfigForPrivateNetwork(identifier: identifier)
         networkDevice.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: runtime.fileHandle)
         try PrivateNetworkRuntimeRegistry.shared.retain(
             runtime,

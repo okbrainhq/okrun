@@ -380,11 +380,12 @@ while it is connected and falls back to Web Switch if the local listener is not
 available.
 
 **Host SSH** lets VMs SSH back into the running Mac over the same private subnet.
-Enable it in **Private Network > Host** and keep the host IP outside the DHCP
-lease range, for example `10.77.0.2`. From a VM, connect with:
+Enable it in **Private Network > Host** and leave the host IP blank to reserve
+the first available address from the DHCP range. DHCP stores that reservation and
+will not offer the host IP to VMs. From a VM, connect with the assigned address:
 
 ```sh
-ssh <mac-user>@10.77.0.2
+ssh <mac-user>@<host-ssh-ip>
 ```
 
 This exposes only `127.0.0.1:22` through a user-space private-network endpoint;

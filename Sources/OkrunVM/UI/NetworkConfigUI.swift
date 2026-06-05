@@ -99,7 +99,7 @@ extension AppDelegate {
 
         let hostSSHEnabled = makeNetworkCheckbox("Allow VMs to SSH into this Mac", identifier: "okrun.network.host-ssh.enabled")
         let hostSSHIPAddressField = makeNetworkField(identifier: "okrun.network.host-ssh.ip-address")
-        setNetworkPlaceholder("10.77.0.2", on: hostSSHIPAddressField)
+        setNetworkPlaceholder("Auto-select from DHCP range", on: hostSSHIPAddressField)
 
         let localSwitchEnabled = makeNetworkCheckbox("Local Switch", identifier: "okrun.network.local-switch.enabled")
         let localSwitchServerField = makeNetworkField(identifier: "okrun.network.local-switch.server")
@@ -165,7 +165,7 @@ extension AppDelegate {
         ])
         configureNetworkGrid(hostSSHGrid)
         let hostSSHHelp = makeNetworkHelpLabel(
-            "Exposes this Mac's 127.0.0.1:22 as a private-network host. Use an address outside the DHCP range, e.g. 10.77.0.2."
+            "Exposes this Mac's 127.0.0.1:22 as a private-network host. Leave Host IP blank to reserve the first available DHCP-range address. DHCP will not offer the reserved host IP to VMs."
         )
         let hostSSHStack = makeNetworkSettingsStack([
             makeNetworkSettingsSection(title: "Host SSH", contentView: hostSSHGrid),
@@ -295,6 +295,7 @@ extension AppDelegate {
         func loadFields() {
             do {
                 _ = try store.dhcpConfigForPrivateNetwork(identifier: identifier)
+                let resolvedHostSSHConfig = try store.hostSSHConfigForPrivateNetwork(identifier: identifier)
                 let config = try store.load()
                 let privateNetwork = config.privateNetworks[identifier]
                 let dhcp = privateNetwork?.dhcp ?? HostNetworkConfigStore.defaultOkrunDHCPConfig()
@@ -304,14 +305,12 @@ extension AppDelegate {
                 rangeEndField.stringValue = dhcp.rangeEnd
                 leaseField.stringValue = "\(dhcp.leaseSeconds)"
 
-                if let hostSSHConfig = privateNetwork?.hostSSH {
+                if let hostSSHConfig = resolvedHostSSHConfig ?? privateNetwork?.hostSSH {
                     hostSSHEnabled.state = hostSSHConfig.enabled ? .on : .off
-                    hostSSHIPAddressField.stringValue = hostSSHConfig.ipAddress.isEmpty
-                        ? defaultHostSSHIPAddress(cidr: dhcp.cidr)
-                        : hostSSHConfig.ipAddress
+                    hostSSHIPAddressField.stringValue = hostSSHConfig.ipAddress
                 } else {
                     hostSSHEnabled.state = .off
-                    hostSSHIPAddressField.stringValue = defaultHostSSHIPAddress(cidr: dhcp.cidr)
+                    hostSSHIPAddressField.stringValue = ""
                 }
 
                 if let localSwitchConfig = privateNetwork?.localSwitch {
@@ -340,10 +339,6 @@ extension AppDelegate {
             } catch {
                 setPanelMessage(error.localizedDescription, isError: true)
             }
-        }
-
-        func defaultHostSSHIPAddress(cidr: String) -> String {
-            (try? PrivateNetworkHostSSHConfig.defaultIPAddress(cidr: cidr)) ?? "10.77.0.2"
         }
 
         func normalizedSwitchServer(_ rawValue: String, displayName: String = "Web Switch") throws -> String {
@@ -469,9 +464,7 @@ extension AppDelegate {
 
         func readHostSSHConfig(dhcp: PrivateNetworkDHCPConfig) throws -> PrivateNetworkHostSSHConfig? {
             guard hostSSHEnabled.state == .on else { return nil }
-            let rawIP = hostSSHIPAddressField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ipAddress = rawIP.isEmpty ? defaultHostSSHIPAddress(cidr: dhcp.cidr) : rawIP
-            hostSSHIPAddressField.stringValue = ipAddress
+            let ipAddress = hostSSHIPAddressField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             return try PrivateNetworkHostSSHConfig(
                 enabled: true,
                 ipAddress: ipAddress
@@ -605,9 +598,13 @@ extension AppDelegate {
         actions.onApply = {
             do {
                 var config = try store.load()
-                let privateNetwork = try readForm()
+                var privateNetwork = try readForm()
+                try store.prepareHostSSHConfigForPrivateNetwork(identifier: identifier, privateNetwork: &privateNetwork)
                 config.privateNetworks[identifier] = privateNetwork
                 try store.save(config)
+                if let hostSSHConfig = privateNetwork.hostSSH, hostSSHConfig.enabled {
+                    hostSSHIPAddressField.stringValue = hostSSHConfig.ipAddress
+                }
                 let dhcpRange = try privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                     dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
                 }
@@ -656,7 +653,7 @@ extension AppDelegate {
         }
         actions.onHostSSHToggle = {
             if hostSSHEnabled.state == .on {
-                setPanelMessage("Host SSH enabled. Apply to expose this Mac at the selected private IP.")
+                setPanelMessage("Host SSH enabled. Apply to reserve a DHCP-range host IP for this Mac.")
             } else {
                 setPanelMessage("Host SSH disabled.")
             }
@@ -681,13 +678,14 @@ extension AppDelegate {
 
         loadFields()
         do {
+            let savedHostSSHConfig = try store.hostSSHConfigForPrivateNetwork(identifier: identifier)
             let savedPrivateNetwork = try store.load().privateNetworks[identifier]
             let dhcpRange = try savedPrivateNetwork?.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                 dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
             }
             try PrivateNetworkRuntimeRegistry.shared.configureHostSSH(
                 identifier: identifier,
-                hostSSHConfig: savedPrivateNetwork?.hostSSH
+                hostSSHConfig: savedHostSSHConfig
             )
             let localSwitchStatus = !PrivateNetworkRuntimeRegistry.shared.hasLocalSwitch(identifier: identifier)
                 && savedPrivateNetwork?.localSwitch?.enabled == true
