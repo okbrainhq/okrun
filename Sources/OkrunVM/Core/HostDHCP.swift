@@ -12,15 +12,211 @@ struct HostPrivateNetworkConfig: Codable, Equatable {
     var dhcp: PrivateNetworkDHCPConfig?
     var `switch`: PrivateNetworkSwitchConfig?
     var localSwitch: PrivateNetworkLocalSwitchConfig?
+    var hostSSH: PrivateNetworkHostSSHConfig?
 
     init(
         dhcp: PrivateNetworkDHCPConfig?,
         switch switchConfig: PrivateNetworkSwitchConfig? = nil,
-        localSwitch: PrivateNetworkLocalSwitchConfig? = nil
+        localSwitch: PrivateNetworkLocalSwitchConfig? = nil,
+        hostSSH: PrivateNetworkHostSSHConfig? = nil
     ) {
         self.dhcp = dhcp
         self.switch = switchConfig
         self.localSwitch = localSwitch
+        self.hostSSH = hostSSH
+    }
+}
+
+struct PrivateNetworkHostSSHConfig: Codable, Equatable {
+    static let defaultListenPort: UInt16 = 22
+    static let defaultTargetHost = "127.0.0.1"
+    static let defaultTargetPort: UInt16 = 22
+
+    var enabled: Bool
+    var ipAddress: String
+    var listenPort: UInt16
+    var targetHost: String
+    var targetPort: UInt16
+    var hostname: String
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case ipAddress
+        case listenPort
+        case targetHost
+        case targetPort
+        case hostname
+    }
+
+    init(
+        enabled: Bool = false,
+        ipAddress: String = "",
+        listenPort: UInt16 = Self.defaultListenPort,
+        targetHost: String = Self.defaultTargetHost,
+        targetPort: UInt16 = Self.defaultTargetPort,
+        hostname: String = Self.defaultHostname()
+    ) {
+        self.enabled = enabled
+        self.ipAddress = ipAddress
+        self.listenPort = listenPort
+        self.targetHost = targetHost
+        self.targetPort = targetPort
+        self.hostname = hostname
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        ipAddress = try container.decodeIfPresent(String.self, forKey: .ipAddress) ?? ""
+        listenPort = try container.decodeIfPresent(UInt16.self, forKey: .listenPort) ?? Self.defaultListenPort
+        targetHost = try container.decodeIfPresent(String.self, forKey: .targetHost) ?? Self.defaultTargetHost
+        targetPort = try container.decodeIfPresent(UInt16.self, forKey: .targetPort) ?? Self.defaultTargetPort
+        hostname = try container.decodeIfPresent(String.self, forKey: .hostname) ?? Self.defaultHostname()
+    }
+
+    func validated(dhcp: PrivateNetworkDHCPConfig?) throws -> PrivateNetworkHostSSHConfig {
+        guard enabled else { return self }
+
+        let trimmedIP = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTargetHost = targetHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTargetHost.isEmpty else {
+            throw AppError("private network host SSH targetHost must not be empty when enabled.")
+        }
+        guard trimmedTargetHost.rangeOfCharacter(from: CharacterSet(charactersIn: "\0")) == nil else {
+            throw AppError("private network host SSH targetHost must not contain NUL.")
+        }
+        guard listenPort > 0, targetPort > 0 else {
+            throw AppError("private network host SSH ports must be between 1 and 65535.")
+        }
+        let normalizedHostname = try Self.normalizedHostname(hostname)
+
+        if let dhcp {
+            guard dhcp.enabled else {
+                throw AppError("private network host SSH requires DHCP to be enabled.")
+            }
+            let validatedDHCP = try dhcp.validated()
+            guard !trimmedIP.isEmpty else {
+                return PrivateNetworkHostSSHConfig(
+                    enabled: true,
+                    ipAddress: "",
+                    listenPort: listenPort,
+                    targetHost: trimmedTargetHost,
+                    targetPort: targetPort,
+                    hostname: normalizedHostname
+                )
+            }
+
+            let hostIP = try IPv4Address(trimmedIP)
+            let network = try IPv4CIDR(validatedDHCP.cidr)
+            guard network.contains(hostIP) else {
+                throw AppError("private network host SSH ipAddress must be inside \(validatedDHCP.cidr).")
+            }
+            guard hostIP != network.networkAddress,
+                  hostIP != network.broadcastAddress,
+                  hostIP != network.serverAddress else {
+                throw AppError("private network host SSH ipAddress must not use the network, broadcast, or DHCP server address.")
+            }
+            let rangeStart = try IPv4Address(validatedDHCP.rangeStart)
+            let rangeEnd = try IPv4Address(validatedDHCP.rangeEnd)
+            guard hostIP.value >= rangeStart.value && hostIP.value <= rangeEnd.value else {
+                throw AppError("private network host SSH ipAddress must be inside the DHCP lease range.")
+            }
+        } else {
+            guard !trimmedIP.isEmpty else {
+                throw AppError("private network host SSH ipAddress must not be empty when enabled.")
+            }
+            _ = try IPv4Address(trimmedIP)
+        }
+
+        return PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: trimmedIP,
+            listenPort: listenPort,
+            targetHost: trimmedTargetHost,
+            targetPort: targetPort,
+            hostname: normalizedHostname
+        )
+    }
+
+    func validatedForLoad(dhcp: PrivateNetworkDHCPConfig?) throws -> PrivateNetworkHostSSHConfig {
+        do {
+            return try validated(dhcp: dhcp)
+        } catch {
+            guard enabled,
+                  !ipAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw error
+            }
+            return try validated(dhcp: nil)
+        }
+    }
+
+    static func defaultIPAddress(dhcp: PrivateNetworkDHCPConfig) throws -> String {
+        try dhcp.validated().rangeStart
+    }
+
+    static func defaultIPAddress(cidr: String) throws -> String {
+        let network = try IPv4CIDR(cidr)
+        return IPv4Address(value: network.networkAddress.value + 20).description
+    }
+
+    static func defaultHostname() -> String {
+        var buffer = [CChar](repeating: 0, count: 256)
+        if gethostname(&buffer, buffer.count) == 0 {
+            let hostname = String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !hostname.isEmpty {
+                return hostname
+            }
+        }
+        let processHostname = ProcessInfo.processInfo.hostName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !processHostname.isEmpty {
+            return processHostname
+        }
+        return "okrun-host"
+    }
+
+    static func normalizedHostname(_ rawHostname: String) throws -> String {
+        var hostname = rawHostname.trimmingCharacters(in: .whitespacesAndNewlines)
+        if hostname.isEmpty {
+            hostname = defaultHostname()
+        }
+
+        while hostname.hasSuffix(".") {
+            hostname.removeLast()
+        }
+
+        if hostname.lowercased().hasSuffix(".local") {
+            hostname = String(hostname.dropLast(6))
+        }
+        if let firstLabel = hostname.split(separator: ".", omittingEmptySubsequences: true).first {
+            hostname = String(firstLabel)
+        }
+
+        var sanitized = ""
+        var previousWasHyphen = false
+        for scalar in hostname.unicodeScalars {
+            let value = scalar.value
+            let isDigit = value >= 48 && value <= 57
+            let isUppercase = value >= 65 && value <= 90
+            let isLowercase = value >= 97 && value <= 122
+            if isDigit || isUppercase || isLowercase {
+                sanitized.unicodeScalars.append(UnicodeScalar(value)!)
+                previousWasHyphen = false
+            } else if !previousWasHyphen {
+                sanitized.append("-")
+                previousWasHyphen = true
+            }
+        }
+        sanitized = sanitized
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            .lowercased()
+
+        guard !sanitized.isEmpty else {
+            throw AppError("private network host SSH hostname must contain at least one letter or number.")
+        }
+        guard sanitized.count <= 63 else {
+            throw AppError("private network host SSH hostname must be 63 characters or fewer.")
+        }
+        return sanitized
     }
 }
 
@@ -116,6 +312,7 @@ final class HostNetworkConfigStore {
             _ = try privateNetwork.dhcp?.validated()
             _ = try privateNetwork.switch?.validated()
             _ = try privateNetwork.localSwitch?.validated()
+            _ = try privateNetwork.hostSSH?.validatedForLoad(dhcp: privateNetwork.dhcp)
         }
         return config
     }
@@ -151,16 +348,103 @@ final class HostNetworkConfigStore {
         return validated.enabled ? validated : nil
     }
 
+    func hostSSHConfigForPrivateNetwork(identifier: String) throws -> PrivateNetworkHostSSHConfig? {
+        var config = try load()
+        guard var privateNetwork = config.privateNetworks[identifier] else {
+            return nil
+        }
+
+        let originalHostSSHConfig = privateNetwork.hostSSH
+        try prepareHostSSHConfigForPrivateNetwork(
+            identifier: identifier,
+            privateNetwork: &privateNetwork,
+            allowsMigratingLegacyIP: true
+        )
+        if privateNetwork.hostSSH != originalHostSSHConfig {
+            config.privateNetworks[identifier] = privateNetwork
+            try save(config)
+        }
+
+        guard let hostSSHConfig = privateNetwork.hostSSH, hostSSHConfig.enabled else {
+            return nil
+        }
+        let validated = try hostSSHConfig.validated(dhcp: privateNetwork.dhcp)
+        return validated.enabled ? validated : nil
+    }
+
+    func prepareHostSSHConfigForPrivateNetwork(
+        identifier: String,
+        privateNetwork: inout HostPrivateNetworkConfig,
+        allowsMigratingLegacyIP: Bool = false
+    ) throws {
+        guard var hostSSHConfig = privateNetwork.hostSSH, hostSSHConfig.enabled else {
+            try releaseHostSSHReservation(identifier: identifier)
+            return
+        }
+        guard let dhcp = privateNetwork.dhcp, dhcp.enabled else {
+            throw AppError("private network Host SSH requires DHCP to be enabled.")
+        }
+
+        let validatedDHCP = try dhcp.validated()
+        do {
+            hostSSHConfig = try hostSSHConfig.validated(dhcp: validatedDHCP)
+        } catch {
+            guard allowsMigratingLegacyIP,
+                  !hostSSHConfig.ipAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw error
+            }
+            let legacyValidated = try hostSSHConfig.validated(dhcp: nil)
+            hostSSHConfig = PrivateNetworkHostSSHConfig(
+                enabled: true,
+                ipAddress: "",
+                listenPort: legacyValidated.listenPort,
+                targetHost: legacyValidated.targetHost,
+                targetPort: legacyValidated.targetPort,
+                hostname: legacyValidated.hostname
+            )
+        }
+        let requestedIP: IPv4Address? = hostSSHConfig.ipAddress.isEmpty
+            ? nil
+            : try IPv4Address(hostSSHConfig.ipAddress)
+        let allocator = try DHCPLeaseAllocator(
+            config: validatedDHCP,
+            store: DHCPLeaseStore(stateDirectory: home.privateNetworkStateDirectory(identifier: identifier))
+        )
+        let lease = try allocator.reserve(
+            for: Self.hostSSHReservationIdentity(identifier: identifier),
+            requestedIP: requestedIP
+        )
+        privateNetwork.hostSSH = try PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: lease.ipAddress.description,
+            listenPort: hostSSHConfig.listenPort,
+            targetHost: hostSSHConfig.targetHost,
+            targetPort: hostSSHConfig.targetPort,
+            hostname: hostSSHConfig.hostname
+        ).validated(dhcp: validatedDHCP)
+    }
+
+    static func hostSSHReservationIdentity(identifier: String) -> String {
+        "reserved:host-ssh:\(identifier)"
+    }
+
     func save(_ config: HostNetworkConfig) throws {
         for (_, privateNetwork) in config.privateNetworks {
             _ = try privateNetwork.dhcp?.validated()
             _ = try privateNetwork.switch?.validated()
             _ = try privateNetwork.localSwitch?.validated()
+            _ = try privateNetwork.hostSSH?.validated(dhcp: privateNetwork.dhcp)
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try encoder.encode(config).write(to: url, options: .atomic)
+    }
+
+    private func releaseHostSSHReservation(identifier: String) throws {
+        try DHCPLeaseStore(stateDirectory: home.privateNetworkStateDirectory(identifier: identifier)).update { leases in
+            leases.removeAll { $0.identity == Self.hostSSHReservationIdentity(identifier: identifier) }
+        }
     }
 
     private static func defaultDHCPConfig(identifier: String, existingConfig: HostNetworkConfig) -> PrivateNetworkDHCPConfig {
@@ -450,6 +734,49 @@ final class DHCPLeaseAllocator {
                 identity: identity,
                 ipAddress: available,
                 expiresAt: now.addingTimeInterval(TimeInterval(leaseSeconds))
+            )
+            leases.append(lease)
+            return lease
+        }
+    }
+
+    func reserve(for identity: String, requestedIP: IPv4Address?, now: Date = Date()) throws -> DHCPLease {
+        try store.update { leases in
+            pruneUnavailableLeases(&leases, now: now)
+
+            if let requestedIP {
+                guard isInRange(requestedIP) else {
+                    throw AppError("Reserved DHCP address \(requestedIP.description) is outside the configured range.")
+                }
+                guard !leases.contains(where: { $0.identity != identity && $0.ipAddress == requestedIP }) else {
+                    throw AppError("Reserved DHCP address \(requestedIP.description) is already leased.")
+                }
+                let lease = DHCPLease(
+                    identity: identity,
+                    ipAddress: requestedIP,
+                    expiresAt: .distantFuture
+                )
+                replace(lease, in: &leases)
+                return lease
+            }
+
+            if let existing = leases.first(where: { $0.identity == identity }) {
+                let renewed = DHCPLease(
+                    identity: identity,
+                    ipAddress: existing.ipAddress,
+                    expiresAt: .distantFuture
+                )
+                replace(renewed, in: &leases)
+                return renewed
+            }
+
+            guard let available = firstAvailableAddress(in: leases) else {
+                throw AppError("private network DHCP range is exhausted.")
+            }
+            let lease = DHCPLease(
+                identity: identity,
+                ipAddress: available,
+                expiresAt: .distantFuture
             )
             leases.append(lease)
             return lease

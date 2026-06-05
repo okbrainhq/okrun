@@ -23,6 +23,7 @@ private final class NetworkConfigPanelActions: NSObject {
     var onClose: (() -> Void)?
     var onSwitchToggle: (() -> Void)?
     var onLocalSwitchToggle: (() -> Void)?
+    var onHostSSHToggle: (() -> Void)?
 
     @objc func apply() {
         onApply?()
@@ -42,6 +43,10 @@ private final class NetworkConfigPanelActions: NSObject {
 
     @objc func localSwitchToggle() {
         onLocalSwitchToggle?()
+    }
+
+    @objc func hostSSHToggle() {
+        onHostSSHToggle?()
     }
 }
 
@@ -91,6 +96,12 @@ extension AppDelegate {
         let rangeStartField = makeNetworkField(identifier: "okrun.network.dhcp.range-start")
         let rangeEndField = makeNetworkField(identifier: "okrun.network.dhcp.range-end")
         let leaseField = makeNetworkField(identifier: "okrun.network.dhcp.lease-seconds")
+
+        let hostSSHEnabled = makeNetworkCheckbox("Allow VMs to SSH into this Mac", identifier: "okrun.network.host-ssh.enabled")
+        let hostSSHIPAddressField = makeNetworkField(identifier: "okrun.network.host-ssh.ip-address")
+        setNetworkPlaceholder("Auto-select from DHCP range", on: hostSSHIPAddressField)
+        let hostSSHHostnameField = makeNetworkField(identifier: "okrun.network.host-ssh.hostname")
+        setNetworkPlaceholder("Auto-use this Mac's hostname", on: hostSSHHostnameField)
 
         let localSwitchEnabled = makeNetworkCheckbox("Local Switch", identifier: "okrun.network.local-switch.enabled")
         let localSwitchServerField = makeNetworkField(identifier: "okrun.network.local-switch.server")
@@ -150,6 +161,20 @@ extension AppDelegate {
             makeNetworkSettingsSection(title: "Lease Range", contentView: dhcpLeaseGrid)
         ])
 
+        let hostSSHGrid = NSGridView(views: [
+            [makeNetworkLabel("Enabled"), hostSSHEnabled],
+            [makeNetworkLabel("Host IP"), hostSSHIPAddressField],
+            [makeNetworkLabel("Hostname"), hostSSHHostnameField]
+        ])
+        configureNetworkGrid(hostSSHGrid)
+        let hostSSHHelp = makeNetworkHelpLabel(
+            "Exposes this Mac's 127.0.0.1:22 as a private-network host. Leave Host IP blank to reserve the first available DHCP-range address. Leave Hostname blank to use this Mac's hostname and answer <hostname>.local via mDNS."
+        )
+        let hostSSHStack = makeNetworkSettingsStack([
+            makeNetworkSettingsSection(title: "Host SSH", contentView: hostSSHGrid),
+            hostSSHHelp
+        ])
+
         let localSwitchConnectionGrid = NSGridView(views: [
             [makeNetworkLabel("Enabled"), localSwitchEnabled],
             [makeNetworkLabel("Server"), localSwitchServerField]
@@ -192,6 +217,7 @@ extension AppDelegate {
         tabView.setAccessibilityIdentifier("okrun.network.tabs")
         tabView.tabViewType = .topTabsBezelBorder
         tabView.addTabViewItem(makeNetworkTabItem(label: "DHCP", contentView: dhcpStack))
+        tabView.addTabViewItem(makeNetworkTabItem(label: "Host", contentView: hostSSHStack))
         tabView.addTabViewItem(makeNetworkTabItem(label: "Local Switch", contentView: localSwitchStack))
         tabView.addTabViewItem(makeNetworkTabItem(label: "Web Switch", contentView: switchStack))
         tabView.selectTabViewItem(at: 0)
@@ -250,10 +276,14 @@ extension AppDelegate {
         func updateTransportControls() {
             let switchOn = switchEnabled.state == .on
             let localSwitchOn = localSwitchEnabled.state == .on
+            let hostSSHOn = hostSSHEnabled.state == .on
 
             switchEnabled.isEnabled = true
             localSwitchEnabled.isEnabled = true
+            hostSSHEnabled.isEnabled = true
 
+            hostSSHIPAddressField.isEnabled = hostSSHOn
+            hostSSHHostnameField.isEnabled = hostSSHOn
             localSwitchServerField.isEnabled = localSwitchOn
             switchServerField.isEnabled = switchOn
             bundleTextView.isEditable = true
@@ -269,6 +299,7 @@ extension AppDelegate {
         func loadFields() {
             do {
                 _ = try store.dhcpConfigForPrivateNetwork(identifier: identifier)
+                let resolvedHostSSHConfig = try store.hostSSHConfigForPrivateNetwork(identifier: identifier)
                 let config = try store.load()
                 let privateNetwork = config.privateNetworks[identifier]
                 let dhcp = privateNetwork?.dhcp ?? HostNetworkConfigStore.defaultOkrunDHCPConfig()
@@ -277,6 +308,17 @@ extension AppDelegate {
                 rangeStartField.stringValue = dhcp.rangeStart
                 rangeEndField.stringValue = dhcp.rangeEnd
                 leaseField.stringValue = "\(dhcp.leaseSeconds)"
+
+                if let hostSSHConfig = resolvedHostSSHConfig ?? privateNetwork?.hostSSH {
+                    let validatedHostSSH = try hostSSHConfig.validatedForLoad(dhcp: dhcp)
+                    hostSSHEnabled.state = validatedHostSSH.enabled ? .on : .off
+                    hostSSHIPAddressField.stringValue = validatedHostSSH.ipAddress
+                    hostSSHHostnameField.stringValue = validatedHostSSH.hostname
+                } else {
+                    hostSSHEnabled.state = .off
+                    hostSSHIPAddressField.stringValue = ""
+                    hostSSHHostnameField.stringValue = ""
+                }
 
                 if let localSwitchConfig = privateNetwork?.localSwitch {
                     localSwitchEnabled.state = localSwitchConfig.enabled ? .on : .off
@@ -427,6 +469,17 @@ extension AppDelegate {
             ).validated()
         }
 
+        func readHostSSHConfig(dhcp: PrivateNetworkDHCPConfig) throws -> PrivateNetworkHostSSHConfig? {
+            guard hostSSHEnabled.state == .on else { return nil }
+            let ipAddress = hostSSHIPAddressField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hostname = hostSSHHostnameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            return try PrivateNetworkHostSSHConfig(
+                enabled: true,
+                ipAddress: ipAddress,
+                hostname: hostname.isEmpty ? PrivateNetworkHostSSHConfig.defaultHostname() : hostname
+            ).validated(dhcp: dhcp)
+        }
+
         func readSwitchConfig() throws -> PrivateNetworkSwitchConfig? {
             guard switchEnabled.state == .on else { return nil }
 
@@ -514,7 +567,8 @@ extension AppDelegate {
             return HostPrivateNetworkConfig(
                 dhcp: dhcp,
                 switch: try readSwitchConfig(),
-                localSwitch: try readLocalSwitchConfig()
+                localSwitch: try readLocalSwitchConfig(),
+                hostSSH: try readHostSSHConfig(dhcp: dhcp)
             )
         }
 
@@ -553,12 +607,21 @@ extension AppDelegate {
         actions.onApply = {
             do {
                 var config = try store.load()
-                let privateNetwork = try readForm()
+                var privateNetwork = try readForm()
+                try store.prepareHostSSHConfigForPrivateNetwork(identifier: identifier, privateNetwork: &privateNetwork)
                 config.privateNetworks[identifier] = privateNetwork
                 try store.save(config)
+                if let hostSSHConfig = privateNetwork.hostSSH, hostSSHConfig.enabled {
+                    hostSSHIPAddressField.stringValue = hostSSHConfig.ipAddress
+                    hostSSHHostnameField.stringValue = hostSSHConfig.hostname
+                }
                 let dhcpRange = try privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                     dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
                 }
+                try PrivateNetworkRuntimeRegistry.shared.configureHostSSH(
+                    identifier: identifier,
+                    hostSSHConfig: privateNetwork.hostSSH
+                )
                 let localSwitchStatus = PrivateNetworkRuntimeRegistry.shared.configureLocalSwitch(
                     identifier: identifier,
                     localSwitchConfig: privateNetwork.localSwitch,
@@ -598,6 +661,14 @@ extension AppDelegate {
             updateTransportControls()
             updateStatus()
         }
+        actions.onHostSSHToggle = {
+            if hostSSHEnabled.state == .on {
+                setPanelMessage("Host SSH enabled. Apply to reserve a DHCP-range host IP for this Mac.")
+            } else {
+                setPanelMessage("Host SSH disabled.")
+            }
+            updateTransportControls()
+        }
         actions.onClose = { [weak panel] in
             panel?.close()
             NSApp.stopModal()
@@ -612,13 +683,20 @@ extension AppDelegate {
         switchEnabled.action = #selector(NetworkConfigPanelActions.switchToggle)
         localSwitchEnabled.target = actions
         localSwitchEnabled.action = #selector(NetworkConfigPanelActions.localSwitchToggle)
+        hostSSHEnabled.target = actions
+        hostSSHEnabled.action = #selector(NetworkConfigPanelActions.hostSSHToggle)
 
         loadFields()
         do {
+            let savedHostSSHConfig = try store.hostSSHConfigForPrivateNetwork(identifier: identifier)
             let savedPrivateNetwork = try store.load().privateNetworks[identifier]
             let dhcpRange = try savedPrivateNetwork?.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                 dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
             }
+            try PrivateNetworkRuntimeRegistry.shared.configureHostSSH(
+                identifier: identifier,
+                hostSSHConfig: savedHostSSHConfig
+            )
             let localSwitchStatus = !PrivateNetworkRuntimeRegistry.shared.hasLocalSwitch(identifier: identifier)
                 && savedPrivateNetwork?.localSwitch?.enabled == true
                 ? PrivateNetworkRuntimeRegistry.shared.configureLocalSwitch(
@@ -852,6 +930,17 @@ extension AppDelegate {
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = NetworkConfigPalette.secondaryText
+        return label
+    }
+
+    private func makeNetworkHelpLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 12, weight: .regular)
+        label.textColor = NetworkConfigPalette.secondaryText
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 3
+        label.widthAnchor.constraint(equalToConstant: networkControlColumnWidth()).isActive = true
         return label
     }
 

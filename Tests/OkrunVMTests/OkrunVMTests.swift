@@ -834,6 +834,40 @@ struct OkrunVMTests {
     }
 
     @Test
+    func dhcpLeaseAllocatorReservesHostSSHAddressInsideRange() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let config = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.22",
+            leaseSeconds: 3600
+        )
+        let store = DHCPLeaseStore(stateDirectory: root)
+        let allocator = try DHCPLeaseAllocator(config: config, store: store)
+        let identity = HostNetworkConfigStore.hostSSHReservationIdentity(identifier: "okrun")
+
+        let reservation = try allocator.reserve(for: identity, requestedIP: nil)
+        let firstClient = try allocator.lease(for: "client-a", requestedIP: nil)
+        let reservedAddress = try IPv4Address("10.77.0.20")
+        let firstClientAddress = try IPv4Address("10.77.0.21")
+
+        #expect(reservation.identity == identity)
+        #expect(reservation.ipAddress == reservedAddress)
+        #expect(firstClient.ipAddress == firstClientAddress)
+        #expect(throws: (any Error).self) {
+            _ = try allocator.requestedLease(for: "client-b", requestedIP: reservedAddress)
+        }
+
+        let movedHostAddress = try IPv4Address("10.77.0.22")
+        let movedReservation = try allocator.reserve(for: identity, requestedIP: movedHostAddress)
+        #expect(movedReservation.ipAddress == movedHostAddress)
+        #expect(try store.load().contains { $0.identity == identity && $0.ipAddress == movedReservation.ipAddress })
+    }
+
+    @Test
     func dhcpLeaseIdentityUsesHardwareAddressForClonedGuests() throws {
         let sharedClientIdentifier = Data([1, 2, 3, 4])
         let first = DHCPMessage(
@@ -1715,6 +1749,256 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRouterDeliversRemoteFramesToLocalEndpointsAndRoutesReplies() throws {
+        let router = PrivateNetworkTransportRouter(identifier: "router-\(UUID().uuidString)")
+        let webSwitch = MockRoutableTransport()
+        router.setWebSwitch(webSwitch)
+
+        let endpointMAC = EthernetAddress([0x02, 0x48, 0x6f, 0x73, 0x74, 0x01])
+        let endpoint = MockLocalEndpoint(macAddress: endpointMAC)
+        let remoteMAC: [UInt8] = [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x40]
+        router.addLocalEndpoint(endpoint)
+
+        let remoteFrame = ethernetFrame(destination: endpointMAC.bytes, source: remoteMAC, payload: [0x02])
+        router.receiveRemoteFrame(remoteFrame, via: .webSwitch)
+
+        #expect(endpoint.receivedFrames == [remoteFrame])
+
+        let reply = ethernetFrame(destination: remoteMAC, source: endpointMAC.bytes, payload: [0x03])
+        router.routeLocalEndpointFrame(reply)
+
+        #expect(webSwitch.sentFrames == [reply])
+    }
+
+    @Test
+    func hostSSHServiceAnswersARPAndProxiesTCPToLoopback() throws {
+        let greeting = Data("SSH-2.0-okrun-test\r\n".utf8)
+        let server = try LoopbackTCPServer(greeting: greeting)
+        defer { server.stop() }
+
+        let collector = FrameCollector()
+        let config = PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: "10.77.0.2",
+            targetPort: server.port
+        )
+        let service = try PrivateNetworkHostSSHService(identifier: "host-ssh-test", config: config) { frame in
+            collector.append(frame)
+        }
+        defer { service.stop() }
+
+        let hostIP = try IPv4Address("10.77.0.2")
+        let clientIP = try IPv4Address("10.77.0.20")
+        let clientMAC: [UInt8] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x40]
+        let hostMAC = service.privateNetworkMACAddress.bytes
+
+        service.receivePrivateNetworkFrame(arpRequest(
+            sourceMAC: clientMAC,
+            sourceIP: clientIP,
+            targetIP: hostIP
+        ))
+        let arpReply = try collector.waitForFrame(timeout: 1) { frameEtherType($0) == 0x0806 }
+        #expect(Array([UInt8](arpReply)[0..<6]) == clientMAC)
+        #expect(Array([UInt8](arpReply)[6..<12]) == hostMAC)
+        #expect(dhcpReadUInt16([UInt8](arpReply), 20) == 2)
+
+        let clientPort: UInt16 = 40_123
+        let clientInitialSequence: UInt32 = 1_000
+        service.receivePrivateNetworkFrame(tcpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: hostMAC,
+            sourceIP: clientIP,
+            destinationIP: hostIP,
+            sourcePort: clientPort,
+            destinationPort: 22,
+            sequenceNumber: clientInitialSequence,
+            acknowledgementNumber: 0,
+            flags: 0x02,
+            payload: Data()
+        ))
+
+        let synAck = try collector.waitForFrame(timeout: 1) { tcpFlags($0) == 0x12 }
+        let hostInitialSequence = try tcpSequenceNumber(synAck)
+        #expect(try tcpAcknowledgementNumber(synAck) == clientInitialSequence + 1)
+
+        service.receivePrivateNetworkFrame(tcpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: hostMAC,
+            sourceIP: clientIP,
+            destinationIP: hostIP,
+            sourcePort: clientPort,
+            destinationPort: 22,
+            sequenceNumber: clientInitialSequence + 1,
+            acknowledgementNumber: hostInitialSequence + 1,
+            flags: 0x10,
+            payload: Data()
+        ))
+
+        let bannerFrame = try collector.waitForFrame(timeout: 2) { frame in
+            (try? tcpPayload(frame)) == greeting
+        }
+        #expect(try tcpSequenceNumber(bannerFrame) == hostInitialSequence + 1)
+        #expect(try tcpPayload(bannerFrame) == greeting)
+
+        let clientPayload = Data("hello from vm\n".utf8)
+        service.receivePrivateNetworkFrame(tcpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: hostMAC,
+            sourceIP: clientIP,
+            destinationIP: hostIP,
+            sourcePort: clientPort,
+            destinationPort: 22,
+            sequenceNumber: clientInitialSequence + 1,
+            acknowledgementNumber: hostInitialSequence + 1 + UInt32(greeting.count),
+            flags: 0x18,
+            payload: clientPayload
+        ))
+
+        #expect(try server.waitForReceived(clientPayload, timeout: 2))
+    }
+
+    @Test
+    func hostSSHServiceAnswersMDNSHostnameQueries() throws {
+        let collector = FrameCollector()
+        let config = PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: "10.77.0.20",
+            hostname: "Test Mac.local"
+        )
+        let service = try PrivateNetworkHostSSHService(identifier: "host-ssh-mdns-test", config: config) { frame in
+            collector.append(frame)
+        }
+        defer { service.stop() }
+
+        let hostIP = try IPv4Address("10.77.0.20")
+        let clientIP = try IPv4Address("10.77.0.21")
+        let clientMAC: [UInt8] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x41]
+        let multicastMAC: [UInt8] = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb]
+
+        service.receivePrivateNetworkFrame(udpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: multicastMAC,
+            sourceIP: clientIP,
+            destinationIP: try IPv4Address("224.0.0.251"),
+            sourcePort: 5353,
+            destinationPort: 5353,
+            payload: mdnsQuery(name: "test-mac.local", qtype: 1)
+        ))
+
+        let response = try collector.waitForFrame(timeout: 1) { frame in
+            (try? mdnsAnswerAddress(frame, name: "test-mac.local")) == hostIP
+        }
+        let responseBytes = [UInt8](response)
+        #expect(Array(responseBytes[0..<6]) == multicastMAC)
+        #expect(Array(responseBytes[6..<12]) == service.privateNetworkMACAddress.bytes)
+        #expect(try udpDestinationPort(response) == 5353)
+        #expect(try mdnsAnswerAddress(response, name: "test-mac.local") == hostIP)
+    }
+
+    @Test
+    func hostNetworkConfigLoadsAndValidatesHostSSHConfig() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
+        let dhcp = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.200",
+            leaseSeconds: 3600
+        )
+        let hostSSH = try PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: "10.77.0.20",
+            hostname: "Test Mac.local"
+        ).validated(dhcp: dhcp)
+        try store.save(HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(dhcp: dhcp, hostSSH: hostSSH)
+        ]))
+
+        #expect(try store.hostSSHConfigForPrivateNetwork(identifier: "okrun") == hostSSH)
+        #expect(hostSSH.hostname == "test-mac")
+        #expect(try PrivateNetworkHostSSHConfig.defaultIPAddress(dhcp: dhcp) == "10.77.0.20")
+        #expect(throws: (any Error).self) {
+            _ = try PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.2").validated(dhcp: dhcp)
+        }
+    }
+
+    @Test
+    func hostNetworkConfigAutoPicksAndReservesHostSSHAddress() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
+        let dhcp = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.22",
+            leaseSeconds: 3600
+        )
+        let leaseStore = DHCPLeaseStore(stateDirectory: store.home.privateNetworkStateDirectory(identifier: "okrun"))
+        try leaseStore.save([
+            DHCPLease(
+                identity: "client-a",
+                ipAddress: try IPv4Address("10.77.0.20"),
+                expiresAt: Date().addingTimeInterval(3600)
+            )
+        ])
+
+        var privateNetwork = HostPrivateNetworkConfig(
+            dhcp: dhcp,
+            hostSSH: PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "")
+        )
+        try store.prepareHostSSHConfigForPrivateNetwork(identifier: "okrun", privateNetwork: &privateNetwork)
+        try store.save(HostNetworkConfig(version: 1, privateNetworks: ["okrun": privateNetwork]))
+
+        let reservedHostIP = try IPv4Address("10.77.0.21")
+        let loadedHostSSH = try #require(try store.hostSSHConfigForPrivateNetwork(identifier: "okrun"))
+        #expect(privateNetwork.hostSSH?.ipAddress == reservedHostIP.description)
+        #expect(loadedHostSSH.ipAddress == reservedHostIP.description)
+
+        let allocator = try DHCPLeaseAllocator(config: dhcp, store: leaseStore)
+        let nextGuestLease = try allocator.lease(for: "client-b", requestedIP: nil)
+        let expectedGuestIP = try IPv4Address("10.77.0.22")
+        #expect(nextGuestLease.ipAddress == expectedGuestIP)
+    }
+
+    @Test
+    func hostNetworkConfigMigratesLegacyOutOfRangeHostSSHAddress() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let configURL = root.appendingPathComponent("private-networks.json")
+        let store = HostNetworkConfigStore(url: configURL)
+        let dhcp = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.22",
+            leaseSeconds: 3600
+        )
+        let legacyConfig = HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(
+                dhcp: dhcp,
+                hostSSH: PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.2")
+            )
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(legacyConfig).write(to: configURL, options: .atomic)
+
+        let migratedHostSSH = try #require(try store.hostSSHConfigForPrivateNetwork(identifier: "okrun"))
+        let savedMigratedHostSSH = try #require(try store.load().privateNetworks["okrun"]?.hostSSH)
+        #expect(migratedHostSSH.ipAddress == "10.77.0.20")
+        #expect(savedMigratedHostSSH.ipAddress == "10.77.0.20")
+    }
+
+    @Test
     func hostNetworkConfigLoadsAndValidatesSwitchConfig() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
@@ -1772,6 +2056,477 @@ struct OkrunVMTests {
                 enabled: true,
                 server: "0.0.0.0:9444"
             ).validated()
+        }
+    }
+
+    private func arpRequest(sourceMAC: [UInt8], sourceIP: IPv4Address, targetIP: IPv4Address) -> Data {
+        var frame = Data()
+        frame.append(contentsOf: EthernetAddress.broadcast.bytes)
+        frame.append(contentsOf: sourceMAC.prefix(6))
+        frame.append(contentsOf: [0x08, 0x06])
+        appendTestUInt16(1, to: &frame)
+        appendTestUInt16(0x0800, to: &frame)
+        frame.append(6)
+        frame.append(4)
+        appendTestUInt16(1, to: &frame)
+        frame.append(contentsOf: sourceMAC.prefix(6))
+        appendTestUInt32(sourceIP.value, to: &frame)
+        frame.append(contentsOf: [0, 0, 0, 0, 0, 0])
+        appendTestUInt32(targetIP.value, to: &frame)
+        return frame
+    }
+
+    private func tcpFrame(
+        sourceMAC: [UInt8],
+        destinationMAC: [UInt8],
+        sourceIP: IPv4Address,
+        destinationIP: IPv4Address,
+        sourcePort: UInt16,
+        destinationPort: UInt16,
+        sequenceNumber: UInt32,
+        acknowledgementNumber: UInt32,
+        flags: UInt8,
+        payload: Data
+    ) -> Data {
+        var tcp = Data()
+        appendTestUInt16(sourcePort, to: &tcp)
+        appendTestUInt16(destinationPort, to: &tcp)
+        appendTestUInt32(sequenceNumber, to: &tcp)
+        appendTestUInt32(acknowledgementNumber, to: &tcp)
+        tcp.append(0x50)
+        tcp.append(flags)
+        appendTestUInt16(65_535, to: &tcp)
+        appendTestUInt16(0, to: &tcp)
+        appendTestUInt16(0, to: &tcp)
+        tcp.append(payload)
+
+        var ip = Data()
+        ip.append(0x45)
+        ip.append(0)
+        appendTestUInt16(UInt16(20 + tcp.count), to: &ip)
+        appendTestUInt16(0, to: &ip)
+        appendTestUInt16(0x4000, to: &ip)
+        ip.append(64)
+        ip.append(6)
+        appendTestUInt16(0, to: &ip)
+        appendTestUInt32(sourceIP.value, to: &ip)
+        appendTestUInt32(destinationIP.value, to: &ip)
+
+        var frame = Data()
+        frame.append(contentsOf: destinationMAC.prefix(6))
+        frame.append(contentsOf: sourceMAC.prefix(6))
+        frame.append(contentsOf: [0x08, 0x00])
+        frame.append(ip)
+        frame.append(tcp)
+        return frame
+    }
+
+    private func udpFrame(
+        sourceMAC: [UInt8],
+        destinationMAC: [UInt8],
+        sourceIP: IPv4Address,
+        destinationIP: IPv4Address,
+        sourcePort: UInt16,
+        destinationPort: UInt16,
+        payload: Data
+    ) -> Data {
+        var udp = Data()
+        appendTestUInt16(sourcePort, to: &udp)
+        appendTestUInt16(destinationPort, to: &udp)
+        appendTestUInt16(UInt16(8 + payload.count), to: &udp)
+        appendTestUInt16(0, to: &udp)
+        udp.append(payload)
+
+        var ip = Data()
+        ip.append(0x45)
+        ip.append(0)
+        appendTestUInt16(UInt16(20 + udp.count), to: &ip)
+        appendTestUInt16(0, to: &ip)
+        appendTestUInt16(0x4000, to: &ip)
+        ip.append(255)
+        ip.append(17)
+        appendTestUInt16(0, to: &ip)
+        appendTestUInt32(sourceIP.value, to: &ip)
+        appendTestUInt32(destinationIP.value, to: &ip)
+
+        var frame = Data()
+        frame.append(contentsOf: destinationMAC.prefix(6))
+        frame.append(contentsOf: sourceMAC.prefix(6))
+        frame.append(contentsOf: [0x08, 0x00])
+        frame.append(ip)
+        frame.append(udp)
+        return frame
+    }
+
+    private func mdnsQuery(name: String, qtype: UInt16, unicast: Bool = false) -> Data {
+        var payload = Data()
+        appendTestUInt16(0, to: &payload)
+        appendTestUInt16(0, to: &payload)
+        appendTestUInt16(1, to: &payload)
+        appendTestUInt16(0, to: &payload)
+        appendTestUInt16(0, to: &payload)
+        appendTestUInt16(0, to: &payload)
+        appendDNSName(name, to: &payload)
+        appendTestUInt16(qtype, to: &payload)
+        appendTestUInt16(unicast ? 0x8001 : 1, to: &payload)
+        return payload
+    }
+
+    private func appendDNSName(_ name: String, to data: inout Data) {
+        for label in name.split(separator: ".", omittingEmptySubsequences: true) {
+            let bytes = Array(label.utf8.prefix(63))
+            data.append(UInt8(bytes.count))
+            data.append(contentsOf: bytes)
+        }
+        data.append(0)
+    }
+
+    private func frameEtherType(_ frame: Data) -> UInt16? {
+        let bytes = [UInt8](frame)
+        guard bytes.count >= 14 else { return nil }
+        return dhcpReadUInt16(bytes, 12)
+    }
+
+    private func tcpFlags(_ frame: Data) -> UInt8? {
+        let bytes = [UInt8](frame)
+        guard let tcpOffset = tcpHeaderOffset(bytes), bytes.count > tcpOffset + 13 else { return nil }
+        return bytes[tcpOffset + 13]
+    }
+
+    private func tcpSequenceNumber(_ frame: Data) throws -> UInt32 {
+        let bytes = [UInt8](frame)
+        let offset = try #require(tcpHeaderOffset(bytes))
+        return testReadUInt32(bytes, offset + 4)
+    }
+
+    private func tcpAcknowledgementNumber(_ frame: Data) throws -> UInt32 {
+        let bytes = [UInt8](frame)
+        let offset = try #require(tcpHeaderOffset(bytes))
+        return testReadUInt32(bytes, offset + 8)
+    }
+
+    private func tcpPayload(_ frame: Data) throws -> Data {
+        let bytes = [UInt8](frame)
+        let ipOffset = 14
+        let tcpOffset = try #require(tcpHeaderOffset(bytes))
+        let ipLength = Int(dhcpReadUInt16(bytes, ipOffset + 2))
+        let dataOffset = Int(bytes[tcpOffset + 12] >> 4) * 4
+        let payloadStart = tcpOffset + dataOffset
+        let payloadEnd = ipOffset + ipLength
+        guard payloadEnd >= payloadStart, bytes.count >= payloadEnd else { return Data() }
+        return Data(bytes[payloadStart..<payloadEnd])
+    }
+
+    private func udpDestinationPort(_ frame: Data) throws -> UInt16 {
+        let bytes = [UInt8](frame)
+        let offset = try #require(udpHeaderOffset(bytes))
+        return dhcpReadUInt16(bytes, offset + 2)
+    }
+
+    private func udpPayload(_ frame: Data) throws -> Data {
+        let bytes = [UInt8](frame)
+        let udpOffset = try #require(udpHeaderOffset(bytes))
+        let udpLength = Int(dhcpReadUInt16(bytes, udpOffset + 4))
+        let payloadStart = udpOffset + 8
+        let payloadEnd = udpOffset + udpLength
+        guard payloadEnd >= payloadStart, bytes.count >= payloadEnd else { return Data() }
+        return Data(bytes[payloadStart..<payloadEnd])
+    }
+
+    private func mdnsAnswerAddress(_ frame: Data, name: String) throws -> IPv4Address? {
+        let payload = try udpPayload(frame)
+        let bytes = [UInt8](payload)
+        guard bytes.count >= 12 else { return nil }
+        var offset = 12
+        let questionCount = Int(dhcpReadUInt16(bytes, 4))
+        let answerCount = Int(dhcpReadUInt16(bytes, 6))
+
+        for _ in 0..<questionCount {
+            _ = try #require(readDNSName(bytes, offset: &offset))
+            guard offset + 4 <= bytes.count else { return nil }
+            offset += 4
+        }
+
+        for _ in 0..<answerCount {
+            let labels = try #require(readDNSName(bytes, offset: &offset))
+            guard offset + 10 <= bytes.count else { return nil }
+            let answerName = labels.map { $0.lowercased() }.joined(separator: ".")
+            let answerType = dhcpReadUInt16(bytes, offset)
+            let answerClass = dhcpReadUInt16(bytes, offset + 2)
+            let dataLength = Int(dhcpReadUInt16(bytes, offset + 8))
+            offset += 10
+            guard offset + dataLength <= bytes.count else { return nil }
+            if answerName == name.lowercased(),
+               answerType == 1,
+               (answerClass & 0x7fff) == 1,
+               dataLength == 4 {
+                return IPv4Address(value: testReadUInt32(bytes, offset))
+            }
+            offset += dataLength
+        }
+        return nil
+    }
+
+    private func tcpHeaderOffset(_ bytes: [UInt8]) -> Int? {
+        let ipOffset = 14
+        guard bytes.count >= ipOffset + 20,
+              dhcpReadUInt16(bytes, 12) == 0x0800 else {
+            return nil
+        }
+        let headerLength = Int(bytes[ipOffset] & 0x0f) * 4
+        guard headerLength >= 20, bytes.count >= ipOffset + headerLength + 20 else { return nil }
+        return ipOffset + headerLength
+    }
+
+    private func udpHeaderOffset(_ bytes: [UInt8]) -> Int? {
+        let ipOffset = 14
+        guard bytes.count >= ipOffset + 20,
+              dhcpReadUInt16(bytes, 12) == 0x0800,
+              bytes[ipOffset + 9] == 17 else {
+            return nil
+        }
+        let headerLength = Int(bytes[ipOffset] & 0x0f) * 4
+        guard headerLength >= 20, bytes.count >= ipOffset + headerLength + 8 else { return nil }
+        return ipOffset + headerLength
+    }
+
+    private func readDNSName(_ bytes: [UInt8], offset: inout Int, depth: Int = 0) -> [String]? {
+        guard depth < 8 else { return nil }
+        var labels: [String] = []
+        var cursor = offset
+        var jumped = false
+
+        while true {
+            guard cursor < bytes.count else { return nil }
+            let length = bytes[cursor]
+            if length == 0 {
+                cursor += 1
+                if !jumped { offset = cursor }
+                return labels
+            }
+            if (length & 0xc0) == 0xc0 {
+                guard cursor + 1 < bytes.count else { return nil }
+                let pointer = Int(dhcpReadUInt16(bytes, cursor) & 0x3fff)
+                cursor += 2
+                if !jumped {
+                    offset = cursor
+                    jumped = true
+                }
+                var pointerOffset = pointer
+                guard let suffix = readDNSName(bytes, offset: &pointerOffset, depth: depth + 1) else {
+                    return nil
+                }
+                labels.append(contentsOf: suffix)
+                return labels
+            }
+            guard (length & 0xc0) == 0 else { return nil }
+            let labelLength = Int(length)
+            guard cursor + 1 + labelLength <= bytes.count else { return nil }
+            guard let label = String(data: Data(bytes[(cursor + 1)..<(cursor + 1 + labelLength)]), encoding: .utf8) else {
+                return nil
+            }
+            labels.append(label)
+            cursor += 1 + labelLength
+            if !jumped { offset = cursor }
+        }
+    }
+
+    private func appendTestUInt16(_ value: UInt16, to data: inout Data) {
+        data.append(UInt8((value >> 8) & 0xff))
+        data.append(UInt8(value & 0xff))
+    }
+
+    private func appendTestUInt32(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8((value >> 24) & 0xff))
+        data.append(UInt8((value >> 16) & 0xff))
+        data.append(UInt8((value >> 8) & 0xff))
+        data.append(UInt8(value & 0xff))
+    }
+
+    private func testReadUInt32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+        (UInt32(bytes[offset]) << 24)
+            | (UInt32(bytes[offset + 1]) << 16)
+            | (UInt32(bytes[offset + 2]) << 8)
+            | UInt32(bytes[offset + 3])
+    }
+
+    private final class FrameCollector {
+        private let lock = NSLock()
+        private var frames: [Data] = []
+        private var readIndex = 0
+
+        func append(_ frame: Data) {
+            lock.lock()
+            frames.append(frame)
+            lock.unlock()
+        }
+
+        func waitForFrame(timeout: TimeInterval, matching predicate: (Data) -> Bool) throws -> Data {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                lock.lock()
+                if readIndex < frames.count {
+                    for index in readIndex..<frames.count where predicate(frames[index]) {
+                        readIndex = index + 1
+                        let frame = frames[index]
+                        lock.unlock()
+                        return frame
+                    }
+                }
+                lock.unlock()
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+            }
+            throw AppError("Timed out waiting for collected private network frame.")
+        }
+    }
+
+    private final class MockLocalEndpoint: PrivateNetworkLocalEndpoint {
+        let privateNetworkMACAddress: EthernetAddress
+        var receivedFrames: [Data] = []
+
+        init(macAddress: EthernetAddress) {
+            privateNetworkMACAddress = macAddress
+        }
+
+        func receivePrivateNetworkFrame(_ frame: Data) {
+            receivedFrames.append(frame)
+        }
+    }
+
+    private final class LoopbackTCPServer {
+        let port: UInt16
+
+        private let descriptor: Int32
+        private let greeting: Data
+        private let lock = NSLock()
+        private var acceptedDescriptor: Int32 = -1
+        private var isStopped = false
+        private var received = Data()
+
+        init(greeting: Data) throws {
+            self.greeting = greeting
+            descriptor = socket(AF_INET, SOCK_STREAM, 0)
+            let socketDescriptor = descriptor
+            guard socketDescriptor >= 0 else {
+                throw AppError("Failed to create TCP test server socket: \(String(cString: strerror(errno))).")
+            }
+
+            var one: Int32 = 1
+            _ = setsockopt(socketDescriptor, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = in_port_t(0).bigEndian
+            address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+            var bindAddress = address
+            let bindResult = withUnsafePointer(to: &bindAddress) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(socketDescriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bindResult == 0 else {
+                let message = String(cString: strerror(errno))
+                close(socketDescriptor)
+                throw AppError("Failed to bind TCP test server socket: \(message).")
+            }
+            guard listen(socketDescriptor, 1) == 0 else {
+                let message = String(cString: strerror(errno))
+                close(socketDescriptor)
+                throw AppError("Failed to listen on TCP test server socket: \(message).")
+            }
+
+            var boundAddress = sockaddr_in()
+            var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let nameResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    getsockname(socketDescriptor, $0, &boundLength)
+                }
+            }
+            guard nameResult == 0 else {
+                let message = String(cString: strerror(errno))
+                close(socketDescriptor)
+                throw AppError("Failed to inspect TCP test server socket: \(message).")
+            }
+            port = UInt16(bigEndian: boundAddress.sin_port)
+
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.acceptOneClient()
+            }
+        }
+
+        deinit {
+            stop()
+        }
+
+        func stop() {
+            lock.lock()
+            guard !isStopped else {
+                lock.unlock()
+                return
+            }
+            isStopped = true
+            let client = acceptedDescriptor
+            acceptedDescriptor = -1
+            lock.unlock()
+
+            if client >= 0 {
+                close(client)
+            }
+            close(descriptor)
+        }
+
+        func waitForReceived(_ expected: Data, timeout: TimeInterval) throws -> Bool {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                lock.lock()
+                let hasExpected = received.range(of: expected) != nil
+                lock.unlock()
+                if hasExpected { return true }
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+            }
+            return false
+        }
+
+        private func acceptOneClient() {
+            let client = accept(descriptor, nil, nil)
+            guard client >= 0 else { return }
+
+            lock.lock()
+            acceptedDescriptor = client
+            let stopped = isStopped
+            lock.unlock()
+            guard !stopped else {
+                close(client)
+                return
+            }
+
+            greeting.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else { return }
+                var sent = 0
+                while sent < greeting.count {
+                    let result = write(client, baseAddress.advanced(by: sent), greeting.count - sent)
+                    guard result > 0 else { return }
+                    sent += result
+                }
+            }
+
+            var buffer = [UInt8](repeating: 0, count: 4_096)
+            while true {
+                let count = recv(client, &buffer, buffer.count, 0)
+                if count > 0 {
+                    lock.lock()
+                    received.append(contentsOf: buffer.prefix(count))
+                    lock.unlock()
+                    continue
+                }
+                if count < 0 && errno == EINTR {
+                    continue
+                }
+                break
+            }
+            close(client)
         }
     }
 
