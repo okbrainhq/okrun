@@ -27,6 +27,14 @@ struct HostPrivateNetworkConfig: Codable, Equatable {
     }
 }
 
+struct StoredPrivateNetworkHostServiceConfig: Equatable {
+    var identifier: String
+    var hostSSHConfig: PrivateNetworkHostSSHConfig
+    var localSwitchConfig: PrivateNetworkLocalSwitchConfig?
+    var switchConfig: PrivateNetworkSwitchConfig?
+    var dhcpRange: PrivateNetworkDHCPLeaseRange?
+}
+
 struct PrivateNetworkHostSSHConfig: Codable, Equatable {
     static let defaultListenPort: UInt16 = 22
     static let defaultTargetHost = "127.0.0.1"
@@ -370,6 +378,57 @@ final class HostNetworkConfigStore {
         }
         let validated = try hostSSHConfig.validated(dhcp: privateNetwork.dhcp)
         return validated.enabled ? validated : nil
+    }
+
+    func storedHostServiceConfigs() throws -> [StoredPrivateNetworkHostServiceConfig] {
+        var config = try load()
+        var shouldSave = false
+        var services: [StoredPrivateNetworkHostServiceConfig] = []
+
+        for identifier in config.privateNetworks.keys.sorted() {
+            guard var privateNetwork = config.privateNetworks[identifier],
+                  privateNetwork.hostSSH?.enabled == true else {
+                continue
+            }
+
+            let originalPrivateNetwork = privateNetwork
+            try prepareHostSSHConfigForPrivateNetwork(
+                identifier: identifier,
+                privateNetwork: &privateNetwork,
+                allowsMigratingLegacyIP: true
+            )
+            if privateNetwork != originalPrivateNetwork {
+                config.privateNetworks[identifier] = privateNetwork
+                shouldSave = true
+            }
+
+            guard let hostSSHConfig = privateNetwork.hostSSH, hostSSHConfig.enabled else {
+                continue
+            }
+            let validatedHostSSHConfig = try hostSSHConfig.validated(dhcp: privateNetwork.dhcp)
+            guard validatedHostSSHConfig.enabled else {
+                continue
+            }
+
+            let localSwitchConfig = try privateNetwork.localSwitch?.validated()
+            let switchConfig = try privateNetwork.switch?.validated()
+            let dhcpRange = try privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
+                dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
+            }
+
+            services.append(StoredPrivateNetworkHostServiceConfig(
+                identifier: identifier,
+                hostSSHConfig: validatedHostSSHConfig,
+                localSwitchConfig: localSwitchConfig?.enabled == true ? localSwitchConfig : nil,
+                switchConfig: switchConfig?.enabled == true ? switchConfig : nil,
+                dhcpRange: dhcpRange
+            ))
+        }
+
+        if shouldSave {
+            try save(config)
+        }
+        return services
     }
 
     func prepareHostSSHConfigForPrivateNetwork(

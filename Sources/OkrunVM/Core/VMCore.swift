@@ -872,7 +872,7 @@ final class PrivateNetworkRuntimeRegistry {
     private var routers: [String: PrivateNetworkTransportRouter] = [:]
     private var nodeIDs: [String: UUID] = [:]
 
-    private init() {}
+    init() {}
 
     func retain(
         _ runtime: PrivateNetworkRuntime,
@@ -991,6 +991,25 @@ final class PrivateNetworkRuntimeRegistry {
         }
     }
 
+    @discardableResult
+    func configureStoredHostService(_ config: StoredPrivateNetworkHostServiceConfig) throws -> (
+        localSwitchStatus: PrivateNetworkSwitchStatus,
+        switchStatus: PrivateNetworkSwitchStatus
+    ) {
+        try configureHostSSH(identifier: config.identifier, hostSSHConfig: config.hostSSHConfig)
+        let localSwitchStatus = configureLocalSwitch(
+            identifier: config.identifier,
+            localSwitchConfig: config.localSwitchConfig,
+            dhcpRange: config.dhcpRange
+        )
+        let switchStatus = configureSwitch(
+            identifier: config.identifier,
+            switchConfig: config.switchConfig,
+            dhcpRange: config.dhcpRange
+        )
+        return (localSwitchStatus: localSwitchStatus, switchStatus: switchStatus)
+    }
+
     func configureHostSSH(identifier: String, hostSSHConfig: PrivateNetworkHostSSHConfig?) throws {
         if let existing = hostSSHServices[identifier],
            let hostSSHConfig,
@@ -1025,6 +1044,14 @@ final class PrivateNetworkRuntimeRegistry {
 
     func hasLocalSwitch(identifier: String) -> Bool {
         localSwitches[identifier] != nil
+    }
+
+    func hasHostSSHService(identifier: String) -> Bool {
+        hostSSHServices[identifier] != nil
+    }
+
+    func hasRuntime(identifier: String) -> Bool {
+        routers[identifier]?.hasRuntimes() ?? false
     }
 
     func switchStatus(identifier: String) -> PrivateNetworkSwitchStatus {

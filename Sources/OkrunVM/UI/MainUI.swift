@@ -437,6 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         do {
             registry = try projectStore.load(defaultProject: ProjectStore.defaultProjectRoot())
             try reloadSessionsFromRegistry()
+            startConfiguredPrivateNetworkHostServices()
             startLaunchConfiguredSessions()
         } catch {
             setStatus("Setup failed", detail: error.localizedDescription)
@@ -921,6 +922,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 AppLog.lifecycle.info("Auto-starting VM project=\(session.paths.root.path, privacy: .public) mode=installer image=\(isoPath, privacy: .public)")
                 start(session: session, mode: .installer(URL(fileURLWithPath: isoPath)))
             }
+        }
+    }
+
+    private func startConfiguredPrivateNetworkHostServices() {
+        do {
+            let serviceConfigs = try HostNetworkConfigStore().storedHostServiceConfigs()
+            for serviceConfig in serviceConfigs {
+                do {
+                    try PrivateNetworkRuntimeRegistry.shared.configureStoredHostService(serviceConfig)
+                    AppLog.lifecycle.info(
+                        "Started private network host mDNS service privateNetwork=\(serviceConfig.identifier, privacy: .public) hostname=\(serviceConfig.hostSSHConfig.hostname, privacy: .public) ip=\(serviceConfig.hostSSHConfig.ipAddress, privacy: .public)"
+                    )
+                } catch {
+                    AppLog.lifecycle.warning(
+                        "Failed to start private network host mDNS service privateNetwork=\(serviceConfig.identifier, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
+        } catch {
+            AppLog.lifecycle.warning(
+                "Failed to load private network host mDNS services error=\(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 

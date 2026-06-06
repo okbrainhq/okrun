@@ -1896,6 +1896,54 @@ struct OkrunVMTests {
     }
 
     @Test
+    func privateNetworkRuntimeRegistryStartsStoredHostMDNSBeforeAnyRuntime() throws {
+        let registry = PrivateNetworkRuntimeRegistry()
+        defer { registry.releaseAll() }
+
+        let identifier = "stored-host-mdns-\(UUID().uuidString)"
+        let hostIP = try IPv4Address("10.77.0.20")
+        let hostSSHConfig = try PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: hostIP.description,
+            hostname: "Test Mac.local"
+        ).validated(dhcp: nil)
+
+        let statuses = try registry.configureStoredHostService(StoredPrivateNetworkHostServiceConfig(
+            identifier: identifier,
+            hostSSHConfig: hostSSHConfig,
+            localSwitchConfig: nil,
+            switchConfig: nil,
+            dhcpRange: nil
+        ))
+
+        #expect(registry.hasHostSSHService(identifier: identifier))
+        #expect(registry.hasRuntime(identifier: identifier) == false)
+        #expect(statuses.localSwitchStatus == .disabled(identifier: identifier))
+        #expect(statuses.switchStatus == .disabled(identifier: identifier))
+
+        let runtime = try PrivateNetworkRuntime(identifier: identifier)
+        try registry.retain(runtime, hostSSHConfig: hostSSHConfig)
+        #expect(registry.hasRuntime(identifier: identifier))
+
+        let clientIP = try IPv4Address("10.77.0.21")
+        let clientMAC: [UInt8] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x42]
+        let multicastMAC: [UInt8] = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb]
+        runtime.fileHandle.write(udpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: multicastMAC,
+            sourceIP: clientIP,
+            destinationIP: try IPv4Address("224.0.0.251"),
+            sourcePort: 5353,
+            destinationPort: 5353,
+            payload: mdnsQuery(name: "test-mac.local", qtype: 1)
+        ))
+
+        let response = try waitForFrame(on: runtime.fileHandle.fileDescriptor, timeout: 1)
+        #expect(try mdnsAnswerAddress(response, name: "test-mac.local") == hostIP)
+        withExtendedLifetime((registry, runtime)) {}
+    }
+
+    @Test
     func hostNetworkConfigLoadsAndValidatesHostSSHConfig() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
@@ -1965,6 +2013,65 @@ struct OkrunVMTests {
         let nextGuestLease = try allocator.lease(for: "client-b", requestedIP: nil)
         let expectedGuestIP = try IPv4Address("10.77.0.22")
         #expect(nextGuestLease.ipAddress == expectedGuestIP)
+    }
+
+    @Test
+    func hostNetworkConfigBuildsStoredHostServiceConfigs() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let store = HostNetworkConfigStore(url: root.appendingPathComponent("private-networks.json"))
+        let dhcp = PrivateNetworkDHCPConfig(
+            enabled: true,
+            mode: .range,
+            cidr: "10.77.0.0/24",
+            rangeStart: "10.77.0.20",
+            rangeEnd: "10.77.0.22",
+            leaseSeconds: 3600
+        )
+        let switchConfig = PrivateNetworkSwitchConfig(
+            enabled: true,
+            server: "localhost:9443",
+            caCert: "/tmp/ca-cert.pem",
+            clientCert: "/tmp/client-cert.pem",
+            clientKey: "/tmp/client-key.pem",
+            credentialFingerprint: "bundle-a"
+        )
+        let localSwitchConfig = PrivateNetworkLocalSwitchConfig(
+            enabled: true,
+            server: "127.0.0.1:9444"
+        )
+        try store.save(HostNetworkConfig(version: 1, privateNetworks: [
+            "okrun": HostPrivateNetworkConfig(
+                dhcp: dhcp,
+                switch: switchConfig,
+                localSwitch: localSwitchConfig,
+                hostSSH: PrivateNetworkHostSSHConfig(
+                    enabled: true,
+                    ipAddress: "",
+                    hostname: "Test Mac.local"
+                )
+            ),
+            "switch-only": HostPrivateNetworkConfig(
+                dhcp: nil,
+                switch: switchConfig,
+                localSwitch: localSwitchConfig,
+                hostSSH: nil
+            )
+        ]))
+
+        let services = try store.storedHostServiceConfigs()
+        let service = try #require(services.first)
+        let expectedDHCPRange = try PrivateNetworkDHCPLeaseRange(config: dhcp)
+
+        #expect(services.count == 1)
+        #expect(service.identifier == "okrun")
+        #expect(service.hostSSHConfig.ipAddress == "10.77.0.20")
+        #expect(service.hostSSHConfig.hostname == "test-mac")
+        #expect(service.localSwitchConfig == localSwitchConfig)
+        #expect(service.switchConfig == switchConfig)
+        #expect(service.dhcpRange == expectedDHCPRange)
+        #expect(try store.load().privateNetworks["okrun"]?.hostSSH?.ipAddress == "10.77.0.20")
     }
 
     @Test
