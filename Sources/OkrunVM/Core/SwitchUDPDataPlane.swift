@@ -63,6 +63,13 @@ private struct SwitchUDPQueuedPacket {
     var queuedAt: Date
 }
 
+private enum SwitchUDPDataPlaneState {
+    case probing
+    case ready
+    case fallback
+    case stopped
+}
+
 final class SwitchUDPDataPlane {
     static let protocolLabel = "okrun-switch udp-data-v1"
     static let headerSize = 40
@@ -91,8 +98,7 @@ final class SwitchUDPDataPlane {
     private let maxFrameSize: Int
     private var activeMTU: Int
     private var connection: NWConnection?
-    private var ready = false
-    private var stopped = false
+    private var state: SwitchUDPDataPlaneState = .probing
     private var nextPacketNumber: UInt64 = 1
     private var nextFragmentID: UInt32 = 1
     private var replayWindow = SwitchUDPReplayWindow()
@@ -167,11 +173,15 @@ final class SwitchUDPDataPlane {
     }
 
     var isReady: Bool {
-        ready && !stopped
+        state == .ready
+    }
+
+    var isFallback: Bool {
+        state == .fallback
     }
 
     func start() {
-        guard connection == nil, !stopped else { return }
+        guard connection == nil, state == .probing else { return }
         let parameters = NWParameters.udp
         parameters.allowLocalEndpointReuse = true
         let connection = NWConnection(
@@ -191,8 +201,7 @@ final class SwitchUDPDataPlane {
     }
 
     func stop() {
-        stopped = true
-        ready = false
+        state = .stopped
         cancelProbeTimers()
         cancelKeepalive()
         cancelPacer()
@@ -203,7 +212,7 @@ final class SwitchUDPDataPlane {
     }
 
     func sendData(_ frame: SwitchFrame) -> Bool {
-        guard isReady, frame.type == .data, frame.streamID == SwitchFrame.ethernetStreamID else {
+        guard state == .ready, frame.type == .data, frame.streamID == SwitchFrame.ethernetStreamID else {
             return false
         }
 
@@ -225,6 +234,7 @@ final class SwitchUDPDataPlane {
     private func handleState(_ state: NWConnection.State) {
         switch state {
         case .ready:
+            guard self.state == .probing else { return }
             AppLog.webSwitch.info(
                 "UDP ready for probe network=\(self.identifier, privacy: .public) port=\(self.udpPort, privacy: .public) session=\(self.sessionIDString, privacy: .public)"
             )
@@ -233,7 +243,9 @@ final class SwitchUDPDataPlane {
         case .failed(let error):
             failOrFallback("UDP failed: \(error.localizedDescription)")
         case .cancelled:
-            ready = false
+            if self.state == .ready {
+                self.state = .stopped
+            }
         case .waiting(let error):
             AppLog.webSwitch.info(
                 "UDP waiting network=\(self.identifier, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
@@ -246,11 +258,14 @@ final class SwitchUDPDataPlane {
     }
 
     private func receiveLoop() {
-        guard let connection, !stopped else { return }
+        guard let connection, state != .stopped, state != .fallback else { return }
         connection.receiveMessage { [weak self, weak connection] content, _, _, error in
             guard let self else { return }
             self.queue.async {
-                guard let connection, connection === self.connection, !self.stopped else { return }
+                guard let connection,
+                      connection === self.connection,
+                      self.state != .stopped,
+                      self.state != .fallback else { return }
                 if let content, !content.isEmpty {
                     self.handleDatagram(content)
                 }
@@ -264,6 +279,7 @@ final class SwitchUDPDataPlane {
     }
 
     private func handleDatagram(_ datagram: Data) {
+        guard state != .stopped, state != .fallback else { return }
         guard let parsed = Self.parsePacket(datagram), parsed.sessionID == sessionID, parsed.keyID == keyID else {
             return
         }
@@ -314,7 +330,7 @@ final class SwitchUDPDataPlane {
         let attempts: [TimeInterval] = [0, 0.5, 1.5, 3.5]
         for delay in attempts {
             let workItem = DispatchWorkItem { [weak self] in
-                guard let self, !self.ready, !self.stopped else { return }
+                guard let self, self.state == .probing else { return }
                 self.sendControl(.probe, plaintext: Data(UUID().uuidString.utf8))
             }
             probeRetryWorkItems.append(workItem)
@@ -322,7 +338,7 @@ final class SwitchUDPDataPlane {
         }
 
         let timeout = DispatchWorkItem { [weak self] in
-            guard let self, !self.ready, !self.stopped else { return }
+            guard let self, self.state == .probing else { return }
             self.failOrFallback("UDP probe timed out; using TCP/TLS fallback.")
         }
         probeTimeoutWorkItem = timeout
@@ -330,8 +346,8 @@ final class SwitchUDPDataPlane {
     }
 
     private func markReady() {
-        guard !ready else { return }
-        ready = true
+        guard state == .probing else { return }
+        state = .ready
         cancelProbeTimers()
         lastValidPacketAt = Date()
         AppLog.webSwitch.info(
@@ -345,10 +361,9 @@ final class SwitchUDPDataPlane {
     private func scheduleKeepalive() {
         cancelKeepalive()
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self, !self.stopped, self.ready else { return }
+            guard let self, self.state == .ready else { return }
             let age = Date().timeIntervalSince(self.lastValidPacketAt ?? .distantPast)
             guard age <= Self.unhealthyTimeout else {
-                self.ready = false
                 self.failOrFallback("UDP path became unhealthy; using TCP/TLS fallback.")
                 return
             }
@@ -360,12 +375,19 @@ final class SwitchUDPDataPlane {
     }
 
     private func failOrFallback(_ message: String) {
-        ready = false
+        guard state != .stopped, state != .fallback else { return }
         cancelProbeTimers()
         cancelKeepalive()
+        cancelPacer()
+        sendQueue.removeAll()
+        queuedBytes = 0
+        connection?.cancel()
+        connection = nil
         if mode == .auto {
+            state = .fallback
             onFallback?(message)
         } else {
+            state = .stopped
             onFailed?(message)
         }
     }
@@ -461,7 +483,7 @@ final class SwitchUDPDataPlane {
     }
 
     private func enqueue(_ packet: Data) -> Bool {
-        guard let connection, !stopped else { return false }
+        guard let connection, state != .stopped, state != .fallback else { return false }
         refillTokens()
         if sendQueue.isEmpty, tokens >= Double(packet.count) {
             tokens -= Double(packet.count)
@@ -491,7 +513,7 @@ final class SwitchUDPDataPlane {
     }
 
     private func flushQueue() {
-        guard let connection, !stopped else { return }
+        guard let connection, state != .stopped, state != .fallback else { return }
         pacerWorkItem = nil
         refillTokens()
         while let next = sendQueue.first, tokens >= Double(next.packet.count) {

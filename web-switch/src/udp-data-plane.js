@@ -60,6 +60,7 @@ class SwitchUDPDataPlane {
     this.globalReassemblyFrames = 0;
     this.started = false;
     this.boundAddress = null;
+    this.bindError = null;
     this.socketBuffers = { recv: null, send: null };
     this.counters = {
       rxPackets: 0,
@@ -95,19 +96,46 @@ class SwitchUDPDataPlane {
       return;
     }
 
-    if (this.socket) {
+    if (this.started) {
       if (callback) {
         process.nextTick(callback);
       }
       return;
     }
 
+    if (this.socket) {
+      if (callback) {
+        process.nextTick(() => callback(this.bindError));
+      }
+      return;
+    }
+
     const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    let callbackCalled = false;
+    const finish = (error = null) => {
+      if (callback && !callbackCalled) {
+        callbackCalled = true;
+        callback(error);
+      }
+    };
     this.socket = socket;
+    this.bindError = null;
 
     socket.on('message', (message, remoteInfo) => this.handleMessage(message, remoteInfo));
     socket.on('error', (error) => {
       this.log('udp_error', { code: error.code, message: error.message });
+      if (!this.started) {
+        this.bindError = { code: error.code, message: error.message };
+        this.options.enabled = false;
+        this.socket = null;
+        this.boundAddress = null;
+        try {
+          socket.close();
+        } catch (_) {
+          // Socket may already be closed after a bind failure.
+        }
+        finish(error);
+      }
     });
     socket.on('listening', () => {
       trySetSocketBuffer(socket, 'recv', this.options.recvBufferBytes);
@@ -116,15 +144,14 @@ class SwitchUDPDataPlane {
       this.socketBuffers.send = tryGetSocketBuffer(socket, 'send');
       this.boundAddress = socket.address();
       this.started = true;
+      this.bindError = null;
       this.log('udp_listening', {
         host: this.boundAddress.address,
         port: this.boundAddress.port,
         recvBufferBytes: this.socketBuffers.recv,
         sendBufferBytes: this.socketBuffers.send
       });
-      if (callback) {
-        callback();
-      }
+      finish();
     });
 
     socket.bind(this.options.port, this.options.host);
@@ -156,7 +183,7 @@ class SwitchUDPDataPlane {
   }
 
   createSession(connection, initPayload) {
-    if (!this.options.enabled || !this.socket || connection.identity?.kind !== 'tls') {
+    if (!this.options.enabled || !this.started || !this.socket || connection.identity?.kind !== 'tls') {
       return null;
     }
 
@@ -227,7 +254,7 @@ class SwitchUDPDataPlane {
   }
 
   sendData(session, payload, seqNo) {
-    if (!session || !session.ready || !this.socket) {
+    if (!session || !session.ready || !this.started || !this.socket) {
       this.counters.fallbackSends += 1;
       return false;
     }
@@ -258,7 +285,7 @@ class SwitchUDPDataPlane {
   }
 
   sendPacket(packet, endpoint) {
-    if (!this.socket || !endpoint) {
+    if (!this.started || !this.socket || !endpoint) {
       return false;
     }
 
@@ -330,10 +357,10 @@ class SwitchUDPDataPlane {
       session.sendControl(UdpPacketType.KEEPALIVE_ACK, Buffer.alloc(0));
       break;
     case UdpPacketType.PMTU_PROBE:
-      session.sendControl(UdpPacketType.PMTU_PROBE_ACK, plaintext, {
-        padTo: Math.min(message.length, session.activeMtu)
-      });
-      this.counters.pmtuProbeSuccess += 1;
+      // Adaptive PMTU probing is intentionally disabled in v1. Use the fixed
+      // configured MTU until padded probe/ACK packets are implemented safely.
+      session.counters.invalidPacketDrops += 1;
+      this.counters.pmtuProbeFailure += 1;
       break;
     case UdpPacketType.PROBE_ACK:
     case UdpPacketType.KEEPALIVE_ACK:
@@ -431,6 +458,7 @@ class SwitchUDPDataPlane {
     return {
       enabled: this.options.enabled,
       bound: this.started,
+      bindError: this.bindError,
       sockets: this.boundAddress ? [this.boundAddress] : [],
       recvBufferBytes: this.socketBuffers.recv,
       sendBufferBytes: this.socketBuffers.send,
@@ -513,7 +541,6 @@ class SwitchUDPSession {
       cipher: 'aes-256-gcm',
       mtu: this.activeMtu,
       minMtu: this.minMtu,
-      maxProbeMtu: this.maxProbeMtu,
       keyId: this.keyId,
       serverRandom: base64UrlEncode(this.serverRandom),
       clientIdentity: this.clientIdentity,
@@ -602,15 +629,12 @@ class SwitchUDPSession {
     return packets;
   }
 
-  sendControl(type, plaintext, options = {}) {
+  sendControl(type, plaintext) {
     if (!this.endpoint) {
       return false;
     }
 
-    let packet = this.encrypt(type, plaintext);
-    if (options.padTo && packet.length < options.padTo) {
-      packet = Buffer.concat([packet, crypto.randomBytes(options.padTo - packet.length)]);
-    }
+    const packet = this.encrypt(type, plaintext);
     return this.pacer.enqueue(packet, this.endpoint);
   }
 

@@ -263,6 +263,7 @@ class SwitchConnection {
     this.pendingWriteBytes = 0;
     this.droppedWrites = 0;
     this.udpSession = null;
+    this.transportPreference = 'tcp';
   }
 
   start() {
@@ -332,6 +333,21 @@ class SwitchConnection {
     }
 
     if (frame.type === FrameType.DATA) {
+      if (this.transportPreference === 'udp') {
+        this.log('reject', {
+          code: 'tcp_data_forbidden',
+          clientSerial: this.identity.clientSerial,
+          nodeID: this.nodeID,
+          network: this.networkKey,
+          message: 'UDP-only clients must send DATA frames over the UDP data plane'
+        });
+        this.closeWithError({
+          code: 'tcp_data_forbidden',
+          message: 'UDP-only clients must send DATA frames over the UDP data plane'
+        });
+        return;
+      }
+
       const result = this.fabric.handleData(this, frame);
       if (process.env.OKRUN_SWITCH_DEBUG === '1') {
         this.log('data', {
@@ -383,13 +399,23 @@ class SwitchConnection {
       throw error;
     }
 
-    this.initialized = true;
+    this.transportPreference = result.init.transportPreference ?? 'tcp';
     clearTimeout(this.initTimer);
     this.initTimer = null;
 
     if (this.udpDataPlane) {
       this.udpSession = this.udpDataPlane.createSession(this, result.init);
     }
+
+    if (this.transportPreference === 'udp' && !this.udpSession) {
+      this.closeWithError({
+        code: 'udp_unavailable',
+        message: 'UDP data plane is unavailable for this UDP-only client'
+      });
+      return;
+    }
+
+    this.initialized = true;
 
     const ackPayload = {
       protocol: 'okrun-switch/1',
@@ -458,6 +484,12 @@ class SwitchConnection {
     if (this.udpSession?.ready && this.udpDataPlane?.sendData(this.udpSession, payload, seqNo)) {
       return true;
     }
+
+    if (this.transportPreference === 'udp' || this.udpSession?.preference === 'udp') {
+      this.recordDroppedWrite('udp_not_ready', payload.length);
+      return false;
+    }
+
     return this.writeEncodedFrame(encoded);
   }
 

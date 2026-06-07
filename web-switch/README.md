@@ -159,11 +159,25 @@ OKRUN_SWITCH_UDP_SEND_BUFFER_BYTES=4194304
 ```
 
 New clients advertise `udp-data-v1` in `INIT` and receive a `dataPlane` block in
-`INIT` ACK when UDP is available. The UDP path uses AES-256-GCM with keys derived
-from random material exchanged over the authenticated TLS control channel. UDP
-packets include replay protection, endpoint validation, token-bucket pacing,
+`INIT` ACK when UDP is available. Clients that choose **UDP Accelerated** require
+UDP and are rejected/fail closed if the data plane is unavailable; **Auto** clients
+fall back to TCP/TLS.
+
+The UDP path uses AES-256-GCM with keys derived from random material exchanged
+over the authenticated TLS control channel. v1 uses one key per UDP session
+(`keyId: 1`); reconnect to rekey. UDP packets include replay protection, endpoint
+validation, fixed-MTU fragmentation/reassembly, static token-bucket pacing,
 bounded queues, and bounded fragment reassembly. `/status` includes UDP socket,
 session, queue, reassembly, and drop counters when UDP is enabled.
+
+Current v1 scope:
+
+- IPv4 UDP listener/client paths only.
+- Fixed configured MTU (`OKRUN_SWITCH_UDP_MTU`, default `1200`); adaptive PMTU
+  probing is disabled in v1. PMTU probe packets are ignored and
+  `OKRUN_SWITCH_UDP_MAX_PROBE_MTU` is reserved for future probing.
+- Static pacing only; no loss/RTT/bandwidth-based congestion control yet.
+- No mid-session key rotation; reconnecting creates fresh UDP keys.
 
 ## Deploying To A Linux VM
 

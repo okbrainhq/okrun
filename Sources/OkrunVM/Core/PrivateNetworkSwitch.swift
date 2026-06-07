@@ -492,6 +492,65 @@ final class PendingSwitchWriteBuffer {
         return (freshEntries.map(\.data), dropped)
     }
 
+    @discardableResult
+    func pruneExpiredEntries(at now: Date = Date()) -> Int {
+        let before = entries.count
+        pruneExpired(at: now)
+        return before - entries.count
+    }
+
+    func removeAll() {
+        entries.removeAll()
+    }
+
+    private func pruneExpired(at now: Date) {
+        entries.removeAll { now.timeIntervalSince($0.queuedAt) > maxAge }
+    }
+}
+
+final class PendingSwitchFrameBuffer {
+    private struct Entry {
+        var frame: SwitchFrame
+        var queuedAt: Date
+    }
+
+    private let limit: Int
+    private let maxAge: TimeInterval
+    private var entries: [Entry] = []
+
+    init(limit: Int = PendingSwitchWriteBuffer.defaultLimit, maxAge: TimeInterval = PendingSwitchWriteBuffer.defaultMaxAge) {
+        precondition(limit > 0, "Pending frame buffer limit must be positive.")
+        precondition(maxAge >= 0, "Pending frame max age must not be negative.")
+        self.limit = limit
+        self.maxAge = maxAge
+    }
+
+    var count: Int {
+        entries.count
+    }
+
+    @discardableResult
+    func append(_ frame: SwitchFrame, at now: Date = Date()) -> Bool {
+        pruneExpired(at: now)
+        guard entries.count < limit else { return false }
+        entries.append(Entry(frame: frame, queuedAt: now))
+        return true
+    }
+
+    func flush(at now: Date = Date()) -> (frames: [SwitchFrame], dropped: Int) {
+        let freshEntries = entries.filter { now.timeIntervalSince($0.queuedAt) <= maxAge }
+        let dropped = entries.count - freshEntries.count
+        entries.removeAll()
+        return (freshEntries.map(\.frame), dropped)
+    }
+
+    @discardableResult
+    func pruneExpiredEntries(at now: Date = Date()) -> Int {
+        let before = entries.count
+        pruneExpired(at: now)
+        return before - entries.count
+    }
+
     func removeAll() {
         entries.removeAll()
     }
@@ -751,6 +810,7 @@ private final class RealSwitchSocket {
     private var decoder: SwitchFrameDecoder
     private var connection: NWConnection?
     private var pendingWrites = PendingSwitchWriteBuffer()
+    private var pendingDataFrames = PendingSwitchFrameBuffer()
     private var initialized = false
     private var stopped = false
     private var maxFrameSize: Int
@@ -794,6 +854,7 @@ private final class RealSwitchSocket {
             reconnectDelay = Self.initialReconnectDelay
             reconnectAttempts = 0
             pendingWrites.removeAll()
+            pendingDataFrames.removeAll()
             startNetworkPathMonitorOnQueue()
             startOnQueue()
         }
@@ -816,6 +877,7 @@ private final class RealSwitchSocket {
             connection?.cancel()
             connection = nil
             pendingWrites.removeAll()
+            pendingDataFrames.removeAll()
         }
     }
 
@@ -988,6 +1050,7 @@ private final class RealSwitchSocket {
         cancelInitResponseTimeout()
         cancelClientKeepalive()
         pendingWrites.removeAll()
+        pendingDataFrames.removeAll()
         initialized = false
         stopUDPDataPlaneOnQueue()
         if let activeConnection = connection {
@@ -1011,6 +1074,7 @@ private final class RealSwitchSocket {
         cancelInitResponseTimeout()
         cancelClientKeepalive()
         pendingWrites.removeAll()
+        pendingDataFrames.removeAll()
         initialized = false
         stopUDPDataPlaneOnQueue()
         if let activeConnection = connection {
@@ -1192,6 +1256,7 @@ private final class RealSwitchSocket {
                 let connections = memberCount(network: ack.networkMemberCount, local: ack.localMemberCount)
                 lastMemberCount = connections
                 handleUDPDataPlaneAck(ack, connections: connections)
+                guard initialized, connection != nil else { return }
                 flushPendingWrites()
                 if udpDataPlane?.isReady == true {
                     report(
@@ -1304,6 +1369,7 @@ private final class RealSwitchSocket {
             }
             udp.onReady = { [weak self] in
                 guard let self else { return }
+                self.flushPendingDataFrames()
                 self.report(
                     .connected,
                     "UDP Accelerated to \(self.endpoint.description).",
@@ -1392,14 +1458,9 @@ private final class RealSwitchSocket {
 
     private func sendDataFrameOnQueue(_ frame: SwitchFrame) {
         guard initialized else {
-            do {
-                let encoded = try SwitchFrameProtocol.encode(frame)
-                SwitchDebug.log("buffer DATA bytes=\(frame.payload.count) until INIT ACK")
-                if !pendingWrites.append(encoded) {
-                    SwitchDebug.log("drop pending DATA bytes=\(frame.payload.count) reason=buffer-full")
-                }
-            } catch {
-                report(.failed, error.localizedDescription, connections: 0, error: error.localizedDescription)
+            SwitchDebug.log("buffer DATA bytes=\(frame.payload.count) until INIT ACK")
+            if !pendingDataFrames.append(frame) {
+                SwitchDebug.log("drop pending DATA bytes=\(frame.payload.count) reason=buffer-full")
             }
             return
         }
@@ -1410,7 +1471,10 @@ private final class RealSwitchSocket {
         }
 
         guard config.transportMode != .udp else {
-            SwitchDebug.log("drop DATA bytes=\(frame.payload.count) reason=udp-not-ready")
+            SwitchDebug.log("buffer DATA bytes=\(frame.payload.count) reason=udp-probing")
+            if !pendingDataFrames.append(frame) {
+                SwitchDebug.log("drop DATA bytes=\(frame.payload.count) reason=udp-buffer-full")
+            }
             return
         }
 
@@ -1432,6 +1496,32 @@ private final class RealSwitchSocket {
         }
         for write in writes {
             sendNow(write)
+        }
+        flushPendingDataFrames()
+    }
+
+    private func flushPendingDataFrames() {
+        guard initialized else { return }
+        if config.transportMode == .udp, udpDataPlane?.isReady != true {
+            let dropped = pendingDataFrames.pruneExpiredEntries()
+            if dropped > 0 {
+                SwitchDebug.log("drop pending DATA count=\(dropped) reason=expired")
+            }
+            if pendingDataFrames.count > 0 {
+                SwitchDebug.log("hold pending DATA count=\(pendingDataFrames.count) reason=udp-probing")
+            }
+            return
+        }
+
+        let result = pendingDataFrames.flush()
+        let frames = result.frames
+        if !frames.isEmpty {
+            SwitchDebug.log("flush pending DATA count=\(frames.count) droppedExpired=\(result.dropped)")
+        } else if result.dropped > 0 {
+            SwitchDebug.log("drop pending DATA count=\(result.dropped) reason=expired")
+        }
+        for frame in frames {
+            sendDataFrameOnQueue(frame)
         }
     }
 
@@ -1621,6 +1711,11 @@ private final class RealSwitchSocket {
         stopUDPDataPlaneOnQueue()
         connection = nil
         activeConnection.cancel()
+
+        if !retry {
+            pendingWrites.removeAll()
+            pendingDataFrames.removeAll()
+        }
 
         guard retry, !stopped else {
             if reportFinalFailure {

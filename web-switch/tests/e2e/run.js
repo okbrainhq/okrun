@@ -31,6 +31,7 @@ const { buildConfig } = require('../../src/index');
 const { SwitchFabric } = require('../../src/switch-fabric');
 const { SwitchConnection } = require('../../src/tls-server');
 const {
+  SwitchUDPDataPlane,
   UdpPacketType,
   deriveUDPKeys,
   encodeUDPHeader,
@@ -279,6 +280,38 @@ test('local-only switch does not enable UDP data plane by default', async () => 
   assert.equal(config.udpEnabled, false);
 });
 
+test('UDP sessions are not negotiated until the UDP socket is bound', async () => {
+  const dataPlane = new SwitchUDPDataPlane({
+    enabled: true,
+    host: '127.0.0.1',
+    port: 0,
+    logger: { log() {} },
+    serverIdentity: 'test-server'
+  });
+  const connection = {
+    identity: {
+      kind: 'tls',
+      clientSerial: 'test-client',
+      clientFingerprint: 'test-client-fingerprint'
+    },
+    nodeID: 'test-node'
+  };
+  const initPayload = {
+    capabilities: ['ethernet-frame', 'udp-data-v1'],
+    transportPreference: 'udp',
+    clientRandom: crypto.randomBytes(32).toString('base64url')
+  };
+  const listening = new Promise((resolve, reject) => {
+    dataPlane.listen((error) => (error ? reject(error) : resolve()));
+  });
+
+  assert.equal(dataPlane.createSession(connection, initPayload), null);
+  await listening;
+  const session = dataPlane.createSession(connection, initPayload);
+  assert.ok(session);
+  await new Promise((resolve) => dataPlane.close(resolve));
+});
+
 test('UDP-capable clients negotiate, probe, and exchange encrypted DATA', async ({ certs }) => {
   const udpServer = await startServer(certs);
   const net = networkName('udp-data');
@@ -322,6 +355,120 @@ test('UDP-capable clients negotiate, probe, and exchange encrypted DATA', async 
     }
     await closeAll([a, b]);
     await udpServer.stop();
+  }
+});
+
+test('PMTU probes are ignored in fixed-MTU v1', async ({ certs }) => {
+  const udpServer = await startServer(certs);
+  const a = client(udpServer, certs, 'hostA', {
+    name: 'pmtu-v1-a',
+    networkIdentifier: networkName('pmtu-v1'),
+    udpPreference: 'auto'
+  });
+  let udp = null;
+
+  try {
+    const ack = await a.connect();
+    assert.equal(ack.dataPlane.selected, 'udp');
+    udp = new TestUDPDataPlane(a, ack.dataPlane);
+    await udp.bind();
+    await udp.probe();
+
+    udp.send(UdpPacketType.PMTU_PROBE, Buffer.from('pmtu-disabled'));
+    await assert.rejects(
+      () => udp.waitFor(
+        ({ parsed }) => parsed.type === UdpPacketType.PMTU_PROBE_ACK,
+        150,
+        'PMTU_PROBE_ACK'
+      ),
+      /Timed out waiting/
+    );
+
+    await eventually(async () => {
+      const status = await udpServer.status();
+      assert.equal(status.udp.counters.pmtuProbeFailure, 1);
+    });
+  } finally {
+    if (udp) {
+      udp.close();
+    }
+    await closeAll([a]);
+    await udpServer.stop();
+  }
+});
+
+test('UDP-only clients do not receive TCP DATA fallback before UDP probe succeeds', async ({ certs }) => {
+  const udpServer = await startServer(certs);
+  const net = networkName('udp-only-no-tcp');
+  const a = client(udpServer, certs, 'hostA', {
+    name: 'udp-only-a',
+    networkIdentifier: net,
+    udpPreference: 'udp'
+  });
+  const b = client(udpServer, certs, 'hostB', {
+    name: 'tcp-b',
+    networkIdentifier: net
+  });
+
+  try {
+    const ack = await a.connect();
+    assert.equal(ack.dataPlane.selected, 'udp');
+    await b.connect();
+
+    b.sendData(ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:72:01', 'must-not-leak-to-tcp'));
+    await a.expectNoData(200);
+  } finally {
+    await closeAll([a, b]);
+    await udpServer.stop();
+  }
+});
+
+test('UDP-only clients are closed if they send TCP DATA', async ({ certs }) => {
+  const udpServer = await startServer(certs);
+  const net = networkName('udp-only-tcp-data-rejected');
+  const a = client(udpServer, certs, 'hostA', {
+    name: 'udp-only-tcp-sender',
+    networkIdentifier: net,
+    udpPreference: 'udp'
+  });
+  const b = client(udpServer, certs, 'hostB', {
+    name: 'tcp-receiver',
+    networkIdentifier: net
+  });
+
+  try {
+    const ack = await a.connect();
+    assert.equal(ack.dataPlane.selected, 'udp');
+    await b.connect();
+
+    a.sendData(ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:72:02', 'must-not-send-over-tcp'));
+    const error = parseErrorFrame(await a.waitForFrame(
+      (candidate) => candidate.type === FrameType.ERROR,
+      1000,
+      'UDP-only TCP DATA ERROR'
+    ));
+    assert.equal(error.code, 'tcp_data_forbidden');
+    await a.waitForClose();
+    await b.expectNoData(200);
+  } finally {
+    await closeAll([a, b]);
+    await udpServer.stop();
+  }
+});
+
+test('UDP-only clients are rejected when the server data plane is unavailable', async ({ certs }) => {
+  const tcpOnlyServer = await startServer(certs, { udpEnabled: false });
+  const a = client(tcpOnlyServer, certs, 'hostA', {
+    name: 'udp-only-rejected',
+    networkIdentifier: networkName('udp-only-rejected'),
+    udpPreference: 'udp'
+  });
+
+  try {
+    await assert.rejects(() => a.connect(), /closed while waiting|Timed out waiting/);
+  } finally {
+    await closeAll([a]);
+    await tcpOnlyServer.stop();
   }
 });
 

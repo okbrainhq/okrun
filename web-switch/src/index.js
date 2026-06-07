@@ -348,10 +348,6 @@ function start(config) {
     })
     : null;
 
-  if (udpDataPlane) {
-    udpDataPlane.listen();
-  }
-
   const tlsServer = config.tlsEnabled !== false
     ? new SwitchTLSServer({
       ...config,
@@ -369,40 +365,57 @@ function start(config) {
 
   const statusServer = createStatusServer(fabric, udpDataPlane);
 
-  if (tlsServer) {
-    tlsServer.listen(() => {
-      const address = tlsServer.address();
-      console.log(JSON.stringify({
-        event: 'tls_listening',
-        host: address.address,
-        port: address.port,
-        serverBundle: config.serverBundlePath,
-        serverCert: config.serverCertPath,
-        caCert: config.caCertPath,
-        crl: config.crlPath
-      }));
-    });
-  }
+  const startListeners = () => {
+    if (tlsServer) {
+      tlsServer.listen(() => {
+        const address = tlsServer.address();
+        console.log(JSON.stringify({
+          event: 'tls_listening',
+          host: address.address,
+          port: address.port,
+          serverBundle: config.serverBundlePath,
+          serverCert: config.serverCertPath,
+          caCert: config.caCertPath,
+          crl: config.crlPath
+        }));
+      });
+    }
 
-  if (localServer) {
-    localServer.listen(() => {
-      const address = localServer.address();
+    if (localServer) {
+      localServer.listen(() => {
+        const address = localServer.address();
+        console.log(JSON.stringify({
+          event: 'local_listening',
+          host: address.address,
+          port: address.port
+        }));
+      });
+    }
+
+    statusServer.listen(config.statusPort, config.host, () => {
+      const address = statusServer.address();
       console.log(JSON.stringify({
-        event: 'local_listening',
+        event: 'status_listening',
         host: address.address,
         port: address.port
       }));
     });
-  }
+  };
 
-  statusServer.listen(config.statusPort, config.host, () => {
-    const address = statusServer.address();
-    console.log(JSON.stringify({
-      event: 'status_listening',
-      host: address.address,
-      port: address.port
-    }));
-  });
+  if (udpDataPlane) {
+    udpDataPlane.listen((error) => {
+      if (error) {
+        console.log(JSON.stringify({
+          event: 'udp_disabled',
+          code: error.code,
+          message: error.message
+        }));
+      }
+      startListeners();
+    });
+  } else {
+    startListeners();
+  }
 
   return {
     fabric,
