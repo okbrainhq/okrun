@@ -137,7 +137,23 @@ async function startServer(certs, options = {}) {
     '--init-timeout-ms',
     String(options.initTimeoutMs ?? 1000),
     '--mac-ttl-ms',
-    String(options.macTtlMs ?? 60000)
+    String(options.macTtlMs ?? 60000),
+    ...(options.udpEnabled === false ? [
+      '--udp-enabled',
+      'false'
+    ] : []),
+    ...(options.udpPort != null ? [
+      '--udp-port',
+      String(options.udpPort)
+    ] : []),
+    ...(options.udpMtu != null ? [
+      '--udp-mtu',
+      String(options.udpMtu)
+    ] : []),
+    ...(options.udpInitialMbps != null ? [
+      '--udp-initial-mbps',
+      String(options.udpInitialMbps)
+    ] : [])
   ];
 
   const child = spawn(NODE, args, {

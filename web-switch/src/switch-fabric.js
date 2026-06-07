@@ -371,13 +371,26 @@ function validateInit(init, serverMaxFrameSize) {
     );
   }
 
+  const capabilities = Array.isArray(init.capabilities)
+    ? init.capabilities.filter((capability) => typeof capability === 'string')
+    : [];
+  const transportPreference = ['tcp', 'udp', 'auto'].includes(init.transportPreference)
+    ? init.transportPreference
+    : 'tcp';
+  const clientRandom = typeof init.clientRandom === 'string'
+    ? init.clientRandom
+    : null;
+
   return {
     protocol: init.protocol,
     nodeID: init.nodeID.toLowerCase(),
     networkIdentifier: init.networkIdentifier,
     interfaceName,
     maxFrameSize,
-    dhcpRange: parseDhcpRange(init.dhcpRange)
+    dhcpRange: parseDhcpRange(init.dhcpRange),
+    capabilities,
+    transportPreference,
+    clientRandom
   };
 }
 

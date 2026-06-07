@@ -4,9 +4,12 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
+const crypto = require('node:crypto');
+
 const { SwitchLocalServer, SwitchTLSServer } = require('./tls-server');
 const { SwitchFabric } = require('./switch-fabric');
 const { DEFAULT_MAX_FRAME_SIZE } = require('./protocol');
+const { SwitchUDPDataPlane } = require('./udp-data-plane');
 
 function parseArgs(argv) {
   const args = {};
@@ -46,6 +49,18 @@ function optionalNumberOption(value, name) {
   }
 
   return numberOption(value, null, name);
+}
+
+function floatOption(value, fallback, name) {
+  if (value == null || value === '') {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative number`);
+  }
+  return parsed;
 }
 
 function booleanOption(value, fallback, name) {
@@ -176,6 +191,71 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
       args['max-pending-bytes'] ?? env.OKRUN_SWITCH_MAX_PENDING_BYTES,
       4 * 1024 * 1024,
       'max-pending-bytes'
+    ),
+    udpEnabled: booleanOption(
+      args['udp-enabled'] ?? env.OKRUN_SWITCH_UDP_ENABLED,
+      tlsEnabled,
+      'udp-enabled'
+    ),
+    udpPort: numberOption(
+      args['udp-port'] ?? env.OKRUN_SWITCH_UDP_PORT,
+      tlsPort ?? 9443,
+      'udp-port'
+    ),
+    udpMtu: numberOption(
+      args['udp-mtu'] ?? env.OKRUN_SWITCH_UDP_MTU,
+      1200,
+      'udp-mtu'
+    ),
+    udpMinMtu: numberOption(
+      args['udp-min-mtu'] ?? env.OKRUN_SWITCH_UDP_MIN_MTU,
+      1200,
+      'udp-min-mtu'
+    ),
+    udpMaxProbeMtu: numberOption(
+      args['udp-max-probe-mtu'] ?? env.OKRUN_SWITCH_UDP_MAX_PROBE_MTU,
+      1450,
+      'udp-max-probe-mtu'
+    ),
+    udpInitialMbps: floatOption(
+      args['udp-initial-mbps'] ?? env.OKRUN_SWITCH_UDP_INITIAL_MBPS,
+      10,
+      'udp-initial-mbps'
+    ),
+    udpMinMbps: floatOption(
+      args['udp-min-mbps'] ?? env.OKRUN_SWITCH_UDP_MIN_MBPS,
+      0.25,
+      'udp-min-mbps'
+    ),
+    udpMaxMbps: floatOption(
+      args['udp-max-mbps'] ?? env.OKRUN_SWITCH_UDP_MAX_MBPS,
+      0,
+      'udp-max-mbps'
+    ),
+    udpQueueBytes: numberOption(
+      args['udp-queue-bytes'] ?? env.OKRUN_SWITCH_UDP_QUEUE_BYTES,
+      4 * 1024 * 1024,
+      'udp-queue-bytes'
+    ),
+    udpReassemblySessionBytes: numberOption(
+      args['udp-reassembly-session-bytes'] ?? env.OKRUN_SWITCH_UDP_REASSEMBLY_SESSION_BYTES,
+      1024 * 1024,
+      'udp-reassembly-session-bytes'
+    ),
+    udpReassemblyGlobalBytes: numberOption(
+      args['udp-reassembly-global-bytes'] ?? env.OKRUN_SWITCH_UDP_REASSEMBLY_GLOBAL_BYTES,
+      64 * 1024 * 1024,
+      'udp-reassembly-global-bytes'
+    ),
+    udpRecvBufferBytes: numberOption(
+      args['udp-recv-buffer-bytes'] ?? env.OKRUN_SWITCH_UDP_RECV_BUFFER_BYTES,
+      4 * 1024 * 1024,
+      'udp-recv-buffer-bytes'
+    ),
+    udpSendBufferBytes: numberOption(
+      args['udp-send-buffer-bytes'] ?? env.OKRUN_SWITCH_UDP_SEND_BUFFER_BYTES,
+      4 * 1024 * 1024,
+      'udp-send-buffer-bytes'
     )
   };
 }
@@ -198,7 +278,22 @@ function requiredBundleString(bundle, key, file) {
   return value;
 }
 
-function createStatusServer(fabric) {
+function serverIdentity(config) {
+  let certificate = config.serverCertPem;
+  if (!certificate && config.serverCertPath) {
+    try {
+      certificate = fs.readFileSync(config.serverCertPath);
+    } catch (_) {
+      certificate = null;
+    }
+  }
+  if (!certificate) {
+    return 'server';
+  }
+  return crypto.createHash('sha256').update(certificate).digest('hex');
+}
+
+function createStatusServer(fabric, udpDataPlane = null) {
   return http.createServer((request, response) => {
     if (request.url === '/healthz') {
       response.writeHead(200, { 'content-type': 'text/plain' });
@@ -207,8 +302,12 @@ function createStatusServer(fabric) {
     }
 
     if (request.url === '/status') {
+      const status = fabric.status();
+      status.udp = udpDataPlane
+        ? udpDataPlane.status()
+        : { enabled: false };
       response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(`${JSON.stringify(fabric.status())}\n`);
+      response.end(`${JSON.stringify(status)}\n`);
       return;
     }
 
@@ -228,10 +327,36 @@ function start(config) {
     rateLimitUnknownUnicastFramesPerSecond: config.rateLimitUnknownUnicastFramesPerSecond
   });
 
+  const udpDataPlane = config.udpEnabled && config.tlsEnabled !== false
+    ? new SwitchUDPDataPlane({
+      enabled: true,
+      host: config.host,
+      port: config.udpPort,
+      mtu: config.udpMtu,
+      minMtu: config.udpMinMtu,
+      maxProbeMtu: config.udpMaxProbeMtu,
+      initialMbps: config.udpInitialMbps,
+      minMbps: config.udpMinMbps,
+      maxMbps: config.udpMaxMbps,
+      queueBytes: config.udpQueueBytes,
+      reassemblySessionBytes: config.udpReassemblySessionBytes,
+      reassemblyGlobalBytes: config.udpReassemblyGlobalBytes,
+      recvBufferBytes: config.udpRecvBufferBytes,
+      sendBufferBytes: config.udpSendBufferBytes,
+      serverIdentity: serverIdentity(config),
+      logger: console
+    })
+    : null;
+
+  if (udpDataPlane) {
+    udpDataPlane.listen();
+  }
+
   const tlsServer = config.tlsEnabled !== false
     ? new SwitchTLSServer({
       ...config,
-      fabric
+      fabric,
+      udpDataPlane
     })
     : null;
 
@@ -242,7 +367,7 @@ function start(config) {
       fabric
     });
 
-  const statusServer = createStatusServer(fabric);
+  const statusServer = createStatusServer(fabric, udpDataPlane);
 
   if (tlsServer) {
     tlsServer.listen(() => {
@@ -285,7 +410,7 @@ function start(config) {
     localServer,
     statusServer,
     close(callback) {
-      const servers = [tlsServer, localServer, statusServer].filter(Boolean);
+      const servers = [tlsServer, localServer, statusServer, udpDataPlane].filter(Boolean);
       let pending = servers.length;
       if (pending === 0) {
         if (callback) {

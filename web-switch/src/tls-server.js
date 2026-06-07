@@ -75,7 +75,8 @@ class SwitchTLSServer {
       maxFrameSize: options.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE,
       maxPendingWrites: options.maxPendingWrites ?? 256,
       maxPendingBytes: options.maxPendingBytes ?? 4 * 1024 * 1024,
-      logger: options.logger ?? console
+      logger: options.logger ?? console,
+      udpDataPlane: options.udpDataPlane ?? null
     };
 
     this.fabric = options.fabric ?? new SwitchFabric({
@@ -151,7 +152,8 @@ class SwitchTLSServer {
       identity,
       fabric: this.fabric,
       options: this.options,
-      logger: this.options.logger
+      logger: this.options.logger,
+      udpDataPlane: this.options.udpDataPlane
     });
     connection.start();
   }
@@ -236,12 +238,13 @@ class SwitchLocalServer {
 }
 
 class SwitchConnection {
-  constructor({ socket, identity, fabric, options, logger }) {
+  constructor({ socket, identity, fabric, options, logger, udpDataPlane = null }) {
     this.socket = socket;
     this.identity = identity;
     this.fabric = fabric;
     this.options = options;
     this.logger = logger;
+    this.udpDataPlane = udpDataPlane;
     this.decoder = new FrameDecoder({ maxPayloadLength: options.maxFrameSize });
     this.initialized = false;
     this.closed = false;
@@ -259,6 +262,7 @@ class SwitchConnection {
     this.pendingWrites = [];
     this.pendingWriteBytes = 0;
     this.droppedWrites = 0;
+    this.udpSession = null;
   }
 
   start() {
@@ -383,7 +387,11 @@ class SwitchConnection {
     clearTimeout(this.initTimer);
     this.initTimer = null;
 
-    this.sendEncodedFrame(encodeJsonFrame(FrameType.INIT, {
+    if (this.udpDataPlane) {
+      this.udpSession = this.udpDataPlane.createSession(this, result.init);
+    }
+
+    const ackPayload = {
       protocol: 'okrun-switch/1',
       maxFrameSize: this.negotiatedMaxFrameSize,
       maxConnectionsPerHost: this.fabric.maxConnectionsPerHost,
@@ -391,7 +399,12 @@ class SwitchConnection {
       keepaliveTimeoutMs: this.options.keepaliveTimeoutMs,
       networkMemberCount: result.memberCounts.networkMemberCount,
       localMemberCount: result.memberCounts.localMemberCount
-    }));
+    };
+    if (this.udpSession) {
+      ackPayload.dataPlane = this.udpSession.ackDataPlane();
+    }
+
+    this.sendEncodedFrame(encodeJsonFrame(FrameType.INIT, ackPayload));
 
     this.log('connect', {
       clientSerial: this.identity.clientSerial,
@@ -439,6 +452,13 @@ class SwitchConnection {
       this.attachDrainHandler();
     }
     return true;
+  }
+
+  writeDataFrame(payload, seqNo, encoded) {
+    if (this.udpSession?.ready && this.udpDataPlane?.sendData(this.udpSession, payload, seqNo)) {
+      return true;
+    }
+    return this.writeEncodedFrame(encoded);
   }
 
   sendEncodedFrame(encoded) {
@@ -554,6 +574,10 @@ class SwitchConnection {
     clearTimeout(this.initTimer);
     clearInterval(this.keepaliveTimer);
     this.clearPendingWrites();
+    if (this.udpSession && this.udpDataPlane) {
+      this.udpDataPlane.closeSession(this.udpSession);
+      this.udpSession = null;
+    }
     this.fabric.removeConnection(this);
 
     if (this.initialized) {

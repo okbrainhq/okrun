@@ -2300,6 +2300,7 @@ struct OkrunVMTests {
             credentialFingerprint: "bundle-b"
         )
         #expect(changedCredentials != switchConfig)
+        #expect(switchConfig.transportMode == .auto)
 
         let legacyJSON = """
         {
@@ -2313,6 +2314,7 @@ struct OkrunVMTests {
         """
         let legacySwitchConfig = try JSONDecoder().decode(PrivateNetworkSwitchConfig.self, from: Data(legacyJSON.utf8))
         #expect(legacySwitchConfig.credentialFingerprint == "")
+        #expect(legacySwitchConfig.transportMode == .tcp)
     }
 
     @Test

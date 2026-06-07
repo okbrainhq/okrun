@@ -2,6 +2,8 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const dgram = require('node:dgram');
 const fs = require('node:fs');
 
 const {
@@ -28,6 +30,14 @@ const {
 const { buildConfig } = require('../../src/index');
 const { SwitchFabric } = require('../../src/switch-fabric');
 const { SwitchConnection } = require('../../src/tls-server');
+const {
+  UdpPacketType,
+  deriveUDPKeys,
+  encodeUDPHeader,
+  encryptPacket,
+  parseUDPPacket,
+  decryptPacket
+} = require('../../src/udp-data-plane');
 
 const tests = [];
 let testCounter = 0;
@@ -122,6 +132,107 @@ async function closeAll(clients) {
   await sleep(50);
 }
 
+class TestUDPDataPlane {
+  constructor(tcpClient, dataPlane) {
+    this.tcpClient = tcpClient;
+    this.dataPlane = dataPlane;
+    this.sessionId = Buffer.from(dataPlane.sessionId, 'base64url');
+    this.keyId = dataPlane.keyId;
+    this.nextPacketNumber = 1n;
+    this.socket = dgram.createSocket('udp4');
+    this.messages = [];
+    this.waiters = [];
+    this.keys = deriveUDPKeys({
+      clientRandom: Buffer.from(tcpClient.clientRandom, 'base64url'),
+      serverRandom: Buffer.from(dataPlane.serverRandom, 'base64url'),
+      sessionId: this.sessionId,
+      keyId: dataPlane.keyId,
+      clientIdentity: dataPlane.clientIdentity,
+      serverIdentity: dataPlane.serverIdentity
+    });
+    this.socket.on('message', (message) => this.handleMessage(message));
+  }
+
+  bind() {
+    return new Promise((resolve, reject) => {
+      this.socket.once('error', reject);
+      this.socket.bind(0, '127.0.0.1', () => {
+        this.socket.off('error', reject);
+        resolve();
+      });
+    });
+  }
+
+  close() {
+    this.socket.close();
+  }
+
+  handleMessage(message) {
+    const parsed = parseUDPPacket(message);
+    assert.ok(parsed, 'expected a valid UDP data-plane packet');
+    const plaintext = decryptPacket(parsed, this.keys.s2c);
+    const decoded = { parsed, plaintext };
+    for (let index = 0; index < this.waiters.length; index += 1) {
+      const waiter = this.waiters[index];
+      if (waiter.predicate(decoded)) {
+        this.waiters.splice(index, 1);
+        clearTimeout(waiter.timer);
+        waiter.resolve(decoded);
+        return;
+      }
+    }
+    this.messages.push(decoded);
+  }
+
+  waitFor(predicate, timeoutMs = 1000, label = 'UDP packet') {
+    for (let index = 0; index < this.messages.length; index += 1) {
+      const message = this.messages[index];
+      if (predicate(message)) {
+        this.messages.splice(index, 1);
+        return Promise.resolve(message);
+      }
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), timeoutMs);
+      this.waiters.push({ predicate, resolve, reject, timer });
+    });
+  }
+
+  send(type, plaintext, fragment = {}) {
+    const packetNumber = this.nextPacketNumber;
+    this.nextPacketNumber += 1n;
+    const header = encodeUDPHeader({
+      type,
+      keyId: this.keyId,
+      sessionId: this.sessionId,
+      packetNumber,
+      fragmentId: fragment.fragmentId ?? 0,
+      fragmentIndex: fragment.fragmentIndex ?? 0,
+      fragmentCount: fragment.fragmentCount ?? 0
+    });
+    const encrypted = encryptPacket(header, plaintext, this.keys.c2s, packetNumber);
+    const packet = Buffer.concat([header, encrypted.ciphertext, encrypted.authTag]);
+    this.socket.send(packet, this.dataPlane.udpPort, '127.0.0.1');
+    return packet;
+  }
+
+  async probe() {
+    this.send(UdpPacketType.PROBE, crypto.randomBytes(8));
+    await this.waitFor(
+      ({ parsed }) => parsed.type === UdpPacketType.PROBE_ACK,
+      1000,
+      'UDP PROBE_ACK'
+    );
+  }
+
+  sendData(payload, seqNo = 1) {
+    const plaintext = Buffer.alloc(4 + payload.length);
+    plaintext.writeUInt32BE(seqNo >>> 0, 0);
+    payload.copy(plaintext, 4);
+    this.send(UdpPacketType.DATA, plaintext);
+  }
+}
+
 test('valid mTLS client can INIT and join', async ({ server, certs }) => {
   const a = client(server, certs, 'hostA', {
     networkIdentifier: networkName('valid-init')
@@ -153,6 +264,83 @@ test('web switch default host remains public-listener friendly', async () => {
   const config = buildConfig([], {});
   assert.equal(config.host, '0.0.0.0');
   assert.equal(config.tlsEnabled, true);
+});
+
+test('TLS Web Switch enables UDP transport by default', async () => {
+  const config = buildConfig([], {});
+  assert.equal(config.udpEnabled, true);
+  assert.equal(config.udpPort, config.tlsPort);
+  assert.equal(config.udpMtu, 1200);
+  assert.equal(config.udpInitialMbps, 10);
+});
+
+test('local-only switch does not enable UDP data plane by default', async () => {
+  const config = buildConfig(['--tls-enabled', 'false', '--local-port', '9444'], {});
+  assert.equal(config.udpEnabled, false);
+});
+
+test('UDP-capable clients negotiate, probe, and exchange encrypted DATA', async ({ certs }) => {
+  const udpServer = await startServer(certs);
+  const net = networkName('udp-data');
+  const a = client(udpServer, certs, 'hostA', {
+    name: 'udp-a',
+    networkIdentifier: net,
+    udpPreference: 'auto'
+  });
+  const b = client(udpServer, certs, 'hostB', {
+    name: 'udp-b',
+    networkIdentifier: net
+  });
+  let udp = null;
+
+  try {
+    const ack = await a.connect();
+    assert.equal(ack.dataPlane.selected, 'udp');
+    assert.equal(ack.dataPlane.cipher, 'aes-256-gcm');
+    assert.equal(ack.dataPlane.mtu, 1200);
+    await b.connect();
+
+    udp = new TestUDPDataPlane(a, ack.dataPlane);
+    await udp.bind();
+    await udp.probe();
+
+    const fromA = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:71:01', 'hello-over-udp');
+    udp.sendData(fromA, 101);
+    assert.deepEqual((await b.waitForData()).payload, fromA);
+
+    const fromB = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:71:02', 'server-to-udp-client');
+    b.sendData(fromB);
+    const udpData = await udp.waitFor(
+      ({ parsed }) => parsed.type === UdpPacketType.DATA,
+      1000,
+      'server UDP DATA'
+    );
+    assert.deepEqual(udpData.plaintext.subarray(4), fromB);
+  } finally {
+    if (udp) {
+      udp.close();
+    }
+    await closeAll([a, b]);
+    await udpServer.stop();
+  }
+});
+
+test('old clients keep TCP/TLS behavior when UDP server is enabled by default', async ({ certs }) => {
+  const udpServer = await startServer(certs);
+  const a = client(udpServer, certs, 'hostA', {
+    networkIdentifier: networkName('udp-old-client')
+  });
+
+  try {
+    const ack = await a.connect();
+    assert.equal(ack.dataPlane, undefined);
+    const status = await udpServer.status();
+    assert.equal(status.udp.enabled, true);
+    assert.equal(status.udp.activeSessions, 0);
+  } finally {
+    await closeAll([a]);
+    await udpServer.stop();
+  }
 });
 
 test('fabric rate-limits broadcast storms per host', async () => {

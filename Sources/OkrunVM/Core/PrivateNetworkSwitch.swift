@@ -233,6 +233,27 @@ struct PrivateNetworkSwitchEndpoint: Equatable {
     }
 }
 
+enum SwitchDataTransportMode: String, Codable, Equatable, CaseIterable {
+    case auto
+    case tcp
+    case udp
+
+    var transportPreference: String {
+        rawValue
+    }
+
+    var displayName: String {
+        switch self {
+        case .auto:
+            return "Auto"
+        case .tcp:
+            return "TCP/TLS Compatibility"
+        case .udp:
+            return "UDP Accelerated"
+        }
+    }
+}
+
 struct PrivateNetworkSwitchConfig: Codable, Equatable {
     var enabled: Bool
     var server: String
@@ -240,6 +261,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
     var clientCert: String
     var clientKey: String
     var credentialFingerprint: String
+    var transportMode: SwitchDataTransportMode
 
     enum CodingKeys: String, CodingKey {
         case enabled
@@ -248,6 +270,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         case clientCert
         case clientKey
         case credentialFingerprint
+        case transportMode
     }
 
     init(
@@ -256,7 +279,8 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         caCert: String = "",
         clientCert: String = "",
         clientKey: String = "",
-        credentialFingerprint: String = ""
+        credentialFingerprint: String = "",
+        transportMode: SwitchDataTransportMode = .auto
     ) {
         self.enabled = enabled
         self.server = server
@@ -264,6 +288,7 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         self.clientCert = clientCert
         self.clientKey = clientKey
         self.credentialFingerprint = credentialFingerprint
+        self.transportMode = transportMode
     }
 
     init(from decoder: Decoder) throws {
@@ -274,6 +299,8 @@ struct PrivateNetworkSwitchConfig: Codable, Equatable {
         clientCert = try container.decodeIfPresent(String.self, forKey: .clientCert) ?? ""
         clientKey = try container.decodeIfPresent(String.self, forKey: .clientKey) ?? ""
         credentialFingerprint = try container.decodeIfPresent(String.self, forKey: .credentialFingerprint) ?? ""
+        // Existing saved Web Switch configs predate UDP and must remain TCP/TLS-only until users opt in.
+        transportMode = try container.decodeIfPresent(SwitchDataTransportMode.self, forKey: .transportMode) ?? .tcp
     }
 
     func validated() throws -> PrivateNetworkSwitchConfig {
@@ -345,6 +372,7 @@ struct PrivateNetworkSwitchConnectionConfig: Equatable {
     var server: String
     var credentialFingerprint: String
     var security: SwitchConnectionSecurity
+    var transportMode: SwitchDataTransportMode
 
     static func webSwitch(_ config: PrivateNetworkSwitchConfig) throws -> PrivateNetworkSwitchConnectionConfig {
         let validated = try config.validated()
@@ -355,7 +383,8 @@ struct PrivateNetworkSwitchConnectionConfig: Equatable {
                 caCert: validated.caCert,
                 clientCert: validated.clientCert,
                 clientKey: validated.clientKey
-            ))
+            )),
+            transportMode: validated.transportMode
         )
     }
 
@@ -364,7 +393,8 @@ struct PrivateNetworkSwitchConnectionConfig: Equatable {
         return PrivateNetworkSwitchConnectionConfig(
             server: validated.server,
             credentialFingerprint: "",
-            security: .none
+            security: .none,
+            transportMode: .tcp
         )
     }
 
@@ -479,6 +509,8 @@ private struct SwitchInitPayload: Codable {
     var maxFrameSize: Int
     var dhcpRange: PrivateNetworkDHCPLeaseRange?
     var capabilities: [String]
+    var transportPreference: String?
+    var clientRandom: String?
 }
 
 private struct SwitchInitAckPayload: Codable {
@@ -489,6 +521,7 @@ private struct SwitchInitAckPayload: Codable {
     var keepaliveTimeoutMs: Int?
     var networkMemberCount: Int?
     var localMemberCount: Int?
+    var dataPlane: SwitchUDPDataPlaneAck?
 }
 
 private struct SwitchErrorPayload: Codable {
@@ -685,12 +718,8 @@ private final class VirtualSwitchSocket {
                 sequenceNumber: outgoingSequenceNumber,
                 payload: frame
             )
-            do {
-                SwitchDebug.log("queue DATA seq=\(outgoingSequenceNumber) bytes=\(frame.count)")
-                self.realSocket.sendEncoded(try SwitchFrameProtocol.encode(switchFrame))
-            } catch {
-                self.onStatusChange?(.failed, error.localizedDescription, 0, error.localizedDescription)
-            }
+            SwitchDebug.log("queue DATA seq=\(outgoingSequenceNumber) bytes=\(frame.count)")
+            self.realSocket.sendDataFrame(switchFrame)
         }
     }
 }
@@ -737,6 +766,9 @@ private final class RealSwitchSocket {
     private var clientKeepaliveTimeout = RealSwitchSocket.defaultLocalKeepaliveTimeout
     private var pathMonitor: NWPathMonitor?
     private var pathSnapshot: NetworkPathSnapshot?
+    private var udpClientRandom: Data?
+    private var udpDataPlane: SwitchUDPDataPlane?
+    private var lastMemberCount = 0
 
     init(
         identifier: String,
@@ -780,6 +812,7 @@ private final class RealSwitchSocket {
             cancelInitResponseTimeout()
             cancelClientKeepalive()
             stopNetworkPathMonitorOnQueue()
+            stopUDPDataPlaneOnQueue()
             connection?.cancel()
             connection = nil
             pendingWrites.removeAll()
@@ -792,9 +825,16 @@ private final class RealSwitchSocket {
         }
     }
 
+    func sendDataFrame(_ frame: SwitchFrame) {
+        queue.async { [weak self] in
+            self?.sendDataFrameOnQueue(frame)
+        }
+    }
+
     private func startOnQueue() {
         guard !stopped else { return }
         initialized = false
+        stopUDPDataPlaneOnQueue()
         maxFrameSize = SwitchFrame.defaultMaxFrameSize
         let keepaliveDefaults = defaultKeepaliveTiming
         clientKeepaliveInterval = keepaliveDefaults.interval
@@ -949,6 +989,7 @@ private final class RealSwitchSocket {
         cancelClientKeepalive()
         pendingWrites.removeAll()
         initialized = false
+        stopUDPDataPlaneOnQueue()
         if let activeConnection = connection {
             connection = nil
             activeConnection.cancel()
@@ -971,6 +1012,7 @@ private final class RealSwitchSocket {
         cancelClientKeepalive()
         pendingWrites.removeAll()
         initialized = false
+        stopUDPDataPlaneOnQueue()
         if let activeConnection = connection {
             connection = nil
             activeConnection.cancel()
@@ -1036,6 +1078,13 @@ private final class RealSwitchSocket {
     }
 
     private func sendInit() {
+        let udpCapable = shouldAttemptUDP
+        let clientRandom = udpCapable ? Data.randomBytes(count: 32) : nil
+        udpClientRandom = clientRandom
+        var capabilities = ["ethernet-frame"]
+        if udpCapable {
+            capabilities.append("udp-data-v1")
+        }
         let payload = SwitchInitPayload(
             protocol: "okrun-switch/1",
             nodeID: nodeID.uuidString,
@@ -1043,7 +1092,9 @@ private final class RealSwitchSocket {
             interface: interfaceName,
             maxFrameSize: maxFrameSize,
             dhcpRange: dhcpRange,
-            capabilities: ["ethernet-frame"]
+            capabilities: capabilities,
+            transportPreference: udpCapable ? config.transportMode.transportPreference : "tcp",
+            clientRandom: clientRandom?.base64URLEncodedString()
         )
 
         do {
@@ -1138,13 +1189,34 @@ private final class RealSwitchSocket {
                 )
                 onInitialized?()
                 startClientKeepaliveIfNeeded(ack: ack)
+                let connections = memberCount(network: ack.networkMemberCount, local: ack.localMemberCount)
+                lastMemberCount = connections
+                handleUDPDataPlaneAck(ack, connections: connections)
                 flushPendingWrites()
-                report(
-                    .connected,
-                    "Connected to \(endpoint.description).",
-                    connections: memberCount(network: ack.networkMemberCount, local: ack.localMemberCount),
-                    error: nil
-                )
+                if udpDataPlane?.isReady == true {
+                    report(
+                        .connected,
+                        "UDP Accelerated to \(endpoint.description).",
+                        connections: connections,
+                        error: nil
+                    )
+                } else if shouldAttemptUDP, ack.dataPlane?.selected == "udp" {
+                    report(
+                        .connected,
+                        "Connected to \(endpoint.description). UDP probing.",
+                        connections: connections,
+                        error: nil
+                    )
+                } else {
+                    report(
+                        .connected,
+                        shouldAttemptUDP && config.transportMode == .auto
+                            ? "Connected to \(endpoint.description). TCP/TLS fallback."
+                            : "Connected to \(endpoint.description).",
+                        connections: connections,
+                        error: nil
+                    )
+                }
             } catch {
                 AppLog.webSwitch.error(
                     "invalid init ack network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
@@ -1188,12 +1260,93 @@ private final class RealSwitchSocket {
                   let update = try? JSONDecoder().decode(SwitchMemberUpdatePayload.self, from: frame.payload) else {
                 return
             }
+            let connections = memberCount(network: update.networkMemberCount, local: update.localMemberCount)
+            lastMemberCount = connections
             report(
                 .connected,
-                "Connected to \(endpoint.description).",
-                connections: memberCount(network: update.networkMemberCount, local: update.localMemberCount),
+                udpDataPlane?.isReady == true
+                    ? "UDP Accelerated to \(endpoint.description)."
+                    : "Connected to \(endpoint.description).",
+                connections: connections,
                 error: nil
             )
+        }
+    }
+
+    private func handleUDPDataPlaneAck(_ ack: SwitchInitAckPayload, connections: Int) {
+        guard shouldAttemptUDP else { return }
+        guard let dataPlane = ack.dataPlane, dataPlane.selected == "udp" else {
+            if config.transportMode == .udp, let connection {
+                closeConnection(
+                    connection,
+                    message: "Switch server did not provide a UDP data plane.",
+                    error: "UDP data plane unavailable.",
+                    retry: false
+                )
+            }
+            return
+        }
+        guard let clientRandom = udpClientRandom else { return }
+        do {
+            let udp = try SwitchUDPDataPlane(
+                identifier: identifier,
+                endpointHost: endpoint.host,
+                ack: dataPlane,
+                clientRandom: clientRandom,
+                mode: config.transportMode,
+                maxFrameSize: maxFrameSize,
+                queue: queue
+            )
+            udp.onFrame = { [weak self] frame in
+                guard let self, self.initialized else { return }
+                SwitchDebug.log("received UDP DATA bytes=\(frame.payload.count) seq=\(frame.sequenceNumber)")
+                self.onFrame?(frame)
+            }
+            udp.onReady = { [weak self] in
+                guard let self else { return }
+                self.report(
+                    .connected,
+                    "UDP Accelerated to \(self.endpoint.description).",
+                    connections: self.lastMemberCount,
+                    error: nil
+                )
+            }
+            udp.onFallback = { [weak self] message in
+                guard let self else { return }
+                self.report(
+                    .connected,
+                    message,
+                    connections: self.lastMemberCount,
+                    error: nil
+                )
+            }
+            udp.onFailed = { [weak self] message in
+                guard let self, let connection = self.connection else { return }
+                self.closeConnection(
+                    connection,
+                    message: message,
+                    error: message,
+                    retry: false
+                )
+            }
+            udpDataPlane = udp
+            udp.start()
+        } catch {
+            if config.transportMode == .udp, let connection {
+                closeConnection(
+                    connection,
+                    message: "Failed to start switch UDP data plane: \(error.localizedDescription)",
+                    error: error.localizedDescription,
+                    retry: false
+                )
+            } else {
+                report(
+                    .connected,
+                    "Connected to \(endpoint.description). TCP/TLS fallback: \(error.localizedDescription)",
+                    connections: connections,
+                    error: nil
+                )
+            }
         }
     }
 
@@ -1235,6 +1388,38 @@ private final class RealSwitchSocket {
         }
         SwitchDebug.log("write encoded bytes=\(data.count)")
         sendNow(data)
+    }
+
+    private func sendDataFrameOnQueue(_ frame: SwitchFrame) {
+        guard initialized else {
+            do {
+                let encoded = try SwitchFrameProtocol.encode(frame)
+                SwitchDebug.log("buffer DATA bytes=\(frame.payload.count) until INIT ACK")
+                if !pendingWrites.append(encoded) {
+                    SwitchDebug.log("drop pending DATA bytes=\(frame.payload.count) reason=buffer-full")
+                }
+            } catch {
+                report(.failed, error.localizedDescription, connections: 0, error: error.localizedDescription)
+            }
+            return
+        }
+
+        if udpDataPlane?.sendData(frame) == true {
+            SwitchDebug.log("write UDP DATA bytes=\(frame.payload.count) seq=\(frame.sequenceNumber)")
+            return
+        }
+
+        guard config.transportMode != .udp else {
+            SwitchDebug.log("drop DATA bytes=\(frame.payload.count) reason=udp-not-ready")
+            return
+        }
+
+        do {
+            SwitchDebug.log("write TCP DATA bytes=\(frame.payload.count) seq=\(frame.sequenceNumber)")
+            sendNow(try SwitchFrameProtocol.encode(frame))
+        } catch {
+            report(.failed, error.localizedDescription, connections: initialized ? 1 : 0, error: error.localizedDescription)
+        }
     }
 
     private func flushPendingWrites() {
@@ -1374,9 +1559,24 @@ private final class RealSwitchSocket {
         }
     }
 
+    private func stopUDPDataPlaneOnQueue() {
+        udpDataPlane?.stop()
+        udpDataPlane = nil
+        udpClientRandom = nil
+    }
+
     private static func seconds(fromMilliseconds milliseconds: Int?, fallback: TimeInterval) -> TimeInterval {
         guard let milliseconds, milliseconds > 0 else { return fallback }
         return TimeInterval(milliseconds) / 1000
+    }
+
+    private var shouldAttemptUDP: Bool {
+        switch config.security {
+        case .tls:
+            return config.transportMode != .tcp
+        case .none:
+            return false
+        }
     }
 
     private var connectionTimeout: TimeInterval {
@@ -1418,6 +1618,7 @@ private final class RealSwitchSocket {
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
         cancelClientKeepalive()
+        stopUDPDataPlaneOnQueue()
         connection = nil
         activeConnection.cancel()
 
@@ -1440,6 +1641,7 @@ private final class RealSwitchSocket {
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
         cancelClientKeepalive()
+        stopUDPDataPlaneOnQueue()
         connection = nil
         activeConnection.cancel()
 

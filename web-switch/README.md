@@ -132,6 +132,39 @@ OKRUN_SWITCH_MAX_PENDING_BYTES=4194304
 Set a rate limit to `0` to disable that specific limiter. Dropped frames and
 drop reasons are included in `/status` per host.
 
+## UDP Accelerated Transport
+
+Web Switch negotiates an encrypted UDP data plane for Ethernet `DATA` frames
+when a client opts in, while keeping the existing TCP/TLS connection as the
+control plane and compatibility fallback.
+
+UDP is enabled by default whenever the mTLS listener is enabled, so the server
+needs no extra enable flag. By default it listens on the same numeric port as
+TLS. Tune it, or disable it explicitly, with:
+
+```bash
+OKRUN_SWITCH_UDP_ENABLED=false
+OKRUN_SWITCH_UDP_PORT=9443
+OKRUN_SWITCH_UDP_MTU=1200
+OKRUN_SWITCH_UDP_MIN_MTU=1200
+OKRUN_SWITCH_UDP_MAX_PROBE_MTU=1450
+OKRUN_SWITCH_UDP_INITIAL_MBPS=10
+OKRUN_SWITCH_UDP_MIN_MBPS=0.25
+OKRUN_SWITCH_UDP_MAX_MBPS=0
+OKRUN_SWITCH_UDP_QUEUE_BYTES=4194304
+OKRUN_SWITCH_UDP_REASSEMBLY_SESSION_BYTES=1048576
+OKRUN_SWITCH_UDP_REASSEMBLY_GLOBAL_BYTES=67108864
+OKRUN_SWITCH_UDP_RECV_BUFFER_BYTES=4194304
+OKRUN_SWITCH_UDP_SEND_BUFFER_BYTES=4194304
+```
+
+New clients advertise `udp-data-v1` in `INIT` and receive a `dataPlane` block in
+`INIT` ACK when UDP is available. The UDP path uses AES-256-GCM with keys derived
+from random material exchanged over the authenticated TLS control channel. UDP
+packets include replay protection, endpoint validation, token-bucket pacing,
+bounded queues, and bounded fragment reassembly. `/status` includes UDP socket,
+session, queue, reassembly, and drop counters when UDP is enabled.
+
 ## Deploying To A Linux VM
 
 Create the deploy config:

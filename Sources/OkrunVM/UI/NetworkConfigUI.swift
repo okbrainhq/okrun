@@ -316,6 +316,14 @@ extension AppDelegate {
         let switchEnabled = makeNetworkCheckbox("Web Switch", identifier: "okrun.network.switch.enabled")
         let switchServerField = makeNetworkField(identifier: "okrun.network.switch.server")
         setNetworkPlaceholder("switch.example.com:9443", on: switchServerField)
+        let switchTransportPopup = NSPopUpButton()
+        switchTransportPopup.translatesAutoresizingMaskIntoConstraints = false
+        switchTransportPopup.setAccessibilityIdentifier("okrun.network.switch.transport")
+        for mode in SwitchDataTransportMode.allCases {
+            switchTransportPopup.addItem(withTitle: mode.displayName)
+            switchTransportPopup.lastItem?.representedObject = mode.rawValue
+        }
+        switchTransportPopup.selectItem(withTitle: SwitchDataTransportMode.auto.displayName)
 
         let (bundleScroll, bundleTextView) = makeNetworkTextArea(
             identifier: "okrun.network.switch.bundle",
@@ -390,7 +398,8 @@ extension AppDelegate {
 
         let switchConnectionGrid = NSGridView(views: [
             [makeNetworkLabel("Enabled"), switchEnabled],
-            [makeNetworkLabel("Server URL"), switchServerField]
+            [makeNetworkLabel("Server URL"), switchServerField],
+            [makeNetworkLabel("Data Transport"), switchTransportPopup]
         ])
         configureNetworkGrid(switchConnectionGrid)
         let switchBundleGrid = NSGridView(views: [
@@ -486,6 +495,7 @@ extension AppDelegate {
             hostSSHAllowedPortsView.setEditingEnabled(hostSSHOn)
             localSwitchServerField.isEnabled = localSwitchOn
             switchServerField.isEnabled = switchOn
+            switchTransportPopup.isEnabled = switchOn
             bundleTextView.isEditable = true
             bundleTextView.isSelectable = true
             bundleTextView.textColor = networkTextAreaTextColor(enabled: true)
@@ -533,12 +543,14 @@ extension AppDelegate {
                 if let switchConfig = privateNetwork?.switch {
                     switchEnabled.state = switchConfig.enabled ? .on : .off
                     switchServerField.stringValue = switchConfig.server
+                    switchTransportPopup.selectItem(withTitle: switchConfig.transportMode.displayName)
                     loadedSwitchServer = switchConfig.server
                     bundleTextView.string = (try? readSavedSwitchBundleText()) ?? ""
                     loadedSwitchBundleText = normalizedSwitchBundleText(bundleTextView.string)
                 } else {
                     switchEnabled.state = .off
                     switchServerField.stringValue = ""
+                    switchTransportPopup.selectItem(withTitle: SwitchDataTransportMode.auto.displayName)
                     loadedSwitchServer = ""
                     bundleTextView.string = (try? readSavedSwitchBundleText()) ?? ""
                     loadedSwitchBundleText = normalizedSwitchBundleText(bundleTextView.string)
@@ -689,11 +701,20 @@ extension AppDelegate {
             ).validated(dhcp: dhcp)
         }
 
+        func selectedSwitchTransportMode() -> SwitchDataTransportMode {
+            if let rawValue = switchTransportPopup.selectedItem?.representedObject as? String,
+               let mode = SwitchDataTransportMode(rawValue: rawValue) {
+                return mode
+            }
+            return .auto
+        }
+
         func readSwitchConfig() throws -> PrivateNetworkSwitchConfig? {
             guard switchEnabled.state == .on else { return nil }
 
             let serverText = switchServerField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let bundleText = normalizedSwitchBundleText(bundleTextView.string)
+            let transportMode = selectedSwitchTransportMode()
             if bundleText.isEmpty {
                 if let saved = try store.load().privateNetworks[identifier]?.switch, saved.enabled {
                     let server = try normalizedSwitchServer(serverText.isEmpty ? saved.server : serverText)
@@ -705,7 +726,8 @@ extension AppDelegate {
                         caCert: saved.caCert,
                         clientCert: saved.clientCert,
                         clientKey: saved.clientKey,
-                        credentialFingerprint: saved.credentialFingerprint
+                        credentialFingerprint: saved.credentialFingerprint,
+                        transportMode: transportMode
                     ).validated()
                 }
                 throw AppError("Paste a Web Switch host bundle JSON before applying.")
@@ -723,7 +745,8 @@ extension AppDelegate {
                     caCert: saved.caCert,
                     clientCert: saved.clientCert,
                     clientKey: saved.clientKey,
-                    credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText)
+                    credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText),
+                    transportMode: transportMode
                 ).validated()
             }
 
@@ -757,7 +780,8 @@ extension AppDelegate {
                 caCert: paths.ca,
                 clientCert: paths.cert,
                 clientKey: paths.key,
-                credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText)
+                credentialFingerprint: switchCredentialFingerprint(bundleJSON: bundleText),
+                transportMode: transportMode
             )
             return try config.validated()
         }

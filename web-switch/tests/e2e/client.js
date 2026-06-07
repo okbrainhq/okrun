@@ -34,6 +34,9 @@ class TestSwitchClient extends EventEmitter {
     this.dhcpRange = options.dhcpRange;
     this.maxFrameSize = options.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE;
     this.autoPong = options.autoPong ?? true;
+    this.udpPreference = options.udpPreference ?? 'tcp';
+    this.clientRandom = options.clientRandom ?? crypto.randomBytes(32).toString('base64url');
+    this.initAck = null;
     this.decoder = new FrameDecoder({ maxPayloadLength: Math.max(this.maxFrameSize, DEFAULT_MAX_FRAME_SIZE) + 4096 });
     this.seqNo = 0;
     this.frames = [];
@@ -87,22 +90,33 @@ class TestSwitchClient extends EventEmitter {
   }
 
   async sendInit() {
-    this.writeFrame(encodeJsonFrame(FrameType.INIT, {
+    const capabilities = ['ethernet-frame'];
+    if (this.udpPreference !== 'tcp') {
+      capabilities.push('udp-data-v1');
+    }
+    const payload = {
       protocol: 'okrun-switch/1',
       nodeID: this.nodeID,
       networkIdentifier: this.networkIdentifier,
       interface: this.interfaceName,
       maxFrameSize: this.maxFrameSize,
       dhcpRange: this.dhcpRange,
-      capabilities: ['ethernet-frame']
-    }));
+      capabilities,
+      transportPreference: this.udpPreference
+    };
+    if (this.udpPreference !== 'tcp') {
+      payload.clientRandom = this.clientRandom;
+    }
+
+    this.writeFrame(encodeJsonFrame(FrameType.INIT, payload));
 
     const frame = await this.waitForFrame(
       (candidate) => candidate.type === FrameType.INIT,
       1000,
       'INIT ACK'
     );
-    return decodeJsonPayload(frame.payload);
+    this.initAck = decodeJsonPayload(frame.payload);
+    return this.initAck;
   }
 
   handleChunk(chunk) {

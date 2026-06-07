@@ -124,7 +124,10 @@ class HostSession {
     });
 
     for (const connection of this.dataConnectionOrder(sourceConnection)) {
-      if (connection.writeEncodedFrame(encoded)) {
+      const sent = typeof connection.writeDataFrame === 'function'
+        ? connection.writeDataFrame(payload, seqNo, encoded)
+        : connection.writeEncodedFrame(encoded);
+      if (sent) {
         return 1;
       }
     }

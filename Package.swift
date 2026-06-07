@@ -17,6 +17,7 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("Network"),
                 .linkedFramework("Security"),
+                .linkedFramework("CryptoKit"),
                 .linkedFramework("Virtualization")
             ]
         ),
@@ -26,6 +27,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("Network"),
                 .linkedFramework("Security"),
+                .linkedFramework("CryptoKit"),
                 .linkedFramework("Virtualization")
             ]
         )
