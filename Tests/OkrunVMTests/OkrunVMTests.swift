@@ -1858,6 +1858,141 @@ struct OkrunVMTests {
     }
 
     @Test
+    func hostSSHServiceProxiesWhitelistedHostPorts() throws {
+        let greeting = Data("HTTP/1.1 200 OK\r\n\r\n".utf8)
+        let server = try LoopbackTCPServer(greeting: greeting)
+        defer { server.stop() }
+
+        let collector = FrameCollector()
+        let config = PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: "10.77.0.2",
+            allowedPorts: [22, server.port]
+        )
+        let service = try PrivateNetworkHostSSHService(identifier: "host-port-test", config: config) { frame in
+            collector.append(frame)
+        }
+        defer { service.stop() }
+
+        let hostIP = try IPv4Address("10.77.0.2")
+        let clientIP = try IPv4Address("10.77.0.20")
+        let clientMAC: [UInt8] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x41]
+        let hostMAC = service.privateNetworkMACAddress.bytes
+        let clientPort: UInt16 = 40_124
+        let clientInitialSequence: UInt32 = 2_000
+
+        service.receivePrivateNetworkFrame(tcpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: hostMAC,
+            sourceIP: clientIP,
+            destinationIP: hostIP,
+            sourcePort: clientPort,
+            destinationPort: server.port,
+            sequenceNumber: clientInitialSequence,
+            acknowledgementNumber: 0,
+            flags: 0x02,
+            payload: Data()
+        ))
+
+        let synAck = try collector.waitForFrame(timeout: 1) { tcpFlags($0) == 0x12 }
+        let hostInitialSequence = try tcpSequenceNumber(synAck)
+        #expect(try tcpAcknowledgementNumber(synAck) == clientInitialSequence + 1)
+
+        service.receivePrivateNetworkFrame(tcpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: hostMAC,
+            sourceIP: clientIP,
+            destinationIP: hostIP,
+            sourcePort: clientPort,
+            destinationPort: server.port,
+            sequenceNumber: clientInitialSequence + 1,
+            acknowledgementNumber: hostInitialSequence + 1,
+            flags: 0x10,
+            payload: Data()
+        ))
+
+        let responseFrame = try collector.waitForFrame(timeout: 2) { frame in
+            (try? tcpPayload(frame)) == greeting
+        }
+        #expect(try tcpPayload(responseFrame) == greeting)
+
+        let clientPayload = Data("GET / HTTP/1.1\r\n\r\n".utf8)
+        service.receivePrivateNetworkFrame(tcpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: hostMAC,
+            sourceIP: clientIP,
+            destinationIP: hostIP,
+            sourcePort: clientPort,
+            destinationPort: server.port,
+            sequenceNumber: clientInitialSequence + 1,
+            acknowledgementNumber: hostInitialSequence + 1 + UInt32(greeting.count),
+            flags: 0x18,
+            payload: clientPayload
+        ))
+
+        #expect(try server.waitForReceived(clientPayload, timeout: 2))
+    }
+
+    @Test
+    func hostSSHServiceFallsBackToIPv6LoopbackForWhitelistedPorts() throws {
+        let greeting = Data("HTTP/1.1 200 OK\r\n\r\nipv6".utf8)
+        let server = try LoopbackTCPServer(greeting: greeting, usesIPv6Loopback: true)
+        defer { server.stop() }
+
+        let collector = FrameCollector()
+        let config = PrivateNetworkHostSSHConfig(
+            enabled: true,
+            ipAddress: "10.77.0.2",
+            allowedPorts: [server.port]
+        )
+        let service = try PrivateNetworkHostSSHService(identifier: "host-port-ipv6-test", config: config) { frame in
+            collector.append(frame)
+        }
+        defer { service.stop() }
+
+        let hostIP = try IPv4Address("10.77.0.2")
+        let clientIP = try IPv4Address("10.77.0.20")
+        let clientMAC: [UInt8] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x42]
+        let hostMAC = service.privateNetworkMACAddress.bytes
+        let clientPort: UInt16 = 40_125
+        let clientInitialSequence: UInt32 = 3_000
+
+        service.receivePrivateNetworkFrame(tcpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: hostMAC,
+            sourceIP: clientIP,
+            destinationIP: hostIP,
+            sourcePort: clientPort,
+            destinationPort: server.port,
+            sequenceNumber: clientInitialSequence,
+            acknowledgementNumber: 0,
+            flags: 0x02,
+            payload: Data()
+        ))
+
+        let synAck = try collector.waitForFrame(timeout: 1) { tcpFlags($0) == 0x12 }
+        let hostInitialSequence = try tcpSequenceNumber(synAck)
+
+        service.receivePrivateNetworkFrame(tcpFrame(
+            sourceMAC: clientMAC,
+            destinationMAC: hostMAC,
+            sourceIP: clientIP,
+            destinationIP: hostIP,
+            sourcePort: clientPort,
+            destinationPort: server.port,
+            sequenceNumber: clientInitialSequence + 1,
+            acknowledgementNumber: hostInitialSequence + 1,
+            flags: 0x10,
+            payload: Data()
+        ))
+
+        let responseFrame = try collector.waitForFrame(timeout: 2) { frame in
+            (try? tcpPayload(frame)) == greeting
+        }
+        #expect(try tcpPayload(responseFrame) == greeting)
+    }
+
+    @Test
     func hostSSHServiceAnswersMDNSHostnameQueries() throws {
         let collector = FrameCollector()
         let config = PrivateNetworkHostSSHConfig(
@@ -1960,6 +2095,7 @@ struct OkrunVMTests {
         let hostSSH = try PrivateNetworkHostSSHConfig(
             enabled: true,
             ipAddress: "10.77.0.20",
+            allowedPorts: [8080, 22, 8080],
             hostname: "Test Mac.local"
         ).validated(dhcp: dhcp)
         try store.save(HostNetworkConfig(version: 1, privateNetworks: [
@@ -1968,9 +2104,20 @@ struct OkrunVMTests {
 
         #expect(try store.hostSSHConfigForPrivateNetwork(identifier: "okrun") == hostSSH)
         #expect(hostSSH.hostname == "test-mac")
+        #expect(hostSSH.allowedPorts == [22, 8080])
+        #expect(hostSSH.targetPort(forHostPort: 8080) == 8080)
+        #expect(hostSSH.targetPort(forHostPort: 443) == nil)
+        #expect(try PrivateNetworkHostSSHConfig.parseAllowedPorts("3000, 8080\n22") == [22, 3000, 8080])
+        #expect(PrivateNetworkHostSSHConfig.formatAllowedPorts(hostSSH.allowedPorts) == "22, 8080")
         #expect(try PrivateNetworkHostSSHConfig.defaultIPAddress(dhcp: dhcp) == "10.77.0.20")
         #expect(throws: (any Error).self) {
             _ = try PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.2").validated(dhcp: dhcp)
+        }
+        #expect(throws: (any Error).self) {
+            _ = try PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.20", allowedPorts: [0]).validated(dhcp: dhcp)
+        }
+        #expect(throws: (any Error).self) {
+            _ = try PrivateNetworkHostSSHConfig.parseAllowedPorts("22, nope")
         }
     }
 
@@ -2049,6 +2196,7 @@ struct OkrunVMTests {
                 hostSSH: PrivateNetworkHostSSHConfig(
                     enabled: true,
                     ipAddress: "",
+                    allowedPorts: [22, 8080],
                     hostname: "Test Mac.local"
                 )
             ),
@@ -2068,6 +2216,7 @@ struct OkrunVMTests {
         #expect(service.identifier == "okrun")
         #expect(service.hostSSHConfig.ipAddress == "10.77.0.20")
         #expect(service.hostSSHConfig.hostname == "test-mac")
+        #expect(service.hostSSHConfig.allowedPorts == [22, 8080])
         #expect(service.localSwitchConfig == localSwitchConfig)
         #expect(service.switchConfig == switchConfig)
         #expect(service.dhcpRange == expectedDHCPRange)
@@ -2510,9 +2659,9 @@ struct OkrunVMTests {
         private var isStopped = false
         private var received = Data()
 
-        init(greeting: Data) throws {
+        init(greeting: Data, usesIPv6Loopback: Bool = false) throws {
             self.greeting = greeting
-            descriptor = socket(AF_INET, SOCK_STREAM, 0)
+            descriptor = socket(usesIPv6Loopback ? AF_INET6 : AF_INET, SOCK_STREAM, 0)
             let socketDescriptor = descriptor
             guard socketDescriptor >= 0 else {
                 throw AppError("Failed to create TCP test server socket: \(String(cString: strerror(errno))).")
@@ -2521,6 +2670,24 @@ struct OkrunVMTests {
             var one: Int32 = 1
             _ = setsockopt(socketDescriptor, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
 
+            if usesIPv6Loopback {
+                port = try Self.bindIPv6Loopback(socketDescriptor)
+            } else {
+                port = try Self.bindIPv4Loopback(socketDescriptor)
+            }
+
+            guard listen(socketDescriptor, 1) == 0 else {
+                let message = String(cString: strerror(errno))
+                close(socketDescriptor)
+                throw AppError("Failed to listen on TCP test server socket: \(message).")
+            }
+
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.acceptOneClient()
+            }
+        }
+
+        private static func bindIPv4Loopback(_ socketDescriptor: Int32) throws -> UInt16 {
             var address = sockaddr_in()
             address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
             address.sin_family = sa_family_t(AF_INET)
@@ -2538,11 +2705,6 @@ struct OkrunVMTests {
                 close(socketDescriptor)
                 throw AppError("Failed to bind TCP test server socket: \(message).")
             }
-            guard listen(socketDescriptor, 1) == 0 else {
-                let message = String(cString: strerror(errno))
-                close(socketDescriptor)
-                throw AppError("Failed to listen on TCP test server socket: \(message).")
-            }
 
             var boundAddress = sockaddr_in()
             var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -2556,11 +2718,41 @@ struct OkrunVMTests {
                 close(socketDescriptor)
                 throw AppError("Failed to inspect TCP test server socket: \(message).")
             }
-            port = UInt16(bigEndian: boundAddress.sin_port)
+            return UInt16(bigEndian: boundAddress.sin_port)
+        }
 
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                self?.acceptOneClient()
+        private static func bindIPv6Loopback(_ socketDescriptor: Int32) throws -> UInt16 {
+            var address = sockaddr_in6()
+            address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            address.sin6_family = sa_family_t(AF_INET6)
+            address.sin6_port = in_port_t(0).bigEndian
+            address.sin6_addr = in6addr_loopback
+
+            var bindAddress = address
+            let bindResult = withUnsafePointer(to: &bindAddress) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(socketDescriptor, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                }
             }
+            guard bindResult == 0 else {
+                let message = String(cString: strerror(errno))
+                close(socketDescriptor)
+                throw AppError("Failed to bind TCP test server socket: \(message).")
+            }
+
+            var boundAddress = sockaddr_in6()
+            var boundLength = socklen_t(MemoryLayout<sockaddr_in6>.size)
+            let nameResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    getsockname(socketDescriptor, $0, &boundLength)
+                }
+            }
+            guard nameResult == 0 else {
+                let message = String(cString: strerror(errno))
+                close(socketDescriptor)
+                throw AppError("Failed to inspect TCP test server socket: \(message).")
+            }
+            return UInt16(bigEndian: boundAddress.sin6_port)
         }
 
         deinit {

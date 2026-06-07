@@ -39,12 +39,14 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
     static let defaultListenPort: UInt16 = 22
     static let defaultTargetHost = "127.0.0.1"
     static let defaultTargetPort: UInt16 = 22
+    static var defaultAllowedPorts: [UInt16] { [defaultListenPort] }
 
     var enabled: Bool
     var ipAddress: String
     var listenPort: UInt16
     var targetHost: String
     var targetPort: UInt16
+    var allowedPorts: [UInt16]
     var hostname: String
 
     enum CodingKeys: String, CodingKey {
@@ -53,6 +55,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         case listenPort
         case targetHost
         case targetPort
+        case allowedPorts
         case hostname
     }
 
@@ -62,6 +65,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         listenPort: UInt16 = Self.defaultListenPort,
         targetHost: String = Self.defaultTargetHost,
         targetPort: UInt16 = Self.defaultTargetPort,
+        allowedPorts: [UInt16]? = nil,
         hostname: String = Self.defaultHostname()
     ) {
         self.enabled = enabled
@@ -69,6 +73,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         self.listenPort = listenPort
         self.targetHost = targetHost
         self.targetPort = targetPort
+        self.allowedPorts = allowedPorts ?? [listenPort]
         self.hostname = hostname
     }
 
@@ -79,6 +84,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         listenPort = try container.decodeIfPresent(UInt16.self, forKey: .listenPort) ?? Self.defaultListenPort
         targetHost = try container.decodeIfPresent(String.self, forKey: .targetHost) ?? Self.defaultTargetHost
         targetPort = try container.decodeIfPresent(UInt16.self, forKey: .targetPort) ?? Self.defaultTargetPort
+        allowedPorts = try container.decodeIfPresent([UInt16].self, forKey: .allowedPorts) ?? [listenPort]
         hostname = try container.decodeIfPresent(String.self, forKey: .hostname) ?? Self.defaultHostname()
     }
 
@@ -96,6 +102,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         guard listenPort > 0, targetPort > 0 else {
             throw AppError("private network host SSH ports must be between 1 and 65535.")
         }
+        let normalizedAllowedPorts = try Self.normalizedAllowedPorts(allowedPorts)
         let normalizedHostname = try Self.normalizedHostname(hostname)
 
         if let dhcp {
@@ -110,6 +117,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
                     listenPort: listenPort,
                     targetHost: trimmedTargetHost,
                     targetPort: targetPort,
+                    allowedPorts: normalizedAllowedPorts,
                     hostname: normalizedHostname
                 )
             }
@@ -142,6 +150,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
             listenPort: listenPort,
             targetHost: trimmedTargetHost,
             targetPort: targetPort,
+            allowedPorts: normalizedAllowedPorts,
             hostname: normalizedHostname
         )
     }
@@ -156,6 +165,50 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
             }
             return try validated(dhcp: nil)
         }
+    }
+
+    func targetPort(forHostPort hostPort: UInt16) -> UInt16? {
+        guard allowedPorts.contains(hostPort) else { return nil }
+        return hostPort == listenPort ? targetPort : hostPort
+    }
+
+    static func parseAllowedPorts(_ rawValue: String) throws -> [UInt16] {
+        let parts = rawValue.split { character in
+            character == "," || character.isWhitespace
+        }
+        guard !parts.isEmpty else {
+            return defaultAllowedPorts
+        }
+
+        let ports = try parts.map { part -> UInt16 in
+            guard let port = UInt16(String(part)), port > 0 else {
+                throw AppError("private network host allowed ports must be between 1 and 65535.")
+            }
+            return port
+        }
+        return try normalizedAllowedPorts(ports)
+    }
+
+    static func formatAllowedPorts(_ ports: [UInt16]) -> String {
+        ports.map(String.init).joined(separator: ", ")
+    }
+
+    static func normalizedAllowedPorts(_ ports: [UInt16]) throws -> [UInt16] {
+        guard !ports.isEmpty else {
+            throw AppError("private network host allowed ports must include at least one port.")
+        }
+
+        var seen = Set<UInt16>()
+        var normalized: [UInt16] = []
+        for port in ports {
+            guard port > 0 else {
+                throw AppError("private network host allowed ports must be between 1 and 65535.")
+            }
+            if seen.insert(port).inserted {
+                normalized.append(port)
+            }
+        }
+        return normalized.sorted()
     }
 
     static func defaultIPAddress(dhcp: PrivateNetworkDHCPConfig) throws -> String {
@@ -459,6 +512,7 @@ final class HostNetworkConfigStore {
                 listenPort: legacyValidated.listenPort,
                 targetHost: legacyValidated.targetHost,
                 targetPort: legacyValidated.targetPort,
+                allowedPorts: legacyValidated.allowedPorts,
                 hostname: legacyValidated.hostname
             )
         }
@@ -479,6 +533,7 @@ final class HostNetworkConfigStore {
             listenPort: hostSSHConfig.listenPort,
             targetHost: hostSSHConfig.targetHost,
             targetPort: hostSSHConfig.targetPort,
+            allowedPorts: hostSSHConfig.allowedPorts,
             hostname: hostSSHConfig.hostname
         ).validated(dhcp: validatedDHCP)
     }

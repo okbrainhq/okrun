@@ -23,7 +23,7 @@ cd okrun
 The build script creates `OkrunVM.app`, copies the app resources, and ad-hoc
 signs the bundle with the virtualization entitlement needed for local use.
 
-Okrun runs on macOS 13 or later. New ASIF disks and ASIF imports require macOS
+Okrun runs on macOS 14 or later. New ASIF disks and ASIF imports require macOS
 26 Tahoe or later; older hosts use RAW disks.
 
 ## Run It
@@ -379,10 +379,12 @@ When both Local Switch and Web Switch are configured, Okrun uses Local Switch
 while it is connected and falls back to Web Switch if the local listener is not
 available.
 
-**Host SSH** lets VMs SSH back into the running Mac over the same private subnet.
-Enable it in **Private Network > Host** and leave the host IP blank to reserve
-the first available address from the DHCP range. DHCP stores that reservation and
-will not offer the host IP to VMs. From a VM, connect with the assigned address:
+**Host access** lets VMs connect back to whitelisted TCP ports on the running
+Mac over the same private subnet. Enable it in **Private Network > Host**, set
+the allowed port list (defaults to `22` for SSH), and leave the host IP blank to
+reserve the first available address from the DHCP range. DHCP stores that
+reservation and will not offer the host IP to VMs. From a VM, connect with the
+assigned address:
 
 ```sh
 ssh <mac-user>@<host-ssh-ip>
@@ -396,8 +398,10 @@ resolution can connect with:
 ssh <mac-user>@<hostname>.local
 ```
 
-This exposes only `127.0.0.1:22` through a user-space private-network endpoint;
-it does not create a macOS TAP/bridge interface.
+Only explicitly allowed localhost loopback TCP ports are exposed through the
+user-space private-network endpoint; it does not create a macOS TAP/bridge
+interface. Add ports such as `3000, 8080` to the allowed list when guests need
+to reach local host services on those ports.
 
 See [web-switch/README.md](web-switch/README.md) for full server deployment,
 certificate, revocation, and LaunchAgent setup.

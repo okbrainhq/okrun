@@ -931,8 +931,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
             for serviceConfig in serviceConfigs {
                 do {
                     try PrivateNetworkRuntimeRegistry.shared.configureStoredHostService(serviceConfig)
+                    let allowedPorts = PrivateNetworkHostSSHConfig.formatAllowedPorts(serviceConfig.hostSSHConfig.allowedPorts)
                     AppLog.lifecycle.info(
-                        "Started private network host mDNS service privateNetwork=\(serviceConfig.identifier, privacy: .public) hostname=\(serviceConfig.hostSSHConfig.hostname, privacy: .public) ip=\(serviceConfig.hostSSHConfig.ipAddress, privacy: .public)"
+                        "Started private network host service privateNetwork=\(serviceConfig.identifier, privacy: .public) hostname=\(serviceConfig.hostSSHConfig.hostname, privacy: .public) ip=\(serviceConfig.hostSSHConfig.ipAddress, privacy: .public) allowedPorts=\(allowedPorts, privacy: .public)"
                     )
                 } catch {
                     AppLog.lifecycle.warning(
