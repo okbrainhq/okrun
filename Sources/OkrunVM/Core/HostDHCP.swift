@@ -39,7 +39,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
     static let defaultListenPort: UInt16 = 22
     static let defaultTargetHost = "127.0.0.1"
     static let defaultTargetPort: UInt16 = 22
-    static var defaultAllowedPorts: [UInt16] { [defaultListenPort] }
+    static var defaultAllowedPorts: [UInt16] { [] }
 
     var enabled: Bool
     var ipAddress: String
@@ -73,7 +73,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
         self.listenPort = listenPort
         self.targetHost = targetHost
         self.targetPort = targetPort
-        self.allowedPorts = allowedPorts ?? [listenPort]
+        self.allowedPorts = allowedPorts ?? Self.defaultAllowedPorts
         self.hostname = hostname
     }
 
@@ -177,7 +177,7 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
             character == "," || character.isWhitespace
         }
         guard !parts.isEmpty else {
-            return defaultAllowedPorts
+            return []
         }
 
         let ports = try parts.map { part -> UInt16 in
@@ -194,10 +194,6 @@ struct PrivateNetworkHostSSHConfig: Codable, Equatable {
     }
 
     static func normalizedAllowedPorts(_ ports: [UInt16]) throws -> [UInt16] {
-        guard !ports.isEmpty else {
-            throw AppError("private network host allowed ports must include at least one port.")
-        }
-
         var seen = Set<UInt16>()
         var normalized: [UInt16] = []
         for port in ports {

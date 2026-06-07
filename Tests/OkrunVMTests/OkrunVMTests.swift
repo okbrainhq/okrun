@@ -1780,7 +1780,8 @@ struct OkrunVMTests {
         let config = PrivateNetworkHostSSHConfig(
             enabled: true,
             ipAddress: "10.77.0.2",
-            targetPort: server.port
+            targetPort: server.port,
+            allowedPorts: [22]
         )
         let service = try PrivateNetworkHostSSHService(identifier: "host-ssh-test", config: config) { frame in
             collector.append(frame)
@@ -2108,7 +2109,16 @@ struct OkrunVMTests {
         #expect(hostSSH.targetPort(forHostPort: 8080) == 8080)
         #expect(hostSSH.targetPort(forHostPort: 443) == nil)
         #expect(try PrivateNetworkHostSSHConfig.parseAllowedPorts("3000, 8080\n22") == [22, 3000, 8080])
+        #expect(try PrivateNetworkHostSSHConfig.parseAllowedPorts("") == [])
         #expect(PrivateNetworkHostSSHConfig.formatAllowedPorts(hostSSH.allowedPorts) == "22, 8080")
+        #expect(try PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.20").validated(dhcp: dhcp).allowedPorts == [])
+        let legacyHostSSH = try JSONDecoder().decode(
+            PrivateNetworkHostSSHConfig.self,
+            from: Data("""
+            {"enabled":true,"ipAddress":"10.77.0.20","listenPort":2222,"targetPort":22,"hostname":"legacy"}
+            """.utf8)
+        )
+        #expect(legacyHostSSH.allowedPorts == [2222])
         #expect(try PrivateNetworkHostSSHConfig.defaultIPAddress(dhcp: dhcp) == "10.77.0.20")
         #expect(throws: (any Error).self) {
             _ = try PrivateNetworkHostSSHConfig(enabled: true, ipAddress: "10.77.0.2").validated(dhcp: dhcp)
