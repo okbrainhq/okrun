@@ -105,7 +105,7 @@ final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
     private func handleIPv4Frame(_ bytes: [UInt8], sourceMAC: EthernetAddress) {
         if let packet = TCPPacket.parse(bytes, sourceMAC: sourceMAC),
            packet.destinationIP == hostIP,
-           packet.destinationPort == config.listenPort {
+           config.targetPort(forHostPort: packet.destinationPort) != nil {
             handleTCPPacket(packet)
             return
         }
@@ -192,34 +192,76 @@ final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
     }
 
     private func connectUpstream(for session: TCPSession) {
-        guard let port = NWEndpoint.Port(rawValue: config.targetPort) else {
+        guard let upstreamPort = config.targetPort(forHostPort: session.hostPort),
+              NWEndpoint.Port(rawValue: upstreamPort) != nil else {
+            failUpstream(for: session.key)
+            return
+        }
+
+        session.upstreamTargetHosts = upstreamTargetHosts(for: config.targetHost)
+        connectUpstream(for: session, targetIndex: 0)
+    }
+
+    private func connectUpstream(for session: TCPSession, targetIndex: Int) {
+        guard let upstreamPort = config.targetPort(forHostPort: session.hostPort),
+              let port = NWEndpoint.Port(rawValue: upstreamPort),
+              session.upstreamTargetHosts.indices.contains(targetIndex) else {
             failUpstream(for: session.key)
             return
         }
 
         let connection = NWConnection(
-            host: NWEndpoint.Host(config.targetHost),
+            host: NWEndpoint.Host(session.upstreamTargetHosts[targetIndex]),
             port: port,
             using: .tcp
         )
+        session.upstreamTargetIndex = targetIndex
         session.connection = connection
-        connection.stateUpdateHandler = { [weak self] state in
-            self?.handleConnectionState(state, key: session.key)
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let connection else { return }
+            self?.handleConnectionState(state, key: session.key, connection: connection)
         }
         connection.start(queue: queue)
     }
 
-    private func handleConnectionState(_ state: NWConnection.State, key: TCPSessionKey) {
-        guard let session = sessions[key] else { return }
+    private func handleConnectionState(_ state: NWConnection.State, key: TCPSessionKey, connection: NWConnection) {
+        guard let session = sessions[key], session.connection === connection else { return }
         switch state {
         case .ready:
             session.upstreamReady = true
             receiveFromUpstream(for: key)
             flushPendingClientData(for: session)
-        case .failed, .cancelled:
+        case .waiting, .failed, .cancelled:
+            guard !retryNextUpstreamTarget(for: session) else { return }
             failUpstream(for: key)
         default:
             break
+        }
+    }
+
+    private func retryNextUpstreamTarget(for session: TCPSession) -> Bool {
+        guard !session.upstreamReady else { return false }
+        let nextIndex = session.upstreamTargetIndex + 1
+        guard session.upstreamTargetHosts.indices.contains(nextIndex) else { return false }
+
+        session.connection?.stateUpdateHandler = nil
+        session.connection?.cancel()
+        session.connection = nil
+        connectUpstream(for: session, targetIndex: nextIndex)
+        return true
+    }
+
+    private func upstreamTargetHosts(for targetHost: String) -> [String] {
+        let trimmed = targetHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch trimmed.lowercased() {
+        case "localhost":
+            return ["::1", "127.0.0.1"]
+        case "127.0.0.1":
+            return ["127.0.0.1", "::1"]
+        case "::1":
+            return ["::1", "127.0.0.1"]
+        default:
+            return [trimmed]
         }
     }
 
@@ -464,6 +506,7 @@ final class PrivateNetworkHostSSHService: PrivateNetworkLocalEndpoint {
         bytes.append(contentsOf: key.clientMAC.bytes)
         appendUInt32ToBytes(key.clientIP.value, to: &bytes)
         appendUInt16ToBytes(key.clientPort, to: &bytes)
+        appendUInt16ToBytes(key.hostPort, to: &bytes)
         appendUInt32ToBytes(clientSequence, to: &bytes)
         return UInt32(truncatingIfNeeded: FNV1a64.hash(bytes))
     }
@@ -517,6 +560,8 @@ private final class TCPSession {
     var hostSequenceNumber: UInt32
     var state: TCPSessionState = .synReceived
     var upstreamReady = false
+    var upstreamTargetHosts: [String] = []
+    var upstreamTargetIndex = 0
     var pendingClientData: [Data] = []
     var pendingUpstreamData = Data()
     var connection: NWConnection?

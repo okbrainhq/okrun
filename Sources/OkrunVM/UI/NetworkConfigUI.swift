@@ -50,6 +50,205 @@ private final class NetworkConfigPanelActions: NSObject {
     }
 }
 
+private final class HostAllowedPortsView: NSView {
+    var onError: ((String) -> Void)?
+    var onChange: (() -> Void)?
+
+    private let controlWidth: CGFloat
+    private var ports: [UInt16] = []
+    private var chipButtons: [NSButton] = []
+    private var editingEnabled = true
+
+    private let portField = NSTextField(string: "")
+    private let addButton = NSButton(title: "Add", target: nil, action: nil)
+    private let chipsStack = NSStackView()
+
+    init(width: CGFloat) {
+        controlWidth = width
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        setupViews()
+        setPorts([])
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    func setPorts(_ newPorts: [UInt16]) {
+        ports = (try? PrivateNetworkHostSSHConfig.normalizedAllowedPorts(newPorts)) ?? []
+        rebuildChips()
+    }
+
+    func normalizedPorts() throws -> [UInt16] {
+        _ = try commitPendingPort()
+        return try PrivateNetworkHostSSHConfig.normalizedAllowedPorts(ports)
+    }
+
+    func setEditingEnabled(_ enabled: Bool) {
+        editingEnabled = enabled
+        portField.isEnabled = enabled
+        addButton.isEnabled = enabled
+        chipButtons.forEach { $0.isEnabled = enabled }
+        alphaValue = enabled ? 1 : 0.62
+    }
+
+    private func setupViews() {
+        portField.setAccessibilityIdentifier("okrun.network.host-ssh.allowed-port.input")
+        portField.translatesAutoresizingMaskIntoConstraints = false
+        portField.font = .systemFont(ofSize: 13)
+        portField.controlSize = .large
+        portField.textColor = NetworkConfigPalette.primaryText
+        portField.backgroundColor = NetworkConfigPalette.fieldBackground
+        portField.drawsBackground = true
+        portField.placeholderAttributedString = NSAttributedString(
+            string: "Port, e.g. 3000",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NetworkConfigPalette.disabledText
+            ]
+        )
+        portField.target = self
+        portField.action = #selector(addPort)
+
+        addButton.setAccessibilityIdentifier("okrun.network.host-ssh.allowed-port.add")
+        addButton.translatesAutoresizingMaskIntoConstraints = false
+        addButton.bezelStyle = .rounded
+        addButton.controlSize = .large
+        addButton.target = self
+        addButton.action = #selector(addPort)
+
+        let inputRow = NSStackView(views: [portField, addButton])
+        inputRow.translatesAutoresizingMaskIntoConstraints = false
+        inputRow.orientation = .horizontal
+        inputRow.alignment = .centerY
+        inputRow.spacing = 8
+
+        let inputContainer = NSView()
+        inputContainer.translatesAutoresizingMaskIntoConstraints = false
+        inputContainer.addSubview(inputRow)
+
+        chipsStack.setAccessibilityIdentifier("okrun.network.host-ssh.allowed-ports")
+        chipsStack.translatesAutoresizingMaskIntoConstraints = false
+        chipsStack.orientation = .vertical
+        chipsStack.alignment = .leading
+        chipsStack.spacing = 6
+
+        let stack = NSStackView(views: [inputContainer, chipsStack])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: controlWidth),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            inputContainer.widthAnchor.constraint(equalToConstant: controlWidth),
+            inputRow.leadingAnchor.constraint(equalTo: inputContainer.leadingAnchor),
+            inputRow.topAnchor.constraint(equalTo: inputContainer.topAnchor),
+            inputRow.bottomAnchor.constraint(equalTo: inputContainer.bottomAnchor),
+            inputRow.trailingAnchor.constraint(lessThanOrEqualTo: inputContainer.trailingAnchor),
+            portField.widthAnchor.constraint(equalToConstant: 142),
+            addButton.widthAnchor.constraint(equalToConstant: 72)
+        ])
+    }
+
+    @objc private func addPort() {
+        do {
+            if try commitPendingPort() {
+                onChange?()
+            }
+        } catch {
+            onError?(error.localizedDescription)
+        }
+    }
+
+    @objc private func removePort(_ sender: NSButton) {
+        guard editingEnabled else { return }
+        let port = UInt16(sender.tag)
+        ports.removeAll { $0 == port }
+        rebuildChips()
+        onChange?()
+    }
+
+    private func commitPendingPort() throws -> Bool {
+        let rawValue = portField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawValue.isEmpty else { return false }
+        guard let port = UInt16(rawValue), port > 0 else {
+            throw AppError("private network host allowed ports must be between 1 and 65535.")
+        }
+
+        let inserted = !ports.contains(port)
+        if inserted {
+            ports.append(port)
+            ports = try PrivateNetworkHostSSHConfig.normalizedAllowedPorts(ports)
+        }
+        portField.stringValue = ""
+        rebuildChips()
+        return inserted
+    }
+
+    private func rebuildChips() {
+        chipButtons.removeAll()
+        chipsStack.arrangedSubviews.forEach { view in
+            chipsStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        guard !ports.isEmpty else {
+            return
+        }
+
+        var currentButtons: [NSButton] = []
+        var currentWidth: CGFloat = 0
+        let spacing: CGFloat = 6
+        for port in ports {
+            let button = makePortChip(port)
+            let buttonWidth = button.fittingSize.width
+            let nextWidth = currentButtons.isEmpty ? buttonWidth : currentWidth + spacing + buttonWidth
+            if nextWidth > controlWidth, !currentButtons.isEmpty {
+                chipsStack.addArrangedSubview(makeChipRow(currentButtons))
+                currentButtons = [button]
+                currentWidth = buttonWidth
+            } else {
+                currentButtons.append(button)
+                currentWidth = nextWidth
+            }
+            chipButtons.append(button)
+        }
+        if !currentButtons.isEmpty {
+            chipsStack.addArrangedSubview(makeChipRow(currentButtons))
+        }
+        setEditingEnabled(editingEnabled)
+    }
+
+    private func makePortChip(_ port: UInt16) -> NSButton {
+        let button = NSButton(title: "\(port)  ×", target: self, action: #selector(removePort(_:)))
+        button.tag = Int(port)
+        button.setAccessibilityIdentifier("okrun.network.host-ssh.allowed-port.\(port)")
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 12, weight: .medium)
+        button.contentTintColor = NetworkConfigPalette.primaryText
+        button.toolTip = "Remove port \(port)"
+        return button
+    }
+
+    private func makeChipRow(_ buttons: [NSButton]) -> NSStackView {
+        let row = NSStackView(views: buttons)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        return row
+    }
+}
+
 private struct SwitchCertificateBundle: Decodable {
     var server: String
     var caCertPem: String
@@ -97,11 +296,13 @@ extension AppDelegate {
         let rangeEndField = makeNetworkField(identifier: "okrun.network.dhcp.range-end")
         let leaseField = makeNetworkField(identifier: "okrun.network.dhcp.lease-seconds")
 
-        let hostSSHEnabled = makeNetworkCheckbox("Allow VMs to SSH into this Mac", identifier: "okrun.network.host-ssh.enabled")
+        let hostSSHEnabled = makeNetworkCheckbox("Allow VMs to access whitelisted host TCP ports", identifier: "okrun.network.host-ssh.enabled")
         let hostSSHIPAddressField = makeNetworkField(identifier: "okrun.network.host-ssh.ip-address")
         setNetworkPlaceholder("Auto-select from DHCP range", on: hostSSHIPAddressField)
         let hostSSHHostnameField = makeNetworkField(identifier: "okrun.network.host-ssh.hostname")
         setNetworkPlaceholder("Auto-use this Mac's hostname", on: hostSSHHostnameField)
+        let hostSSHHostnameRow = makeNetworkSuffixFieldRow(field: hostSSHHostnameField, suffix: ".local")
+        let hostSSHAllowedPortsView = HostAllowedPortsView(width: networkControlColumnWidth())
 
         let localSwitchEnabled = makeNetworkCheckbox("Local Switch", identifier: "okrun.network.local-switch.enabled")
         let localSwitchServerField = makeNetworkField(identifier: "okrun.network.local-switch.server")
@@ -161,18 +362,14 @@ extension AppDelegate {
             makeNetworkSettingsSection(title: "Lease Range", contentView: dhcpLeaseGrid)
         ])
 
-        let hostSSHGrid = NSGridView(views: [
-            [makeNetworkLabel("Enabled"), hostSSHEnabled],
-            [makeNetworkLabel("Host IP"), hostSSHIPAddressField],
-            [makeNetworkLabel("Hostname"), hostSSHHostnameField]
+        let hostSSHForm = makeNetworkFormStack([
+            makeNetworkFormRow(label: "Enabled", controlView: hostSSHEnabled),
+            makeNetworkFormRow(label: "Host IP", controlView: hostSSHIPAddressField),
+            makeNetworkFormRow(label: "Hostname", controlView: hostSSHHostnameRow),
+            makeNetworkFormRow(label: "Allowed Ports", controlView: hostSSHAllowedPortsView, alignsToTop: true)
         ])
-        configureNetworkGrid(hostSSHGrid)
-        let hostSSHHelp = makeNetworkHelpLabel(
-            "Exposes this Mac's 127.0.0.1:22 as a private-network host. Leave Host IP blank to reserve the first available DHCP-range address. Leave Hostname blank to use this Mac's hostname and answer <hostname>.local via mDNS."
-        )
         let hostSSHStack = makeNetworkSettingsStack([
-            makeNetworkSettingsSection(title: "Host SSH", contentView: hostSSHGrid),
-            hostSSHHelp
+            makeNetworkSettingsSection(title: "Host Access", contentView: hostSSHForm)
         ])
 
         let localSwitchConnectionGrid = NSGridView(views: [
@@ -259,10 +456,8 @@ extension AppDelegate {
         ])
 
         func setPanelMessage(_ message: String, isError: Bool = false) {
-            messageLabel.stringValue = message
-            messageLabel.textColor = isError
-                ? NetworkConfigPalette.errorText
-                : NetworkConfigPalette.secondaryText
+            messageLabel.stringValue = isError ? message : ""
+            messageLabel.textColor = NetworkConfigPalette.errorText
             messageBanner.layer?.backgroundColor = (isError
                 ? NetworkConfigPalette.errorBackground
                 : .clear
@@ -271,6 +466,10 @@ extension AppDelegate {
                 ? NetworkConfigPalette.errorBorder
                 : .clear
             ).cgColor
+        }
+
+        hostSSHAllowedPortsView.onError = { message in
+            setPanelMessage(message, isError: true)
         }
 
         func updateTransportControls() {
@@ -284,6 +483,7 @@ extension AppDelegate {
 
             hostSSHIPAddressField.isEnabled = hostSSHOn
             hostSSHHostnameField.isEnabled = hostSSHOn
+            hostSSHAllowedPortsView.setEditingEnabled(hostSSHOn)
             localSwitchServerField.isEnabled = localSwitchOn
             switchServerField.isEnabled = switchOn
             bundleTextView.isEditable = true
@@ -314,10 +514,12 @@ extension AppDelegate {
                     hostSSHEnabled.state = validatedHostSSH.enabled ? .on : .off
                     hostSSHIPAddressField.stringValue = validatedHostSSH.ipAddress
                     hostSSHHostnameField.stringValue = validatedHostSSH.hostname
+                    hostSSHAllowedPortsView.setPorts(validatedHostSSH.allowedPorts)
                 } else {
                     hostSSHEnabled.state = .off
                     hostSSHIPAddressField.stringValue = ""
                     hostSSHHostnameField.stringValue = ""
+                    hostSSHAllowedPortsView.setPorts(PrivateNetworkHostSSHConfig.defaultAllowedPorts)
                 }
 
                 if let localSwitchConfig = privateNetwork?.localSwitch {
@@ -473,9 +675,16 @@ extension AppDelegate {
             guard hostSSHEnabled.state == .on else { return nil }
             let ipAddress = hostSSHIPAddressField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let hostname = hostSSHHostnameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let allowedPorts = try hostSSHAllowedPortsView.normalizedPorts()
+            let savedHostSSH = try store.load().privateNetworks[identifier]?.hostSSH?.validatedForLoad(dhcp: dhcp)
+            hostSSHAllowedPortsView.setPorts(allowedPorts)
             return try PrivateNetworkHostSSHConfig(
                 enabled: true,
                 ipAddress: ipAddress,
+                listenPort: savedHostSSH?.listenPort ?? PrivateNetworkHostSSHConfig.defaultListenPort,
+                targetHost: savedHostSSH?.targetHost ?? PrivateNetworkHostSSHConfig.defaultTargetHost,
+                targetPort: savedHostSSH?.targetPort ?? PrivateNetworkHostSSHConfig.defaultTargetPort,
+                allowedPorts: allowedPorts,
                 hostname: hostname.isEmpty ? PrivateNetworkHostSSHConfig.defaultHostname() : hostname
             ).validated(dhcp: dhcp)
         }
@@ -614,6 +823,7 @@ extension AppDelegate {
                 if let hostSSHConfig = privateNetwork.hostSSH, hostSSHConfig.enabled {
                     hostSSHIPAddressField.stringValue = hostSSHConfig.ipAddress
                     hostSSHHostnameField.stringValue = hostSSHConfig.hostname
+                    hostSSHAllowedPortsView.setPorts(hostSSHConfig.allowedPorts)
                 }
                 let dhcpRange = try privateNetwork.dhcp.flatMap { dhcp -> PrivateNetworkDHCPLeaseRange? in
                     dhcp.enabled ? try PrivateNetworkDHCPLeaseRange(config: dhcp) : nil
@@ -663,9 +873,9 @@ extension AppDelegate {
         }
         actions.onHostSSHToggle = {
             if hostSSHEnabled.state == .on {
-                setPanelMessage("Host SSH enabled. Apply to reserve a DHCP-range host IP for this Mac.")
+                setPanelMessage("Host access enabled. Add TCP ports, then apply to reserve a DHCP-range host IP.")
             } else {
-                setPanelMessage("Host SSH disabled.")
+                setPanelMessage("Host access disabled.")
             }
             updateTransportControls()
         }
@@ -850,6 +1060,70 @@ extension AppDelegate {
         NetworkConfigPalette.primaryText
     }
 
+    private func makeNetworkSuffixFieldRow(field: NSTextField, suffix: String) -> NSStackView {
+        let suffixLabel = NSTextField(labelWithString: suffix)
+        suffixLabel.translatesAutoresizingMaskIntoConstraints = false
+        suffixLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        suffixLabel.textColor = NetworkConfigPalette.secondaryText
+        suffixLabel.setContentHuggingPriority(.required, for: .horizontal)
+        suffixLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let row = NSStackView(views: [field, suffixLabel])
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.widthAnchor.constraint(equalToConstant: networkControlColumnWidth()).isActive = true
+        return row
+    }
+
+    private func makeNetworkFormStack(_ rows: [NSView]) -> NSStackView {
+        let stack = NSStackView(views: rows)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 11
+        stack.widthAnchor.constraint(
+            equalToConstant: networkLabelColumnWidth() + 14 + networkControlColumnWidth()
+        ).isActive = true
+        return stack
+    }
+
+    private func makeNetworkFormRow(
+        label text: String,
+        controlView: NSView,
+        alignsToTop: Bool = false
+    ) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = makeNetworkLabel(text)
+        controlView.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(label)
+        row.addSubview(controlView)
+
+        var constraints: [NSLayoutConstraint] = [
+            row.widthAnchor.constraint(equalToConstant: networkLabelColumnWidth() + 14 + networkControlColumnWidth()),
+            label.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            label.widthAnchor.constraint(equalToConstant: networkLabelColumnWidth()),
+            controlView.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 14),
+            controlView.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            controlView.widthAnchor.constraint(equalToConstant: networkControlColumnWidth()),
+            controlView.topAnchor.constraint(equalTo: row.topAnchor),
+            controlView.bottomAnchor.constraint(equalTo: row.bottomAnchor)
+        ]
+        if alignsToTop {
+            constraints.append(label.topAnchor.constraint(equalTo: controlView.topAnchor, constant: 7))
+        } else {
+            constraints.append(label.centerYAnchor.constraint(equalTo: controlView.centerYAnchor))
+        }
+        NSLayoutConstraint.activate(constraints)
+        return row
+    }
+
     private func makeNetworkSettingsStack(_ sections: [NSView]) -> NSStackView {
         let stack = NSStackView(views: sections)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -891,7 +1165,13 @@ extension AppDelegate {
 
     private func makeNetworkTabItem(label: String, contentView: NSView) -> NSTabViewItem {
         let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
+        // NSTabView owns and positions the tab item view by setting its frame.
+        // Keep autoresizing masks enabled on this top-level view; disabling them
+        // lets AppKit re-apply the tab content offset during layout, which makes
+        // the selected tab's content drift down/right after button clicks.
+        container.translatesAutoresizingMaskIntoConstraints = true
+        container.autoresizingMask = [.width, .height]
+
         contentView.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(contentView)
         NSLayoutConstraint.activate([
@@ -930,6 +1210,9 @@ extension AppDelegate {
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = NetworkConfigPalette.secondaryText
+        label.alignment = .right
+        label.cell?.alignment = .right
+        label.lineBreakMode = .byTruncatingTail
         return label
     }
 
