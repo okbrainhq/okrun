@@ -596,7 +596,7 @@ struct OkrunVMTests {
         try encoder.encode(registry).write(to: legacyURL)
 
         let store = ProjectStore(url: root.appendingPathComponent(".okrun/registry.json"), legacyURL: legacyURL)
-        let loaded = try store.load(defaultProject: nil)
+        let loaded = try store.load()
 
         #expect(loaded == registry)
     }
@@ -1011,7 +1011,20 @@ struct OkrunVMTests {
     }
 
     @Test
-    func projectStoreCreatesAndNormalizesRegistry() throws {
+    func projectStoreCreatesEmptyRegistry() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+
+        let registryURL = root.appendingPathComponent(".okrun")
+        let store = ProjectStore(url: registryURL)
+
+        let createdRegistry = try store.load()
+        #expect(createdRegistry.projects.isEmpty)
+        #expect(createdRegistry.selectedProject == nil)
+    }
+
+    @Test
+    func projectStoreNormalizesDuplicatePaths() throws {
         let root = try makeTemporaryDirectory()
         defer { removeTemporaryDirectory(root) }
 
@@ -1019,9 +1032,8 @@ struct OkrunVMTests {
         let defaultProject = root.appendingPathComponent("devbox", isDirectory: true)
         let store = ProjectStore(url: registryURL)
 
-        let createdRegistry = try store.load(defaultProject: defaultProject)
-        #expect(createdRegistry.projects == [defaultProject.standardizedFileURL.path])
-        #expect(createdRegistry.selectedProject == defaultProject.standardizedFileURL.path)
+        // Load to create the file, then save duplicates
+        _ = try store.load()
 
         let duplicateRegistry = ProjectRegistry(
             selectedProject: defaultProject.appendingPathComponent("..").appendingPathComponent("devbox").path,
@@ -1032,7 +1044,7 @@ struct OkrunVMTests {
         )
         try store.save(duplicateRegistry)
 
-        let normalizedRegistry = try store.load(defaultProject: nil)
+        let normalizedRegistry = try store.load()
         #expect(normalizedRegistry.projects == [defaultProject.standardizedFileURL.path])
         #expect(normalizedRegistry.selectedProject == defaultProject.standardizedFileURL.path)
     }

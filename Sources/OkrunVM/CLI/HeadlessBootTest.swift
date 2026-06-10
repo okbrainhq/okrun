@@ -175,7 +175,7 @@ final class HeadlessBootTest: NSObject, VZVirtualMachineDelegate {
 
         if let registryPath, !registryPath.isEmpty {
             let store = ProjectStore(url: URL(fileURLWithPath: registryPath))
-            var registry = try store.load(defaultProject: nil)
+            var registry = try store.load()
             let path = store.standardPath(projectRoot)
             if !registry.projects.contains(path) {
                 registry.projects.append(path)

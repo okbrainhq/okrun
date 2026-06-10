@@ -24,5 +24,7 @@
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>OkrunEnvironment</key>
+	<string>prod</string>
 </dict>
 </plist>

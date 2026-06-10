@@ -390,6 +390,11 @@ private final class VMTabItemView: NSControl {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtualMachineDelegate {
     private var window: NSWindow!
+
+    private var appDisplayName: String {
+        let env = Bundle.main.object(forInfoDictionaryKey: "OkrunEnvironment") as? String ?? "prod"
+        return env == "dev" ? "Okrun VM - dev" : "Okrun VM"
+    }
     private var statusLabel = NSTextField(labelWithString: "Preparing")
     private var detailsLabel = NSTextField(labelWithString: "")
     private var vmContainer: RoundedContainerView!
@@ -435,7 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         )
 
         do {
-            registry = try projectStore.load(defaultProject: ProjectStore.defaultProjectRoot())
+            registry = try projectStore.load()
             try reloadSessionsFromRegistry()
             startConfiguredPrivateNetworkHostServices()
             startLaunchConfiguredSessions()
@@ -648,7 +653,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         )
         window.minSize = NSSize(width: 1040, height: 560)
         window.center()
-        window.title = "Okrun VM"
+        window.title = appDisplayName
         window.backgroundColor = NSColor(calibratedWhite: 0.065, alpha: 1)
         window.contentView = content
         window.delegate = self
@@ -707,8 +712,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         let appItem = NSMenuItem()
         mainMenu.addItem(appItem)
 
-        let appMenu = NSMenu(title: "Okrun VM")
-        appMenu.addItem(NSMenuItem(title: "Quit Okrun VM", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        let appMenu = NSMenu(title: appDisplayName)
+        appMenu.addItem(NSMenuItem(title: "Quit \(appDisplayName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appItem.submenu = appMenu
 
         let fileItem = NSMenuItem()

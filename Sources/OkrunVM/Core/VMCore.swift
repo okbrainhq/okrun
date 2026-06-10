@@ -182,7 +182,9 @@ struct OkrunHome {
         } else if let environmentRoot = ProcessInfo.processInfo.environment["OKRUN_HOME"], !environmentRoot.isEmpty {
             self.root = URL(fileURLWithPath: environmentRoot, isDirectory: true)
         } else {
-            self.root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".okrun", isDirectory: true)
+            let env = Bundle.main.object(forInfoDictionaryKey: "OkrunEnvironment") as? String ?? "prod"
+            let dirName = env == "dev" ? ".okrun-dev" : ".okrun"
+            self.root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(dirName, isDirectory: true)
         }
     }
 
@@ -220,18 +222,14 @@ final class ProjectStore {
         }
     }
 
-    func load(defaultProject: URL?) throws -> ProjectRegistry {
+    func load() throws -> ProjectRegistry {
         let fileManager = FileManager.default
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try migrateLegacyRegistryIfNeeded(fileManager: fileManager)
 
         if !fileManager.fileExists(atPath: url.path) {
-            var registry = ProjectRegistry.empty
-            if let defaultProject {
-                registry.projects = [standardPath(defaultProject)]
-                registry.selectedProject = registry.projects.first
-            }
+            let registry = ProjectRegistry.empty
             try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try encoder.encode(registry)
             try data.write(to: url, options: .atomic)

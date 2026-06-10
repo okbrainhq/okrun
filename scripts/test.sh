@@ -3,6 +3,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Parse environment flag (default: dev)
+ENV="dev"
+for arg in "$@"; do
+  case "$arg" in
+    --prod) ENV="prod" ;;
+    --dev)  ENV="dev" ;;
+  esac
+done
+
 export CLANG_MODULE_CACHE_PATH="$ROOT/.build/clang-module-cache"
 export SWIFTPM_HOME="$ROOT/.build/swiftpm-home"
 mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFTPM_HOME"
@@ -38,6 +47,8 @@ run_e2e() {
   printf 'FAIL %s (%ss)\n' "$name" "$((SECONDS - start))" >&2
   return "$status"
 }
+
+echo "Running tests (env=$ENV)"
 
 (cd "$ROOT" && swift test "${SWIFT_TEST_ARGS[@]}")
 run_e2e "Guest tools installer E2E" "$ROOT/scripts/e2e-guest-tools-installer.sh"

@@ -12,12 +12,12 @@ Install Xcode Command Line Tools first if Swift is not already available:
 xcode-select --install
 ```
 
-Then clone and build the app:
+Then clone and build the app for production:
 
 ```sh
 git clone https://github.com/okbrainhq/okrun.git
 cd okrun
-./scripts/build.sh
+./scripts/build.sh --prod
 ```
 
 The build script creates `OkrunVM.app`, copies the app resources, and ad-hoc
@@ -26,10 +26,15 @@ signs the bundle with the virtualization entitlement needed for local use.
 Okrun runs on macOS 14 or later. New ASIF disks and ASIF imports require macOS
 26 Tahoe or later; older hosts use RAW disks.
 
+> **Note:** The build scripts default to `--dev`, which creates a separate
+> `OkrunVM-Dev.app` with its own bundle ID and data directory (`~/.okrun-dev`).
+> Use `--prod` to build the production version (`OkrunVM.app`, `~/.okrun`).
+> Both versions can run side by side.
+
 ## Run It
 
 ```sh
-./scripts/run.sh
+./scripts/run.sh --prod
 ```
 
 `run.sh` builds the app if needed and opens `OkrunVM.app`.

@@ -1,7 +1,0 @@
-{
-  "cpuCount" : 4,
-  "diskGB" : 64,
-  "guestOS" : "linux",
-  "installerISOPath" : null,
-  "memoryGB" : 4
-}

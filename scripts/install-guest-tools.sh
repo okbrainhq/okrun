@@ -131,6 +131,16 @@ if [[ -z "$TARGET_HOST" || $# -gt 1 ]]; then
   exit 64
 fi
 
+# Parse user@host from the positional argument if present
+if [[ "$TARGET_HOST" == *@* ]]; then
+  HOST_PART="${TARGET_HOST#*@}"
+  USER_PART="${TARGET_HOST%@*}"
+  if [[ -z "$SSH_USER" ]]; then
+    SSH_USER="$USER_PART"
+  fi
+  TARGET_HOST="$HOST_PART"
+fi
+
 if [[ -z "$SSH_USER" ]]; then
   SSH_USER="$(id -un)"
 fi
