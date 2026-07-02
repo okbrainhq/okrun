@@ -23,7 +23,9 @@ Options:
   --help           Show this help text.
 
 Access port positional args are optional. Leave ACCESS_NETWORK empty to disable
-Linux TAP access. When enabled, ACCESS_IP must be a CIDR such as 10.77.0.1/24.
+Linux TAP access. ACCESS_NETWORK must match the clients' networkIdentifier shown
+in /status, e.g. okrun. When enabled, ACCESS_IP must be a CIDR such as
+10.77.0.1/24.
 EOF
 }
 

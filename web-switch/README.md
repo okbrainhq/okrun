@@ -129,7 +129,7 @@ sudo npm run start -- \
   --status-port 8080 \
   --server-bundle .certs/server/okrun-switch-server-bundle.json \
   --crl .ca/crl.txt \
-  --access-network okrun-prod \
+  --access-network okrun \
   --access-iface oksw0 \
   --access-ip 10.77.0.1/24
 ```
@@ -137,10 +137,15 @@ sudo npm run start -- \
 Equivalent environment variables:
 
 ```bash
-OKRUN_SWITCH_ACCESS_NETWORK=okrun-prod
+OKRUN_SWITCH_ACCESS_NETWORK=okrun
 OKRUN_SWITCH_ACCESS_IFACE=oksw0
 OKRUN_SWITCH_ACCESS_IP=10.77.0.1/24
 ```
+
+`OKRUN_SWITCH_ACCESS_NETWORK` must match the exact `networkIdentifier` used by
+the VM clients. For the current deployment that network is `okrun`; if the access
+port joins `okrun-prod` while clients join `okrun`, the TAP interface will be
+alone and ARP/ping/SSH to private hosts will fail.
 
 The access port requires Linux `/dev/net/tun`, `iproute2`, and root or
 `CAP_NET_ADMIN`. It is disabled by default. Treat the cloud host as a full L2
@@ -174,11 +179,15 @@ To expose a private network from the cloud host, also set the optional TAP acces
 variables:
 
 ```bash
-SWITCH_ACCESS_NETWORK=okrun-prod
+SWITCH_ACCESS_NETWORK=okrun
 SWITCH_ACCESS_IFACE=oksw0
 SWITCH_ACCESS_IP=10.77.0.1/24
 SWITCH_ACCESS_MTU=1500
 ```
+
+`SWITCH_ACCESS_NETWORK` is not an environment label; it is the switch fabric
+network name. It must match the VM clients' `networkIdentifier` shown in
+`/status`.
 
 Then create the server certificate locally and deploy it:
 

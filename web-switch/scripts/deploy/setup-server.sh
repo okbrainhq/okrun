@@ -26,7 +26,8 @@ Options:
   --help                 Show this help text.
 
 Access port config comes from .deploy.switch:
-  SWITCH_ACCESS_NETWORK  Private network to expose through Linux TAP; empty disables it.
+  SWITCH_ACCESS_NETWORK  Private networkIdentifier to expose through Linux TAP; empty disables it.
+                         Must match the clients' network shown in /status, e.g. okrun.
   SWITCH_ACCESS_IFACE    TAP interface name on the cloud host. Default: oksw0.
   SWITCH_ACCESS_IP       CIDR address for the TAP interface, e.g. 10.77.0.1/24.
   SWITCH_ACCESS_MTU      TAP MTU. Default: 1500.
