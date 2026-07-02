@@ -155,6 +155,60 @@ test('web switch default host remains public-listener friendly', async () => {
   assert.equal(config.tlsEnabled, true);
 });
 
+test('access port config is explicit and Linux-friendly', async () => {
+  const config = buildConfig([
+    '--access-network', 'okrun-access-e2e',
+    '--access-iface', 'oksw-test0',
+    '--access-ip', '10.77.0.1/24'
+  ], {});
+  assert.equal(config.access.enabled, true);
+  assert.equal(config.access.networkIdentifier, 'okrun-access-e2e');
+  assert.equal(config.access.tapName, 'oksw-test0');
+  assert.equal(config.access.interfaceName, 'oksw-test0');
+  assert.equal(config.access.ipCidr, '10.77.0.1/24');
+  assert.equal(config.access.mtu, 1500);
+});
+
+test('access port traffic bridges with mTLS peers but not local-only peers', async () => {
+  const fabric = new SwitchFabric({
+    rateLimitFramesPerSecond: 0,
+    rateLimitBytesPerSecond: 0,
+    rateLimitBroadcastFramesPerSecond: 0,
+    rateLimitMulticastFramesPerSecond: 0,
+    rateLimitUnknownUnicastFramesPerSecond: 0
+  });
+  const net = networkName('access-transport');
+  const access = mockFabricConnection('access-port', 'access');
+  const tlsPeer = mockFabricConnection('tls-peer', 'tls');
+  const localPeer = mockFabricConnection('local-peer', 'local');
+
+  admitFabricHost(fabric, access, {
+    networkIdentifier: net,
+    nodeID: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    interfaceName: 'oksw0'
+  });
+  admitFabricHost(fabric, tlsPeer, {
+    networkIdentifier: net,
+    nodeID: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  });
+  admitFabricHost(fabric, localPeer, {
+    networkIdentifier: net,
+    nodeID: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+  });
+
+  const frame = ethernetFrame('ff:ff:ff:ff:ff:ff', '02:00:00:00:ac:01', 'from-access');
+  const result = fabric.handleData(access, {
+    streamId: ETHERNET_STREAM_ID,
+    type: FrameType.DATA,
+    seqNo: 1,
+    payload: frame
+  });
+
+  assert.equal(result.forwarded, 1);
+  assert.equal(tlsPeer.sent.length, 1);
+  assert.equal(localPeer.sent.length, 0);
+});
+
 test('fabric rate-limits broadcast storms per host', async () => {
   let now = 1_000;
   const fabric = new SwitchFabric({

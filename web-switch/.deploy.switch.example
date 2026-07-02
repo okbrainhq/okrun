@@ -8,6 +8,13 @@ SSH_PORT=22
 SWITCH_TLS_PORT=9443
 SWITCH_STATUS_PORT=8080
 
+# Optional Linux TAP access port. Leave SWITCH_ACCESS_NETWORK empty to disable.
+# When enabled, the cloud switch host joins this private network as a real L2 member.
+# SWITCH_ACCESS_NETWORK=okrun-prod
+# SWITCH_ACCESS_IFACE=oksw0
+# SWITCH_ACCESS_IP=10.77.0.1/24
+# SWITCH_ACCESS_MTU=1500
+
 # Optional cert path for --upload-certs.
 # This root should contain ca/ and server/ directories.
 # CERTS_DIR=.certs/prod

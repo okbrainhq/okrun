@@ -8,6 +8,7 @@
     "start": "node src/index.js",
     "dev": "node src/index.js --tls-port 9443 --status-port 8080 --server-bundle .certs/server/okrun-switch-server-bundle.json --crl .ca/crl.txt",
     "test": "node tests/e2e/run.js",
+    "test:access": "../scripts/e2e-web-switch-access-linux.sh",
     "ca": "node bin/okrun-switch-ca.js",
     "cert:init": "./init-ca.sh",
     "cert:server": "./issue-server.sh",

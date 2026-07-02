@@ -2,7 +2,7 @@
 
 # setup-server-remote.sh
 # Purpose: Installs dependencies and deploys okrun-switch on a Debian/Ubuntu VM.
-# Usage: ./setup-server-remote.sh [--restart-only] <HOSTNAME> <REPO_URL> [TLS_PORT] [STATUS_PORT] [SSH_PORT]
+# Usage: ./setup-server-remote.sh [--restart-only] <HOSTNAME> <REPO_URL> [TLS_PORT] [STATUS_PORT] [SSH_PORT] [ACCESS_NETWORK] [ACCESS_IFACE] [ACCESS_IP] [ACCESS_MTU]
 
 set -euo pipefail
 
@@ -16,11 +16,14 @@ NODE_PATH="${OKRUN_SWITCH_NODE_PATH:-}"
 
 usage() {
   cat <<'EOF'
-Usage: ./setup-server-remote.sh [--restart-only] <HOSTNAME> <REPO_URL> [TLS_PORT] [STATUS_PORT] [SSH_PORT]
+Usage: ./setup-server-remote.sh [--restart-only] <HOSTNAME> <REPO_URL> [TLS_PORT] [STATUS_PORT] [SSH_PORT] [ACCESS_NETWORK] [ACCESS_IFACE] [ACCESS_IP] [ACCESS_MTU]
 
 Options:
   --restart-only   Restart the existing okrun-switch systemd service and run health checks.
   --help           Show this help text.
+
+Access port positional args are optional. Leave ACCESS_NETWORK empty to disable
+Linux TAP access. When enabled, ACCESS_IP must be a CIDR such as 10.77.0.1/24.
 EOF
 }
 
@@ -57,6 +60,10 @@ REPO_URL="${POSITIONAL[1]}"
 SWITCH_TLS_PORT="${POSITIONAL[2]:-9443}"
 SWITCH_STATUS_PORT="${POSITIONAL[3]:-8080}"
 SSH_PORT="${POSITIONAL[4]:-22}"
+SWITCH_ACCESS_NETWORK="${POSITIONAL[5]:-${OKRUN_SWITCH_ACCESS_NETWORK:-}}"
+SWITCH_ACCESS_IFACE="${POSITIONAL[6]:-${OKRUN_SWITCH_ACCESS_IFACE:-oksw0}}"
+SWITCH_ACCESS_IP="${POSITIONAL[7]:-${OKRUN_SWITCH_ACCESS_IP:-}}"
+SWITCH_ACCESS_MTU="${POSITIONAL[8]:-${OKRUN_SWITCH_ACCESS_MTU:-1500}}"
 
 is_port() {
   local value="$1"
@@ -69,6 +76,21 @@ for port_name in SWITCH_TLS_PORT SWITCH_STATUS_PORT SSH_PORT; do
     exit 1
   fi
 done
+
+if [[ -n "$SWITCH_ACCESS_NETWORK" ]]; then
+  if [[ -z "$SWITCH_ACCESS_IP" ]]; then
+    echo "Error: ACCESS_IP is required when ACCESS_NETWORK is set."
+    exit 1
+  fi
+  if [[ ! "$SWITCH_ACCESS_MTU" =~ ^[0-9]+$ ]] || (( 10#$SWITCH_ACCESS_MTU < 576 || 10#$SWITCH_ACCESS_MTU > 9000 )); then
+    echo "Error: ACCESS_MTU must be a number from 576 to 9000, got: $SWITCH_ACCESS_MTU"
+    exit 1
+  fi
+  if [[ "$SWITCH_ACCESS_NETWORK" =~ [[:space:]] || "$SWITCH_ACCESS_IFACE" =~ [[:space:]] || "$SWITCH_ACCESS_IP" =~ [[:space:]] ]]; then
+    echo "Error: ACCESS_* values must not contain whitespace."
+    exit 1
+  fi
+fi
 
 if [[ "$(id -u)" -eq 0 ]]; then
   REAL_USER="${SUDO_USER:-root}"
@@ -160,7 +182,7 @@ install_basic_tools() {
   run_sudo apt update
 
   echo "Installing basic tools..."
-  run_sudo apt install -y ca-certificates curl git unzip openssl iproute2
+  run_sudo apt install -y ca-certificates curl git unzip openssl iproute2 python3 avahi-daemon libnss-mdns
 }
 
 install_node() {
@@ -329,6 +351,22 @@ install_web_switch_dependencies() {
 
 write_systemd_unit() {
   echo "Writing systemd unit..."
+
+  local access_env access_security
+  access_env=""
+  access_security="RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX"
+  if [[ -n "$SWITCH_ACCESS_NETWORK" ]]; then
+    access_env="Environment=OKRUN_SWITCH_ACCESS_NETWORK=$SWITCH_ACCESS_NETWORK
+Environment=OKRUN_SWITCH_ACCESS_IFACE=$SWITCH_ACCESS_IFACE
+Environment=OKRUN_SWITCH_ACCESS_IP=$SWITCH_ACCESS_IP
+Environment=OKRUN_SWITCH_ACCESS_MTU=$SWITCH_ACCESS_MTU
+Environment=OKRUN_SWITCH_ACCESS_PYTHON=/usr/bin/python3"
+    access_security="# TAP access port needs CAP_NET_ADMIN and AF_NETLINK for iproute2.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK"
+  fi
+
   run_sudo tee "/etc/systemd/system/$SERVICE_NAME.service" >/dev/null <<EOF
 [Unit]
 Description=OkRun Web Switch
@@ -351,6 +389,7 @@ Environment=OKRUN_SWITCH_SERVER_KEY=$CERT_DIR/server-key.pem
 Environment=OKRUN_SWITCH_SERVER_CERT=$CERT_DIR/server-cert.pem
 Environment=OKRUN_SWITCH_CA_CERT=$CERT_DIR/ca-cert.pem
 Environment=OKRUN_SWITCH_CRL=$CERT_DIR/crl.txt
+$access_env
 UMask=0077
 
 # Security hardening
@@ -367,7 +406,7 @@ ProtectHostname=true
 RestrictRealtime=true
 RestrictNamespaces=true
 RestrictSUIDSGID=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+$access_security
 LockPersonality=true
 RemoveIPC=true
 
@@ -514,6 +553,24 @@ health_check() {
     exit 1
   fi
 
+  if [[ -n "$SWITCH_ACCESS_NETWORK" ]]; then
+    if ip link show "$SWITCH_ACCESS_IFACE" >/dev/null 2>&1; then
+      echo "Access TAP interface $SWITCH_ACCESS_IFACE exists."
+    else
+      echo "Access TAP interface $SWITCH_ACCESS_IFACE was not created."
+      run_sudo journalctl -u "$SERVICE_NAME" -n 60 --no-pager || true
+      exit 1
+    fi
+
+    if ip -o addr show dev "$SWITCH_ACCESS_IFACE" | grep -Fq "$SWITCH_ACCESS_IP"; then
+      echo "Access TAP interface has $SWITCH_ACCESS_IP."
+    else
+      echo "Access TAP interface does not have expected IP $SWITCH_ACCESS_IP."
+      ip -o addr show dev "$SWITCH_ACCESS_IFACE" || true
+      exit 1
+    fi
+  fi
+
   echo "Firewall exposes SSH ($SSH_PORT/tcp) and okrun-switch mTLS ($SWITCH_TLS_PORT/tcp); HTTP/HTTPS/status ports are not opened."
 }
 
@@ -523,6 +580,11 @@ echo "Repository: $REPO_URL"
 echo "Hostname: $HOSTNAME"
 echo "TLS port: $SWITCH_TLS_PORT"
 echo "Status port: $SWITCH_STATUS_PORT"
+if [[ -n "$SWITCH_ACCESS_NETWORK" ]]; then
+  echo "Access port: enabled network=$SWITCH_ACCESS_NETWORK iface=$SWITCH_ACCESS_IFACE ip=$SWITCH_ACCESS_IP mtu=$SWITCH_ACCESS_MTU"
+else
+  echo "Access port: disabled"
+fi
 echo "Configuring for user: $REAL_USER ($REAL_GROUP)"
 
 require_sudo

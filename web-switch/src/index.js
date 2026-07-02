@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
+const { TapAccessPort } = require('./access-port');
 const { SwitchLocalServer, SwitchTLSServer } = require('./tls-server');
 const { SwitchFabric } = require('./switch-fabric');
 const { DEFAULT_MAX_FRAME_SIZE } = require('./protocol');
@@ -88,6 +89,15 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
     ? numberOption(args['tls-port'] ?? env.OKRUN_SWITCH_TLS_PORT, 9443, 'tls-port')
     : null;
   const defaultHost = tlsEnabled ? '0.0.0.0' : '127.0.0.1';
+  const accessNetwork = args['access-network'] ?? env.OKRUN_SWITCH_ACCESS_NETWORK ?? null;
+  const accessEnabled = booleanOption(
+    args['access-enabled'] ?? env.OKRUN_SWITCH_ACCESS_ENABLED,
+    Boolean(accessNetwork),
+    'access-enabled'
+  );
+  if (accessEnabled && !accessNetwork) {
+    throw new Error('access-network is required when access-enabled is true');
+  }
 
   return {
     host: args.host ?? env.OKRUN_SWITCH_HOST ?? defaultHost,
@@ -176,7 +186,20 @@ function buildConfig(argv = process.argv.slice(2), env = process.env) {
       args['max-pending-bytes'] ?? env.OKRUN_SWITCH_MAX_PENDING_BYTES,
       4 * 1024 * 1024,
       'max-pending-bytes'
-    )
+    ),
+    access: accessEnabled
+      ? {
+        enabled: true,
+        networkIdentifier: accessNetwork,
+        tapName: args['access-iface'] ?? env.OKRUN_SWITCH_ACCESS_IFACE ?? 'oksw0',
+        interfaceName: args['access-interface'] ?? env.OKRUN_SWITCH_ACCESS_INTERFACE ?? args['access-iface'] ?? env.OKRUN_SWITCH_ACCESS_IFACE ?? 'oksw0',
+        ipCidr: args['access-ip'] ?? env.OKRUN_SWITCH_ACCESS_IP ?? null,
+        mtu: numberOption(args['access-mtu'] ?? env.OKRUN_SWITCH_ACCESS_MTU, 1500, 'access-mtu'),
+        nodeID: args['access-node-id'] ?? env.OKRUN_SWITCH_ACCESS_NODE_ID ?? null,
+        helperPath: path.resolve(args['access-helper'] ?? env.OKRUN_SWITCH_ACCESS_HELPER ?? path.join(root, 'bin/okrun-switch-tap-helper.py')),
+        python: args['access-python'] ?? env.OKRUN_SWITCH_ACCESS_PYTHON ?? 'python3'
+      }
+      : { enabled: false }
   };
 }
 
@@ -242,6 +265,15 @@ function start(config) {
       fabric
     });
 
+  const accessPort = config.access?.enabled
+    ? new TapAccessPort({
+      ...config.access,
+      fabric,
+      maxFrameSize: config.maxFrameSize,
+      logger: config.logger ?? console
+    })
+    : null;
+
   const statusServer = createStatusServer(fabric);
 
   if (tlsServer) {
@@ -270,6 +302,10 @@ function start(config) {
     });
   }
 
+  if (accessPort) {
+    accessPort.start();
+  }
+
   statusServer.listen(config.statusPort, config.host, () => {
     const address = statusServer.address();
     console.log(JSON.stringify({
@@ -283,10 +319,11 @@ function start(config) {
     fabric,
     tlsServer,
     localServer,
+    accessPort,
     statusServer,
     close(callback) {
-      const servers = [tlsServer, localServer, statusServer].filter(Boolean);
-      let pending = servers.length;
+      const closers = [tlsServer, localServer, statusServer, accessPort].filter(Boolean);
+      let pending = closers.length;
       if (pending === 0) {
         if (callback) {
           callback();
@@ -299,8 +336,8 @@ function start(config) {
           callback();
         }
       };
-      for (const server of servers) {
-        server.close(done);
+      for (const closer of closers) {
+        closer.close(done);
       }
     }
   };

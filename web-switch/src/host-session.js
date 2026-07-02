@@ -159,6 +159,7 @@ class HostSession {
     return {
       nodeID: this.nodeID,
       clientSerial: this.clientSerial,
+      identityKind: this.identityKind,
       connections: Array.from(this.connections.keys()).sort(),
       dhcpRange: this.dhcpRange
         ? {

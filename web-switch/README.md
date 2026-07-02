@@ -117,6 +117,35 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/status
 ```
 
+## Linux Access Port
+
+On a Linux cloud switch host, `web-switch` can join one private network through a
+real TAP interface. This lets a normal SSH login on the cloud host reach private
+hosts by IP, and `.local` names when mDNS/NSS is configured on that Linux host.
+
+```bash
+sudo npm run start -- \
+  --tls-port 9443 \
+  --status-port 8080 \
+  --server-bundle .certs/server/okrun-switch-server-bundle.json \
+  --crl .ca/crl.txt \
+  --access-network okrun-prod \
+  --access-iface oksw0 \
+  --access-ip 10.77.0.1/24
+```
+
+Equivalent environment variables:
+
+```bash
+OKRUN_SWITCH_ACCESS_NETWORK=okrun-prod
+OKRUN_SWITCH_ACCESS_IFACE=oksw0
+OKRUN_SWITCH_ACCESS_IP=10.77.0.1/24
+```
+
+The access port requires Linux `/dev/net/tun`, `iproute2`, and root or
+`CAP_NET_ADMIN`. It is disabled by default. Treat the cloud host as a full L2
+member of the selected private network while this is enabled.
+
 Safety limits are enabled by default and can be tuned per deployment:
 
 ```bash
@@ -141,6 +170,16 @@ cp .deploy.switch.example .deploy.switch
 ```
 
 Edit `.deploy.switch` with the VM SSH target, switch hostname, and repo URL.
+To expose a private network from the cloud host, also set the optional TAP access
+variables:
+
+```bash
+SWITCH_ACCESS_NETWORK=okrun-prod
+SWITCH_ACCESS_IFACE=oksw0
+SWITCH_ACCESS_IP=10.77.0.1/24
+SWITCH_ACCESS_MTU=1500
+```
+
 Then create the server certificate locally and deploy it:
 
 ```bash
@@ -159,10 +198,13 @@ Later code updates can reuse the remote certificates:
 ./scripts/deploy/setup-server.sh deploy@switch.example.com
 ```
 
-The setup installs Node.js, clones/updates the repo under
+The setup installs Node.js, Python 3, iproute2, avahi-daemon, and libnss-mdns,
+clones/updates the repo under
 `/opt/okrun-switch/source`, runs `okrun-switch` with systemd, and configures UFW
-to allow only SSH plus the switch mTLS port. The status HTTP port is for local
-health checks and SSH access; it is not opened in the firewall.
+to allow only SSH plus the switch mTLS port. If `SWITCH_ACCESS_NETWORK` is set,
+the systemd unit grants `CAP_NET_ADMIN` so the TAP helper can create the access
+interface. The status HTTP port is for local health checks and SSH access; it is
+not opened in the firewall.
 
 ## Deploying a Local Switch to a Mac
 
@@ -223,4 +265,12 @@ after updating the CRL.
 
 ```bash
 npm test
+```
+
+Linux TAP access-port E2E runs on a Linux host with passwordless sudo:
+
+```bash
+../scripts/e2e-web-switch-access-linux.sh
+# or from macOS, after SSH auth is available:
+../scripts/e2e-web-switch-access-remote.sh arunoda@devbox-sandbox.local
 ```

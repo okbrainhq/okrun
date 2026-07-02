@@ -25,6 +25,12 @@ Options:
   --restart-only         Restart the existing remote okrun-switch service only.
   --help                 Show this help text.
 
+Access port config comes from .deploy.switch:
+  SWITCH_ACCESS_NETWORK  Private network to expose through Linux TAP; empty disables it.
+  SWITCH_ACCESS_IFACE    TAP interface name on the cloud host. Default: oksw0.
+  SWITCH_ACCESS_IP       CIDR address for the TAP interface, e.g. 10.77.0.1/24.
+  SWITCH_ACCESS_MTU      TAP MTU. Default: 1500.
+
 Cert root layout:
   <certs-dir>/ca/ca-cert.pem
   <certs-dir>/ca/crl.txt
@@ -57,6 +63,10 @@ DEPLOY_HOST="${DEPLOY_HOST:-}"
 SSH_PORT="${SSH_PORT:-22}"
 SWITCH_TLS_PORT="${SWITCH_TLS_PORT:-9443}"
 SWITCH_STATUS_PORT="${SWITCH_STATUS_PORT:-8080}"
+SWITCH_ACCESS_NETWORK="${SWITCH_ACCESS_NETWORK:-${OKRUN_SWITCH_ACCESS_NETWORK:-}}"
+SWITCH_ACCESS_IFACE="${SWITCH_ACCESS_IFACE:-${OKRUN_SWITCH_ACCESS_IFACE:-oksw0}}"
+SWITCH_ACCESS_IP="${SWITCH_ACCESS_IP:-${OKRUN_SWITCH_ACCESS_IP:-}}"
+SWITCH_ACCESS_MTU="${SWITCH_ACCESS_MTU:-${OKRUN_SWITCH_ACCESS_MTU:-1500}}"
 CERTS_DIR="${CERTS_DIR:-}"
 SERVER_CERT_DIR="${SERVER_CERT_DIR:-}"
 CA_DIR="${CA_DIR:-}"
@@ -184,11 +194,31 @@ if ! is_port "$SWITCH_STATUS_PORT"; then
   exit 1
 fi
 
+if [[ -n "$SWITCH_ACCESS_NETWORK" ]]; then
+  if [[ -z "$SWITCH_ACCESS_IP" ]]; then
+    echo "Error: SWITCH_ACCESS_IP is required when SWITCH_ACCESS_NETWORK is set."
+    exit 1
+  fi
+  if [[ ! "$SWITCH_ACCESS_MTU" =~ ^[0-9]+$ ]] || (( 10#$SWITCH_ACCESS_MTU < 576 || 10#$SWITCH_ACCESS_MTU > 9000 )); then
+    echo "Error: SWITCH_ACCESS_MTU must be a number from 576 to 9000, got: $SWITCH_ACCESS_MTU"
+    exit 1
+  fi
+  if [[ "$SWITCH_ACCESS_NETWORK" =~ [[:space:]] || "$SWITCH_ACCESS_IFACE" =~ [[:space:]] || "$SWITCH_ACCESS_IP" =~ [[:space:]] ]]; then
+    echo "Error: SWITCH_ACCESS_* values must not contain whitespace."
+    exit 1
+  fi
+fi
+
 echo "Setting up okrun-switch on $HOST..."
 echo "Hostname: $HOSTNAME"
 echo "Repository: $REPO_URL"
 echo "TLS port: $SWITCH_TLS_PORT"
 echo "Status port: $SWITCH_STATUS_PORT (not opened in UFW)"
+if [[ -n "$SWITCH_ACCESS_NETWORK" ]]; then
+  echo "Access port: enabled network=$SWITCH_ACCESS_NETWORK iface=$SWITCH_ACCESS_IFACE ip=$SWITCH_ACCESS_IP mtu=$SWITCH_ACCESS_MTU"
+else
+  echo "Access port: disabled"
+fi
 
 ssh_remote() {
   if [[ "$SSH_PORT" != "22" ]]; then
@@ -286,7 +316,17 @@ REMOTE_ARGS=()
 if [[ "$RESTART_ONLY" == true ]]; then
   REMOTE_ARGS+=(--restart-only)
 fi
-REMOTE_ARGS+=("$HOSTNAME" "$REPO_URL" "$SWITCH_TLS_PORT" "$SWITCH_STATUS_PORT" "$SSH_PORT")
+REMOTE_ARGS+=(
+  "$HOSTNAME"
+  "$REPO_URL"
+  "$SWITCH_TLS_PORT"
+  "$SWITCH_STATUS_PORT"
+  "$SSH_PORT"
+  "$SWITCH_ACCESS_NETWORK"
+  "$SWITCH_ACCESS_IFACE"
+  "$SWITCH_ACCESS_IP"
+  "$SWITCH_ACCESS_MTU"
+)
 
 REMOTE_CMD="chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh"
 for remote_arg in "${REMOTE_ARGS[@]}"; do
