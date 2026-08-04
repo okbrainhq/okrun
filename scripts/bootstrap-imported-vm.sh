@@ -104,65 +104,6 @@ choose_public_key() {
   done
 }
 
-run_with_expect_password() {
-  local password="$1"
-  shift
-
-  expect -f - -- "$password" "$@" <<'EXPECT_SCRIPT'
-# Generous overall budget: the remote apt upgrade alone can take a long time.
-# The timeout only fires if nothing matches for the whole period, which is a
-# strong signal the session is wedged and needs a human.
-set timeout 5400
-set password [lindex $argv 0]
-set cmd [lrange $argv 1 end]
-
-# Raise the pattern-matching buffer: sshd banners / apt output can be large,
-# and with the default 2000-byte window a prompt can scroll past unmatched.
-match_max 100000
-
-spawn {*}$cmd
-expect {
-  -re {(?i)are you sure you want to continue connecting.*\?} {
-    send -- "yes\r"
-    exp_continue
-  }
-  -re {(?i)password.*:} {
-    # Wait a beat before sending. Sending immediately races ssh's terminal
-    # echo setup; the password can be echoed back or swallowed, leaving the
-    # session sitting at a live prompt that looks "stuck" to the user.
-    sleep 1
-    send -- "$password\r"
-    exp_continue
-  }
-  -re {(?i)(permission denied|publickey|host key verification failed|connection refused|no route to host)} {
-    puts "\nERROR: SSH connection or authentication failed for the target host."
-    exit 1
-  }
-  timeout {
-    # Fall back to interactive mode so a human can type the password (or
-    # Ctrl-C) instead of expect silently swallowing all keyboard input.
-    puts "\nWARNING: no expected output for a long time. Handing the session over"
-    puts "to you so you can finish or interrupt it."
-    interact
-    catch wait result
-    set code [lindex $result 3]
-    if {$code eq ""} {
-      set code 1
-    }
-    exit $code
-  }
-  eof
-}
-
-catch wait result
-set exit_code [lindex $result 3]
-if {$exit_code eq ""} {
-  set exit_code 1
-}
-exit $exit_code
-EXPECT_SCRIPT
-}
-
 create_remote_script() {
   local output="$1"
 
@@ -466,7 +407,6 @@ if [ "$#" -ne 1 ]; then
 fi
 
 target="$1"
-current_password="${OKRUN_VM_PASSWORD:-password}"
 ssh_port="22"
 
 # Accept an optional user@ prefix on the target (e.g. arunoda@hostname.local).
@@ -481,7 +421,6 @@ validate_username "$current_user" || die "invalid SSH login username derived fro
 
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
 command -v scp >/dev/null 2>&1 || die "scp is required"
-command -v expect >/dev/null 2>&1 || die "expect is required for automatic password handling"
 command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
 command -v base64 >/dev/null 2>&1 || die "base64 is required"
 
@@ -513,7 +452,7 @@ printf '\nPlan:\n'
 printf '  Target:              %s\n' "$target"
 printf '  SSH login:           %s@%s:%s\n' "$current_user" "$target" "$ssh_port"
 printf '  SSH port:            %s\n' "$ssh_port"
-printf '  Password handling:   automatic via expect\n'
+printf '  Password handling:   interactive (you type the SSH/sudo password)\n'
 printf '  New login user:      %s\n' "$new_username"
 printf '  New hostname:        %s\n' "$new_hostname"
 printf '  Authorized key:      %s\n' "$selected_key"
@@ -555,30 +494,27 @@ trap cleanup EXIT
 
 create_remote_script "$remote_script"
 
-printf '\nCopying setup script to %s...\n' "$target"
-run_with_expect_password "$current_password" \
-  scp \
+printf '\nCopying setup script to %s (type the VM password when prompted)...\n' "$target"
+scp \
   -o PubkeyAuthentication=no \
   -o PreferredAuthentications=password \
-  -o NumberOfPasswordPrompts=2 \
   -o ConnectTimeout=15 \
   -P "$ssh_port" \
   "$remote_script" "${current_user}@${target}:/tmp/okrun-imported-vm-bootstrap.sh"
 
-printf '\nRunning remote setup with expect password handling.\n'
-# The remote command pipes the password straight into `sudo -S`, so sudo never
-# shows an interactive "[sudo] password" prompt. expect therefore only has to
-# answer the single ssh login prompt, which removes the most common hang.
-run_with_expect_password "$current_password" \
-  ssh \
-  -T \
+printf '\nRunning remote setup. You will be prompted for the SSH password,\n'
+printf 'then for the sudo password on the VM.\n'
+# -t allocates a tty so sudo can prompt for the password interactively on the
+# remote side. The whole bootstrap runs as a single sudo invocation, so the
+# sudo password is only asked once at the start.
+ssh \
+  -t \
   -o PubkeyAuthentication=no \
   -o PreferredAuthentications=password \
-  -o NumberOfPasswordPrompts=2 \
   -o ConnectTimeout=15 \
   -o ServerAliveInterval=30 \
   -p "$ssh_port" \
   "${current_user}@${target}" \
-  "printf '%s\\n' '$current_password' | sudo -S -p '' bash /tmp/okrun-imported-vm-bootstrap.sh '$current_user' '$new_username' '$new_hostname' '$public_key_b64' '$lock_old_user'"
+  "sudo bash /tmp/okrun-imported-vm-bootstrap.sh '$current_user' '$new_username' '$new_hostname' '$public_key_b64' '$lock_old_user'"
 
 printf '\nSetup complete.\n'
