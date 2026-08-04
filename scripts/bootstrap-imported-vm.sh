@@ -362,7 +362,12 @@ fi
 
 log "Disabling SSH password authentication"
 if [ -d /etc/ssh/sshd_config.d ]; then
-  cat > /etc/ssh/sshd_config.d/99-disable-password-auth.conf <<'SSHD_DROPIN'
+  # sshd keeps the FIRST value it reads, and sshd_config.d/*.conf files are
+  # included (in lexical order) at the top of sshd_config. Ubuntu cloud images
+  # ship 50-cloud-init.conf with "PasswordAuthentication yes", which would
+  # silently override a later drop-in — so ours must sort first (00-*).
+  rm -f /etc/ssh/sshd_config.d/99-disable-password-auth.conf
+  cat > /etc/ssh/sshd_config.d/00-okrun-disable-password-auth.conf <<'SSHD_DROPIN'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
