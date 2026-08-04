@@ -109,9 +109,16 @@ run_with_expect_password() {
   shift
 
   expect -f - -- "$password" "$@" <<'EXPECT_SCRIPT'
-set timeout -1
+# Generous overall budget: the remote apt upgrade alone can take a long time.
+# The timeout only fires if nothing matches for the whole period, which is a
+# strong signal the session is wedged and needs a human.
+set timeout 5400
 set password [lindex $argv 0]
 set cmd [lrange $argv 1 end]
+
+# Raise the pattern-matching buffer: sshd banners / apt output can be large,
+# and with the default 2000-byte window a prompt can scroll past unmatched.
+match_max 100000
 
 spawn {*}$cmd
 expect {
@@ -120,8 +127,29 @@ expect {
     exp_continue
   }
   -re {(?i)password.*:} {
+    # Wait a beat before sending. Sending immediately races ssh's terminal
+    # echo setup; the password can be echoed back or swallowed, leaving the
+    # session sitting at a live prompt that looks "stuck" to the user.
+    sleep 1
     send -- "$password\r"
     exp_continue
+  }
+  -re {(?i)(permission denied|publickey|host key verification failed|connection refused|no route to host)} {
+    puts "\nERROR: SSH connection or authentication failed for the target host."
+    exit 1
+  }
+  timeout {
+    # Fall back to interactive mode so a human can type the password (or
+    # Ctrl-C) instead of expect silently swallowing all keyboard input.
+    puts "\nWARNING: no expected output for a long time. Handing the session over"
+    puts "to you so you can finish or interrupt it."
+    interact
+    catch wait result
+    set code [lindex $result 3]
+    if {$code eq ""} {
+      set code 1
+    }
+    exit $code
   }
   eof
 }
@@ -141,6 +169,11 @@ create_remote_script() {
   cat > "$output" <<'REMOTE_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Never let apt/debconf block on prompts, and suppress Ubuntu's needrestart
+# interactive dialog which otherwise hangs the bootstrap on a tty.
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 
 old_user="$1"
 new_user="$2"
@@ -433,7 +466,7 @@ if [ "$#" -ne 1 ]; then
 fi
 
 target="$1"
-current_password="password"
+current_password="${OKRUN_VM_PASSWORD:-password}"
 ssh_port="22"
 
 # Accept an optional user@ prefix on the target (e.g. arunoda@hostname.local).
@@ -527,17 +560,25 @@ run_with_expect_password "$current_password" \
   scp \
   -o PubkeyAuthentication=no \
   -o PreferredAuthentications=password \
+  -o NumberOfPasswordPrompts=2 \
+  -o ConnectTimeout=15 \
   -P "$ssh_port" \
   "$remote_script" "${current_user}@${target}:/tmp/okrun-imported-vm-bootstrap.sh"
 
 printf '\nRunning remote setup with expect password handling.\n'
+# The remote command pipes the password straight into `sudo -S`, so sudo never
+# shows an interactive "[sudo] password" prompt. expect therefore only has to
+# answer the single ssh login prompt, which removes the most common hang.
 run_with_expect_password "$current_password" \
   ssh \
-  -tt \
+  -T \
   -o PubkeyAuthentication=no \
   -o PreferredAuthentications=password \
+  -o NumberOfPasswordPrompts=2 \
+  -o ConnectTimeout=15 \
+  -o ServerAliveInterval=30 \
   -p "$ssh_port" \
   "${current_user}@${target}" \
-  "sudo bash /tmp/okrun-imported-vm-bootstrap.sh '$current_user' '$new_username' '$new_hostname' '$public_key_b64' '$lock_old_user'"
+  "printf '%s\\n' '$current_password' | sudo -S -p '' bash /tmp/okrun-imported-vm-bootstrap.sh '$current_user' '$new_username' '$new_hostname' '$public_key_b64' '$lock_old_user'"
 
 printf '\nSetup complete.\n'
