@@ -184,6 +184,7 @@ private final class VMTabSession {
     var virtualMachine: VZVirtualMachine?
     var fakeRunning = false
     var shutdownRequested = false
+    var vmStartedAt: Date?
     var projectLockFD: Int32?
     var privateNetworkRuntimes: [PrivateNetworkRuntime] = []
 #if arch(arm64)
@@ -1977,6 +1978,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
     private func start(session: VMTabSession, mode: VMMode) {
         guard !session.isRunning else { return }
 
+        if case .installer(let installerImage) = mode, InstallerImageVerifier.shouldCheck(url: installerImage) {
+            do {
+                try InstallerImageVerifier.verifyInstallerImage(at: installerImage)
+            } catch {
+                AppLog.virtualMachine.error(
+                    "Installer image rejected project=\(session.paths.root.path, privacy: .public) image=\(installerImage.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                )
+                setStatus(for: session, status: "Installer image invalid", detail: error.localizedDescription)
+                return
+            }
+        }
+
         do {
             try acquireProjectLock(for: session)
             let loaded = try reloadConfiguration(for: session)
@@ -2027,6 +2040,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
+                        session.vmStartedAt = Date()
                         AppLog.virtualMachine.info("VM started project=\(session.paths.root.path, privacy: .public)")
                         self?.setControlsEnabled(for: session, canStart: false, canStop: true)
                         self?.setStatus(for: session, status: "Running", detail: self?.runtimeDetail(for: session, "Mode: \(modeText)") ?? "")
@@ -2326,10 +2340,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         updateTabButtonState()
     }
 
+    /// A guest that shuts down cleanly within this many seconds of starting
+    /// almost certainly never found a bootable device (e.g. a truncated
+    /// installer ISO), so we report it as a failure instead of a normal
+    /// shutdown.
+    private static let earlyStopThreshold: TimeInterval = 10
+
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         DispatchQueue.main.async { [weak self] in
             guard let self, let session = self.session(for: virtualMachine) else { return }
-            AppLog.virtualMachine.info("Guest stopped project=\(session.paths.root.path, privacy: .public)")
+            let runtimeSeconds = session.vmStartedAt.map { Date().timeIntervalSince($0) }
+            let wasUserRequested = session.shutdownRequested
+            AppLog.virtualMachine.info(
+                "Guest stopped project=\(session.paths.root.path, privacy: .public) runtimeSeconds=\(runtimeSeconds.map { String(format: "%.1f", $0) } ?? "unknown", privacy: .public) userRequested=\(wasUserRequested)"
+            )
             self.releaseProjectLock(for: session)
             self.releasePrivateNetworkRuntimes(for: session)
             session.virtualMachine = nil
@@ -2337,9 +2361,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 #if arch(arm64)
             session.macOSInstaller = nil
 #endif
+            session.vmStartedAt = nil
             session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
-            self.setStatus(for: session, status: "Shutdown", detail: "The VM has shut down.")
+            if let runtimeSeconds, runtimeSeconds < Self.earlyStopThreshold, !wasUserRequested {
+                let secondsText = String(format: "%.1f", runtimeSeconds)
+                AppLog.virtualMachine.error(
+                    "Guest stopped unexpectedly soon project=\(session.paths.root.path, privacy: .public) runtimeSeconds=\(secondsText, privacy: .public)"
+                )
+                self.setStatus(
+                    for: session,
+                    status: "Stopped unexpectedly",
+                    detail: "The guest shut down \(secondsText) seconds after starting without reporting an error. " +
+                        "This usually means no bootable device was found. If you are installing from an ISO, " +
+                        "verify the download (size and checksum) and try again."
+                )
+            } else {
+                self.setStatus(for: session, status: "Shutdown", detail: "The VM has shut down.")
+            }
             self.completePendingCloseIfReady()
         }
     }
@@ -2355,6 +2394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 #if arch(arm64)
             session.macOSInstaller = nil
 #endif
+            session.vmStartedAt = nil
             session.shutdownRequested = false
             self.setControlsEnabled(for: session, canStart: true, canStop: false)
             self.setStatus(for: session, status: "Stopped with error", detail: error.localizedDescription)
