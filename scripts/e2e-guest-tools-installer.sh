@@ -156,6 +156,8 @@ assert_file_contains "$GUEST_ROOT/etc/systemd/system/mnt-okrun.mount" "Type=virt
 assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Name=enp0s2"
 assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "Address=10.77.0.9/24"
 assert_file_contains "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network" "RequiredForOnline=no"
+[[ -L "$GUEST_ROOT/etc/systemd/system/systemd-networkd-wait-online.service" ]]
+[[ "$(readlink "$GUEST_ROOT/etc/systemd/system/systemd-networkd-wait-online.service")" == "/dev/null" ]]
 if grep -q "DHCP=ipv4" "$GUEST_ROOT/etc/systemd/network/20-okrun-private.network"; then
   echo "Static --private-ip should win when --private-dhcp is also supplied." >&2
   exit 1
@@ -189,6 +191,8 @@ assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "
 assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "UseDNS=false"
 assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "UseRoutes=false"
 assert_file_contains "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network" "RequiredForOnline=no"
+[[ -L "$DHCP_ROOT/etc/systemd/system/systemd-networkd-wait-online.service" ]]
+[[ "$(readlink "$DHCP_ROOT/etc/systemd/system/systemd-networkd-wait-online.service")" == "/dev/null" ]]
 if grep -q "^Address=" "$DHCP_ROOT/etc/systemd/network/20-okrun-private.network"; then
   echo "DHCP private network config should not include a static Address line." >&2
   exit 1
@@ -286,6 +290,10 @@ assert_file_contains "$MACOS_ROOT/Library/LaunchDaemons/com.okrun.virtiofs.plist
 assert_file_contains "$MACOS_ROOT/usr/local/sbin/okrun-mount-virtiofs" 'MOUNT_POINT="/Volumes/okrun"'
 assert_file_contains "$MACOS_ROOT/Library/LaunchDaemons/com.okrun.private-network.plist" "com.okrun.private-network"
 assert_file_contains "$MACOS_ROOT/usr/local/sbin/okrun-private-network" 'ipconfig set "en1" DHCP'
+if [[ -e "$MACOS_ROOT/etc/systemd/system/systemd-networkd-wait-online.service" ]]; then
+  echo "macOS guests must not mask systemd-networkd-wait-online.service." >&2
+  exit 1
+fi
 
 MACOS_STATIC_ROOT="$WORK_DIR/macos-static-root"
 mkdir -p "$MACOS_STATIC_ROOT/Volumes/okrun/okrun-guest-logs"
