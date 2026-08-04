@@ -3,10 +3,12 @@ set -euo pipefail
 
 usage() {
   cat <<USAGE
-Usage: ./scripts/bootstrap-imported-vm.sh <hostname-or-ip>
+Usage: ./scripts/bootstrap-imported-vm.sh [user@]hostname-or-ip
 
 Interactive first-run bootstrapper for an imported Ubuntu VM.
 It asks for all selections first, then SSHes into the VM and applies them.
+When the target includes a user prefix (e.g. arunoda@vm01.local) that user is
+used as the SSH login; otherwise the default imported-VM login "user" is used.
 USAGE
 }
 
@@ -431,9 +433,18 @@ if [ "$#" -ne 1 ]; then
 fi
 
 target="$1"
-current_user="user"
 current_password="password"
 ssh_port="22"
+
+# Accept an optional user@ prefix on the target (e.g. arunoda@hostname.local).
+# When no user is given, fall back to the default imported-VM login "user".
+if [[ "$target" =~ ^([a-z_][a-z0-9_-]*)\@([^@]+)$ ]]; then
+  current_user="${BASH_REMATCH[1]}"
+  target="${BASH_REMATCH[2]}"
+else
+  current_user="user"
+fi
+validate_username "$current_user" || die "invalid SSH login username derived from: $1"
 
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
 command -v scp >/dev/null 2>&1 || die "scp is required"
@@ -442,7 +453,7 @@ command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
 command -v base64 >/dev/null 2>&1 || die "base64 is required"
 
 printf 'No remote commands will run until you confirm the final plan.\n\n'
-printf 'Using default VM SSH login: %s@%s:%s\n\n' "$current_user" "$target" "$ssh_port"
+printf 'Using VM SSH login: %s@%s:%s\n\n' "$current_user" "$target" "$ssh_port"
 
 while true; do
   new_username="$(prompt_default "New login username" "ubuntu")"
