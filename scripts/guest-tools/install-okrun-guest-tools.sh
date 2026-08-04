@@ -791,6 +791,11 @@ install_private_network_dhcp_config() {
 [Match]
 Name=$private_iface
 
+# The Okrun private switch NIC may have no carrier or DHCP server at boot.
+# Keep systemd-networkd-wait-online from blocking boot on it.
+[Link]
+RequiredForOnline=no
+
 [Network]
 DHCP=ipv4
 LinkLocalAddressing=no
@@ -800,6 +805,52 @@ IPv6AcceptRA=no
 UseDNS=false
 UseRoutes=false
 EOF
+}
+
+install_private_network_static_config() {
+  local private_iface="$1"
+  local private_ip_cidr="$2"
+  install -d -m 0755 "$(guest_path /etc/systemd/network)"
+  cat >"$(guest_path /etc/systemd/network/20-okrun-private.network)" <<EOF
+# Managed by Okrun guest tools.
+[Match]
+Name=$private_iface
+
+# The Okrun private switch NIC may have no carrier at boot.
+# Keep systemd-networkd-wait-online from blocking boot on it.
+[Link]
+RequiredForOnline=no
+
+[Network]
+Address=$private_ip_cidr
+EOF
+}
+
+upgrade_managed_private_network_config() {
+  # Older Okrun-managed configs lack RequiredForOnline=no, which makes
+  # systemd-networkd-wait-online stall boot for up to 2 minutes.
+  local config_file
+  config_file="$(private_managed_network_config)"
+  [[ -f "$config_file" ]] || return 0
+  grep -qs 'Managed by Okrun guest tools' "$config_file" || return 0
+  if grep -qs '^RequiredForOnline=no$' "$config_file"; then
+    return 0
+  fi
+  grep -qs '^RequiredForOnline=' "$config_file" && return 0
+
+  local iface address
+  iface="$(awk -F= '$1 == "Name" && $2 != "" { print $2; exit }' "$config_file")"
+  address="$(awk -F= '$1 == "Address" && $2 != "" { print $2; exit }' "$config_file")"
+  [[ -n "$iface" ]] || return 0
+
+  if grep -qs '^DHCP=ipv4$' "$config_file"; then
+    install_private_network_dhcp_config "$iface"
+  elif [[ -n "$address" ]]; then
+    install_private_network_static_config "$iface" "$address"
+  else
+    return 0
+  fi
+  echo "Upgraded Okrun private network config on $iface: it is no longer required for boot to be online."
 }
 
 installed_private_network_config="0"
@@ -812,16 +863,9 @@ if [[ -n "$PRIVATE_IP_CIDR" ]]; then
     echo "No Okrun private network interface detected; leaving network config unchanged. Enable privateNetwork for this VM, reboot it, then rerun with --private-ip."
   elif private_network_config_exists "$private_iface" "$PRIVATE_IP_CIDR"; then
     echo "Okrun private network config already exists; leaving it unchanged."
+    upgrade_managed_private_network_config
   else
-    install -d -m 0755 "$(guest_path /etc/systemd/network)"
-    cat >"$(guest_path /etc/systemd/network/20-okrun-private.network)" <<EOF
-# Managed by Okrun guest tools.
-[Match]
-Name=$private_iface
-
-[Network]
-Address=$PRIVATE_IP_CIDR
-EOF
+    install_private_network_static_config "$private_iface" "$PRIVATE_IP_CIDR"
     installed_private_network_config="1"
     echo "Okrun private network config set to $PRIVATE_IP_CIDR on $private_iface."
   fi
@@ -831,6 +875,7 @@ else
     echo "No Okrun private network interface detected; leaving network config unchanged. Enable privateNetwork for this VM, reboot it, then rerun this installer."
   elif private_managed_network_config_is_dhcp; then
     echo "Okrun DHCP private network config already exists; leaving it unchanged."
+    upgrade_managed_private_network_config
   else
     install_private_network_dhcp_config "$private_iface"
     installed_private_network_config="1"
