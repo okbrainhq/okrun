@@ -853,6 +853,38 @@ upgrade_managed_private_network_config() {
   echo "Upgraded Okrun private network config on $iface: it is no longer required for boot to be online."
 }
 
+disable_network_wait_online() {
+  # systemd-networkd-wait-online stalls boot for up to 2 minutes when ANY managed
+  # link fails to become routable quickly (e.g. the Okrun private switch NIC).
+  # RequiredForOnline=no in our /etc config is not enough: netplan and dracut
+  # generate overriding configs in /run/systemd/network that keep the link
+  # required. Okrun's guest health checks cover network readiness instead.
+  [[ "$GUEST_OS" == "linux" ]] || return 0
+
+  local unit="systemd-networkd-wait-online.service"
+  if [[ -n "$GUEST_ROOT" ]]; then
+    install -d -m 0755 "$(guest_path /etc/systemd/system)"
+    local unit_link
+    unit_link="$(guest_path "/etc/systemd/system/$unit")"
+    if [[ ! -e "$unit_link" && ! -L "$unit_link" ]]; then
+      ln -s /dev/null "$unit_link"
+      echo "Masked $unit in test root."
+    fi
+    return 0
+  fi
+
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local state
+  state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+  if [[ "$state" == "masked" ]]; then
+    echo "$unit is already masked; leaving it unchanged."
+    return 0
+  fi
+  systemctl mask "$unit" >/dev/null 2>&1
+  systemctl stop "$unit" >/dev/null 2>&1 || true
+  echo "Masked $unit so boot does not wait for all NICs to be online."
+}
+
 installed_private_network_config="0"
 if [[ -n "$PRIVATE_IP_CIDR" ]]; then
   if [[ "$PRIVATE_DHCP_EXPLICIT" == "1" ]]; then
@@ -882,6 +914,8 @@ else
     echo "Okrun private network DHCP config installed on $private_iface."
   fi
 fi
+
+disable_network_wait_online
 
 resize_root_if_requested() {
   [[ "$RESIZE_ROOT" == "1" ]] || return 0
