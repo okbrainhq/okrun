@@ -325,13 +325,14 @@ For Ubuntu VMs imported from a generic image or clone, run the bootstrap helper
 after the first boot:
 
 ```sh
-./scripts/bootstrap-imported-vm.sh <hostname-or-ip>
+./scripts/bootstrap-imported-vm.sh [user@]hostname-or-ip
 ```
 
 The bootstrap helper assumes the imported VM is reachable by SSH with the
-default `user` / `password` login. It asks for the new Linux username, hostname,
-and SSH public key, prints a full plan, and only runs remote commands after you
-confirm.
+default `user` / `password` login, or with the `user@` prefix you pass on the
+target (e.g. `arunoda@vm01.local`). It asks for the new Linux username,
+hostname, and SSH public key, prints a full plan, and only runs remote commands
+after you confirm.
 
 On the guest it updates packages, creates or updates the chosen login user,
 installs your SSH key, enables passwordless sudo, regenerates cloned machine
