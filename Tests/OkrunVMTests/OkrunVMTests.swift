@@ -2906,6 +2906,129 @@ struct OkrunVMTests {
     }
 
 
+    @Test
+    func projectSafetyAllowsDeletingStandardProjectFolder() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let paths = VMPaths.project(at: project)
+        try FileManager.default.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: paths.config.path, contents: Data())
+        FileManager.default.createFile(atPath: project.appendingPathComponent(".DS_Store").path, contents: Data())
+
+        try ProjectSafety.validateProjectDeletable(at: project, registeredProjects: [project.path])
+    }
+
+    @Test
+    func projectSafetyRejectsDeletingFolderContainingOtherVMs() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let paths = VMPaths.project(at: project)
+        try FileManager.default.createDirectory(at: paths.vmDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: paths.config.path, contents: Data())
+        try FileManager.default.createDirectory(
+            at: project.appendingPathComponent("Another VM", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let error = #expect(throws: AppError.self) {
+            try ProjectSafety.validateProjectDeletable(at: project, registeredProjects: [project.path])
+        }
+        #expect(error?.message.contains("Another VM") == true)
+        #expect(error?.message.contains("Nothing was deleted") == true)
+    }
+
+    @Test
+    func projectSafetyRejectsDeletingFolderWithUnexpectedFiles() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        FileManager.default.createFile(atPath: project.appendingPathComponent("notes.txt").path, contents: Data())
+
+        let error = #expect(throws: AppError.self) {
+            try ProjectSafety.validateProjectDeletable(at: project, registeredProjects: [])
+        }
+        #expect(error?.message.contains("notes.txt") == true)
+    }
+
+    @Test
+    func projectSafetyRejectsDeletingFolderContainingNestedRegisteredProject() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let nested = project.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+        let error = #expect(throws: AppError.self) {
+            try ProjectSafety.validateProjectDeletable(at: project, registeredProjects: [project.path, nested.path])
+        }
+        #expect(error?.message.contains("another registered VM") == true)
+    }
+
+    @Test
+    func projectSafetyRejectsDeletingHomeOrRoot() throws {
+        #expect(throws: AppError.self) {
+            try ProjectSafety.validateProjectDeletable(at: URL(fileURLWithPath: "/"), registeredProjects: [])
+        }
+
+        #expect(throws: AppError.self) {
+            try ProjectSafety.validateProjectDeletable(
+                at: FileManager.default.homeDirectoryForCurrentUser,
+                registeredProjects: []
+            )
+        }
+    }
+
+    @Test
+    func projectSafetyAllowsDeletingMissingProjectFolder() throws {
+        let project = try makeTemporaryDirectory()
+        removeTemporaryDirectory(project)
+
+        try ProjectSafety.validateProjectDeletable(at: project, registeredProjects: [project.path])
+    }
+
+    @Test
+    func projectSafetyAllowsNewProjectInMissingOrEmptyFolder() throws {
+        let base = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(base) }
+
+        try ProjectSafety.validateNewProjectLocation(at: base.appendingPathComponent("new-vm", isDirectory: true))
+
+        let empty = base.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        try ProjectSafety.validateNewProjectLocation(at: empty)
+    }
+
+    @Test
+    func projectSafetyRejectsNewProjectInNonEmptyFolder() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        try FileManager.default.createDirectory(
+            at: project.appendingPathComponent("Existing VM", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let error = #expect(throws: AppError.self) {
+            try ProjectSafety.validateNewProjectLocation(at: project)
+        }
+        #expect(error?.message.contains("not empty") == true)
+    }
+
+    @Test
+    func projectSafetyRejectsNewProjectOverExistingFile() throws {
+        let base = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(base) }
+
+        let filePath = base.appendingPathComponent("blocker").path
+        FileManager.default.createFile(atPath: filePath, contents: Data())
+
+        #expect(throws: AppError.self) {
+            try ProjectSafety.validateNewProjectLocation(at: URL(fileURLWithPath: filePath))
+        }
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("OkrunVMTests", isDirectory: true)

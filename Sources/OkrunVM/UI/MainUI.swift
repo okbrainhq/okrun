@@ -1087,6 +1087,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         guard let request = askForNewProject() else { return }
 
         do {
+            try ProjectSafety.validateNewProjectLocation(at: request.projectURL)
             try FileManager.default.createDirectory(at: request.projectURL, withIntermediateDirectories: true)
             let paths = VMPaths.project(at: request.projectURL)
             try request.config.save(to: paths.config)
@@ -1195,6 +1196,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
 
         do {
             AppLog.lifecycle.warning("Deleting project path=\(selectedProject, privacy: .public)")
+            try ProjectSafety.validateProjectDeletable(
+                at: URL(fileURLWithPath: selectedProject, isDirectory: true),
+                registeredProjects: registry.projects
+            )
             let fileManager = FileManager.default
             if fileManager.fileExists(atPath: selectedProject) {
                 try fileManager.removeItem(atPath: selectedProject)
