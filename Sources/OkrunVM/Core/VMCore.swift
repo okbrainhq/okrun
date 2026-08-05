@@ -521,6 +521,7 @@ struct VMConfig: Codable, Equatable {
     let sharedDirectories: [SharedDirectoryConfig]
     let diskIO: DiskIOConfig
     let startup: VMStartupConfig
+    let audioEnabled: Bool
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -534,6 +535,7 @@ struct VMConfig: Codable, Equatable {
         case sharedDirectories
         case diskIO
         case startup
+        case audioEnabled
     }
 
     init(
@@ -547,7 +549,8 @@ struct VMConfig: Codable, Equatable {
         sharedDirectories: [SharedDirectoryConfig] = [],
         diskIO: DiskIOConfig = .defaults,
         startup: VMStartupConfig = .disabled,
-        guestOS: GuestOS = .linux
+        guestOS: GuestOS = .linux,
+        audioEnabled: Bool = false
     ) {
         self.name = name
         self.guestOS = guestOS
@@ -560,6 +563,7 @@ struct VMConfig: Codable, Equatable {
         self.sharedDirectories = sharedDirectories
         self.diskIO = diskIO
         self.startup = startup
+        self.audioEnabled = audioEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -575,6 +579,7 @@ struct VMConfig: Codable, Equatable {
         sharedDirectories = try container.decodeIfPresent([SharedDirectoryConfig].self, forKey: .sharedDirectories) ?? []
         diskIO = try container.decodeIfPresent(DiskIOConfig.self, forKey: .diskIO) ?? .defaults
         startup = try container.decodeIfPresent(VMStartupConfig.self, forKey: .startup) ?? .disabled
+        audioEnabled = try container.decodeIfPresent(Bool.self, forKey: .audioEnabled) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -594,6 +599,7 @@ struct VMConfig: Codable, Equatable {
         try container.encode(sharedDirectories, forKey: .sharedDirectories)
         try container.encode(diskIO, forKey: .diskIO)
         try container.encode(startup, forKey: .startup)
+        try container.encode(audioEnabled, forKey: .audioEnabled)
     }
 
     static func load(from url: URL) throws -> VMConfig {
@@ -615,7 +621,8 @@ struct VMConfig: Codable, Equatable {
             || !Self.configDataContainsDiskFormat(data)
             || !Self.configDataContainsDiskIO(data)
             || !Self.configDataContainsPrivateNetwork(data)
-            || !Self.configDataContainsStartup(data) {
+            || !Self.configDataContainsStartup(data)
+            || !Self.configDataContainsAudio(data) {
             try config.save(to: url)
         }
         return config
@@ -686,7 +693,8 @@ struct VMConfig: Codable, Equatable {
             sharedDirectories: sharedDirectories,
             diskIO: diskIO,
             startup: startup,
-            guestOS: guestOS
+            guestOS: guestOS,
+            audioEnabled: audioEnabled
         )
     }
 
@@ -708,6 +716,10 @@ struct VMConfig: Codable, Equatable {
 
     private static func configDataContainsStartup(_ data: Data) -> Bool {
         configData(data, contains: CodingKeys.startup.rawValue)
+    }
+
+    private static func configDataContainsAudio(_ data: Data) -> Bool {
+        configData(data, contains: CodingKeys.audioEnabled.rawValue)
     }
 
     private static func configData(_ data: Data, contains key: String) -> Bool {
@@ -855,6 +867,26 @@ enum NetworkDeviceFactory {
         ]
         let string = macBytes.map { String(format: "%02x", $0) }.joined(separator: ":")
         return VZMACAddress(string: string)
+    }
+}
+
+enum AudioDeviceFactory {
+    /// Builds the VM's audio devices.
+    ///
+    /// Uses a virtio-sound device with a host audio output stream so guest
+    /// audio plays through the Mac's default output device. Input (mic)
+    /// streams are intentionally not attached: `VZHostAudioInputStreamSource`
+    /// requires macOS 15+ and hosts without a default input device.
+    ///
+    /// macOS guests are skipped because macOS has no virtio-sound guest driver.
+    static func makeDevices(enabled: Bool, guestOS: GuestOS) -> [VZAudioDeviceConfiguration] {
+        guard enabled, guestOS == .linux else { return [] }
+
+        let soundDevice = VZVirtioSoundDeviceConfiguration()
+        let outputStream = VZVirtioSoundDeviceOutputStreamConfiguration()
+        outputStream.sink = VZHostAudioOutputStreamSink()
+        soundDevice.streams = [outputStream]
+        return [soundDevice]
     }
 }
 

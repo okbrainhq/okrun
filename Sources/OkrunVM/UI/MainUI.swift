@@ -1704,7 +1704,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
                 sharedDirectories: currentConfig.sharedDirectories,
                 diskIO: currentConfig.diskIO,
                 startup: currentConfig.startup,
-                guestOS: currentConfig.guestOS
+                guestOS: currentConfig.guestOS,
+                audioEnabled: currentConfig.audioEnabled
             )
             try updatedConfig.save(to: session.paths.config)
             session.config = updatedConfig
@@ -2186,6 +2187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVi
         }
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.storageDevices = try makeStorageDevices(paths: paths, mode: mode, config: config)
+        configuration.audioDevices = AudioDeviceFactory.makeDevices(enabled: config.audioEnabled, guestOS: config.guestOS)
         configuration.directorySharingDevices = try DirectorySharingDeviceFactory.makeDevices(
             for: config.sharedDirectories,
             managedGuestLogsDirectory: ManagedGuestTools.guestLogsDirectory(in: paths)
