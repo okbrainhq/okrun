@@ -413,6 +413,42 @@ to reach local host services on those ports.
 See [web-switch/README.md](web-switch/README.md) for full server deployment,
 certificate, revocation, and LaunchAgent setup.
 
+## Logs & Diagnostics
+
+Okrun is a desktop app, but its logs go to macOS unified logging (`os.Logger`)
+under subsystem `local.okrun.vm` (or `com.okrun.vm`), not to a file. Log
+categories: `lifecycle`, `storage`, `virtual-machine`, and `web-switch`.
+
+Tail live logs in a terminal while the app runs:
+
+```sh
+./scripts/logs web-switch       # private network / switch activity
+./scripts/logs virtual-machine  # VM runtime events, dropped guest frames
+./scripts/logs all              # every category
+```
+
+You can also filter by subsystem `local.okrun.vm` in Console.app.
+
+To inspect logs after a crash or a long-running session:
+
+```sh
+log show --last 24h --predicate 'subsystem == "local.okrun.vm"' | less
+```
+
+Warnings worth watching for during long VM uptimes:
+
+- `Rate limited broadcast/multicast frames to remote switch` (`web-switch`) —
+  guest multicast chatter exceeded the forwarding budget.
+- `Dropping switch frames due to congestion` (`web-switch`) — the switch
+  connection is congested and frames are being shed.
+- `Dropped private network frame` (`virtual-machine`) — a guest frame could not
+  be delivered locally.
+
+Kernel panics and crash reports land in `/Library/Logs/DiagnosticReports/*.ips`.
+A `userspace watchdog timeout: no successful checkins from configd` panic means
+a system daemon (usually configd) was starved by a stalled network path — check
+the Okrun warnings above in the hours before the panic.
+
 ## Other Useful Stuff
 
 Use Okrun's **Shutdown** control or shut down from inside the guest. Force stop is
@@ -427,7 +463,7 @@ the guest.
 `OKRUN_HOME` points Okrun at a different state directory. `OKRUN_REGISTRY_PATH`
 overrides only the project registry path.
 
-Useful diagnostics:
+Useful diagnostics (see **Logs & Diagnostics** for details):
 
 ```sh
 ./scripts/logs all

@@ -1254,6 +1254,8 @@ final class PrivateNetworkRuntime {
     private var frameObservers: [(PrivateNetworkFrameDirection, Data) -> Void] = []
     private var hostServices: [AnyObject] = []
     private var droppedGuestFrameCount: UInt64 = 0
+    private var cachedPeerURLs: [URL] = []
+    private var directoryWatchSource: DispatchSourceFileSystemObject?
 
     init(identifier: String) throws {
         self.identifier = identifier
@@ -1307,11 +1309,15 @@ final class PrivateNetworkRuntime {
         }
         hostSource.resume()
         peerSource.resume()
+
+        refreshPeerCache()
+        startDirectoryWatch()
     }
 
     deinit {
         hostSource.cancel()
         peerSource.cancel()
+        directoryWatchSource?.cancel()
         close(hostDescriptor)
         close(peerDescriptor)
         try? FileManager.default.removeItem(at: peerURL)
@@ -1358,12 +1364,11 @@ final class PrivateNetworkRuntime {
     }
 
     private func broadcastFrame(_ frame: [UInt8], count: Int) {
-        guard let peers = try? FileManager.default.contentsOfDirectory(at: networkDirectory, includingPropertiesForKeys: nil) else {
-            return
-        }
+        guard !cachedPeerURLs.isEmpty else { return }
 
-        for peer in peers where peer.pathExtension == "sock" && peer != peerURL {
-            _ = frame.withUnsafeBufferPointer { pointer in
+        var stalePeers: [URL] = []
+        for peer in cachedPeerURLs {
+            let result = frame.withUnsafeBufferPointer { pointer in
                 Self.sendUnixDatagram(
                     descriptor: peerDescriptor,
                     buffer: pointer.baseAddress,
@@ -1371,7 +1376,46 @@ final class PrivateNetworkRuntime {
                     to: peer.path
                 )
             }
+            if result < 0 && errno == ENOENT {
+                stalePeers.append(peer)
+            }
         }
+
+        if !stalePeers.isEmpty {
+            cachedPeerURLs.removeAll { stalePeers.contains($0) }
+        }
+    }
+
+    private func refreshPeerCache() {
+        let peers = (try? FileManager.default.contentsOfDirectory(
+            at: networkDirectory,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        cachedPeerURLs = peers.filter { $0.pathExtension == "sock" && $0 != peerURL }
+    }
+
+    private func startDirectoryWatch() {
+        let descriptor = open(networkDirectory.path, O_EVTONLY)
+        guard descriptor >= 0 else {
+            AppLog.virtualMachine.warning(
+                "Failed to watch private network directory privateNetwork=\(self.identifier, privacy: .public) error=\(String(cString: strerror(errno)), privacy: .public)"
+            )
+            return
+        }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .delete, .rename],
+            queue: queue
+        )
+        source.setEventHandler { [weak self] in
+            self?.refreshPeerCache()
+        }
+        source.setCancelHandler {
+            close(descriptor)
+        }
+        directoryWatchSource = source
+        source.resume()
     }
 
     func addFrameObserver(_ observer: @escaping (PrivateNetworkFrameDirection, Data) -> Void) {

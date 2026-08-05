@@ -462,6 +462,12 @@ final class PendingSwitchWriteBuffer {
         return (freshEntries.map(\.data), dropped)
     }
 
+    func popOldest(at now: Date = Date()) -> Data? {
+        pruneExpired(at: now)
+        guard !entries.isEmpty else { return nil }
+        return entries.removeFirst().data
+    }
+
     func removeAll() {
         entries.removeAll()
     }
@@ -706,6 +712,7 @@ private final class RealSwitchSocket {
     private static let defaultWebKeepaliveTimeout: TimeInterval = 25
     private static let defaultLocalKeepaliveInterval: TimeInterval = 0.5
     private static let defaultLocalKeepaliveTimeout: TimeInterval = 1.5
+    private static let maxInFlightWrites = 256
 
     var onFrame: ((SwitchFrame) -> Void)?
     var onResetSeq: (([UInt32]) -> Void)?
@@ -722,6 +729,8 @@ private final class RealSwitchSocket {
     private var decoder: SwitchFrameDecoder
     private var connection: NWConnection?
     private var pendingWrites = PendingSwitchWriteBuffer()
+    private var inFlightWrites = 0
+    private var droppedCongestedWrites: UInt64 = 0
     private var initialized = false
     private var stopped = false
     private var maxFrameSize: Int
@@ -783,6 +792,7 @@ private final class RealSwitchSocket {
             connection?.cancel()
             connection = nil
             pendingWrites.removeAll()
+            inFlightWrites = 0
         }
     }
 
@@ -795,6 +805,7 @@ private final class RealSwitchSocket {
     private func startOnQueue() {
         guard !stopped else { return }
         initialized = false
+        inFlightWrites = 0
         maxFrameSize = SwitchFrame.defaultMaxFrameSize
         let keepaliveDefaults = defaultKeepaliveTiming
         clientKeepaliveInterval = keepaliveDefaults.interval
@@ -1233,8 +1244,25 @@ private final class RealSwitchSocket {
             }
             return
         }
+        guard inFlightWrites < Self.maxInFlightWrites else {
+            if !pendingWrites.append(data) {
+                droppedCongestedWrites += 1
+                if droppedCongestedWrites == 1 || droppedCongestedWrites.isMultiple(of: 1000) {
+                    AppLog.webSwitch.warning(
+                        "Dropping switch frames due to congestion network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) dropped=\(self.droppedCongestedWrites, privacy: .public)"
+                    )
+                }
+            }
+            return
+        }
         SwitchDebug.log("write encoded bytes=\(data.count)")
         sendNow(data)
+    }
+
+    private func drainPendingWritesOnQueue() {
+        while inFlightWrites < Self.maxInFlightWrites, let next = pendingWrites.popOldest() {
+            sendNow(next)
+        }
     }
 
     private func flushPendingWrites() {
@@ -1252,19 +1280,25 @@ private final class RealSwitchSocket {
 
     private func sendNow(_ data: Data) {
         guard let connection else { return }
-        connection.send(content: data, completion: .contentProcessed { [weak self] error in
-            guard let self, let error else { return }
+        inFlightWrites += 1
+        connection.send(content: data, completion: .contentProcessed { [weak self, weak connection] error in
+            guard let self else { return }
             queue.async {
-                guard let connection = self.connection else { return }
-                AppLog.webSwitch.error(
-                    "send failed network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
-                )
-                self.closeConnection(
-                    connection,
-                    message: "Switch send failed: \(error.localizedDescription)",
-                    error: error.localizedDescription,
-                    retry: true
-                )
+                guard let connection, self.connection === connection else { return }
+                self.inFlightWrites = max(0, self.inFlightWrites - 1)
+                if let error {
+                    AppLog.webSwitch.error(
+                        "send failed network=\(self.identifier, privacy: .public) server=\(self.endpoint.description, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                    self.closeConnection(
+                        connection,
+                        message: "Switch send failed: \(error.localizedDescription)",
+                        error: error.localizedDescription,
+                        retry: true
+                    )
+                    return
+                }
+                self.drainPendingWritesOnQueue()
             }
         })
     }
@@ -1415,6 +1449,7 @@ private final class RealSwitchSocket {
     ) {
         guard activeConnection === connection else { return }
         initialized = false
+        inFlightWrites = 0
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
         cancelClientKeepalive()
@@ -1437,6 +1472,7 @@ private final class RealSwitchSocket {
     ) {
         guard activeConnection === connection else { return }
         initialized = false
+        inFlightWrites = 0
         cancelConnectionTimeout()
         cancelInitResponseTimeout()
         cancelClientKeepalive()
@@ -1623,6 +1659,8 @@ final class PrivateNetworkSwitchTransport {
 
     private static let queueKey = DispatchSpecificKey<UUID>()
     private static let localMacTtl: TimeInterval = 5 * 60
+    private static let remoteNonUnicastBurstLimit: Double = 256
+    private static let remoteNonUnicastRefillPerSecond: Double = 64
 
     private let identifier: String
     private let config: PrivateNetworkSwitchConnectionConfig
@@ -1636,6 +1674,9 @@ final class PrivateNetworkSwitchTransport {
     private var runtimes: [WeakRuntime] = []
     private var localMACs: [EthernetAddress: Date] = [:]
     private var status: PrivateNetworkSwitchStatus
+    private var remoteNonUnicastTokens = PrivateNetworkSwitchTransport.remoteNonUnicastBurstLimit
+    private var remoteNonUnicastLastRefill = Date()
+    private var droppedRemoteNonUnicastFrames: UInt64 = 0
 
     convenience init(
         identifier: String,
@@ -1798,11 +1839,39 @@ final class PrivateNetworkSwitchTransport {
                 SwitchDebug.log("skip local destination=\(header.destination.description) bytes=\(frame.count)")
                 return
             }
+            if !header.destination.isUnicast && !allowNonUnicastFrameToRemote(now: currentDate) {
+                SwitchDebug.log("drop rate-limited non-unicast destination=\(header.destination.description) bytes=\(frame.count)")
+                return
+            }
             SwitchDebug.log("send local destination=\(header.destination.description) source=\(header.source.description) bytes=\(frame.count)")
         } else {
             SwitchDebug.log("send local malformed-ethernet bytes=\(frame.count)")
         }
         sendFrameToRemote(frame)
+    }
+
+    private func allowNonUnicastFrameToRemote(now: Date) -> Bool {
+        let elapsed = now.timeIntervalSince(remoteNonUnicastLastRefill)
+        if elapsed > 0 {
+            remoteNonUnicastTokens = min(
+                Self.remoteNonUnicastBurstLimit,
+                remoteNonUnicastTokens + elapsed * Self.remoteNonUnicastRefillPerSecond
+            )
+            remoteNonUnicastLastRefill = now
+        }
+
+        guard remoteNonUnicastTokens >= 1 else {
+            droppedRemoteNonUnicastFrames += 1
+            if droppedRemoteNonUnicastFrames == 1 || droppedRemoteNonUnicastFrames.isMultiple(of: 1000) {
+                AppLog.webSwitch.warning(
+                    "Rate limited broadcast/multicast frames to remote switch network=\(self.identifier, privacy: .public) dropped=\(self.droppedRemoteNonUnicastFrames, privacy: .public)"
+                )
+            }
+            return false
+        }
+
+        remoteNonUnicastTokens -= 1
+        return true
     }
 
     private func injectFrameToLocalGuests(_ frame: Data) {
