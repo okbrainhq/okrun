@@ -144,6 +144,7 @@ struct OkrunVMTests {
         #expect(config.sharedDirectories == [])
         #expect(config.diskIO == .defaults)
         #expect(config.startup == .disabled)
+        #expect(config.audioEnabled == false)
 
         let migratedData = try Data(contentsOf: configURL)
         let migratedJSON = try #require(JSONSerialization.jsonObject(with: migratedData) as? [String: Any])
@@ -158,6 +159,32 @@ struct OkrunVMTests {
         let startup = try #require(migratedJSON["startup"] as? [String: Any])
         #expect(startup["startOnAppLaunch"] as? Bool == false)
         #expect(startup["mode"] as? String == "installed")
+        #expect(migratedJSON["audioEnabled"] as? Bool == false)
+    }
+
+    @Test
+    func vmConfigSavesAndLoadsAudioEnabled() throws {
+        let project = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(project) }
+
+        let configURL = project.appendingPathComponent("okrun-vm.json")
+        let config = try VMConfig(
+            cpuCount: 4,
+            memoryGB: 4,
+            diskGB: 64,
+            installerISOPath: nil,
+            audioEnabled: false
+        ).validated()
+        try config.save(to: configURL)
+
+        let loaded = try VMConfig.load(from: configURL)
+
+        #expect(loaded.audioEnabled == false)
+        #expect(loaded == config)
+
+        let savedData = try Data(contentsOf: configURL)
+        let savedJSON = try #require(JSONSerialization.jsonObject(with: savedData) as? [String: Any])
+        #expect(savedJSON["audioEnabled"] as? Bool == false)
     }
 
     @Test

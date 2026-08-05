@@ -98,9 +98,17 @@ folders, and per-VM private networking:
   "startup": {
     "startOnAppLaunch": false,
     "mode": "installed"
-  }
+  },
+  "audioEnabled": false
 }
 ```
+
+New VM configs include `"audioEnabled": false`, so the VM runs without a sound
+device until you opt in. Set it to `true` (Linux guests only) and Okrun attaches
+a virtio-sound device whose output plays through your Mac's default audio
+output, so guest audio is heard on the host. The guest kernel must include the
+virtio-snd driver (`zgrep SND_VIRTIO /proc/config.gz`); Ubuntu 24.04+ kernels
+ship it as a module, and PulseAudio/PipeWire picks up the card automatically.
 
 Use `"guestOS": "macos"` with an IPSW path in `installerISOPath` for a macOS
 guest. When macOS is selected in **Add VM**, Okrun can open or copy Apple's
