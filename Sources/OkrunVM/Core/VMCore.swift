@@ -1270,7 +1270,15 @@ final class PrivateNetworkRuntimeRegistry {
 }
 
 final class PrivateNetworkRuntime {
+    private struct PeerMACRoute {
+        var peerURL: URL
+        var updatedAt: Date
+    }
+
     private static let maxFramesPerReadEvent = 512
+    private static let peerMacTtl: TimeInterval = 5 * 60
+    private static let peerFloodBurstLimit: Double = 256
+    private static let peerFloodRefillPerSecond: Double = 64
 
     let identifier: String
     let fileHandle: FileHandle
@@ -1286,7 +1294,19 @@ final class PrivateNetworkRuntime {
     private var frameObservers: [(PrivateNetworkFrameDirection, Data) -> Void] = []
     private var hostServices: [AnyObject] = []
     private var droppedGuestFrameCount: UInt64 = 0
+    private var droppedPeerIngressFloodFrames: UInt64 = 0
+    private var droppedPeerEgressFloodFrames: UInt64 = 0
+    private var failedPeerSendCount: UInt64 = 0
+    private var prunedPeerCount: UInt64 = 0
     private var cachedPeerURLs: [URL] = []
+    private var localGuestMACs: [EthernetAddress: Date] = [:]
+    private var peerMACRoutes: [EthernetAddress: PeerMACRoute] = [:]
+    private var peerIngressFloodLimiters: [String: PrivateNetworkTokenBucket] = [:]
+    private var peerEgressFloodLimiter = PrivateNetworkTokenBucket(
+        burstLimit: PrivateNetworkRuntime.peerFloodBurstLimit,
+        refillPerSecond: PrivateNetworkRuntime.peerFloodRefillPerSecond
+    )
+    private var guestWriteBackoff = PrivateNetworkGuestWriteBackoff()
     private var directoryWatchSource: DispatchSourceFileSystemObject?
 
     init(identifier: String) throws {
@@ -1339,11 +1359,11 @@ final class PrivateNetworkRuntime {
         peerSource.setEventHandler { [weak self] in
             self?.readPeerFrames()
         }
-        hostSource.resume()
-        peerSource.resume()
 
         refreshPeerCache()
         startDirectoryWatch()
+        hostSource.resume()
+        peerSource.resume()
     }
 
     deinit {
@@ -1363,8 +1383,9 @@ final class PrivateNetworkRuntime {
             let count = recv(hostDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
             if count > 0 {
                 framesRead += 1
-                notifyObservers(direction: .fromGuest, frame: Data(buffer.prefix(count)))
-                broadcastFrame(buffer, count: count)
+                let frame = Data(buffer.prefix(count))
+                notifyObservers(direction: .fromGuest, frame: frame)
+                forwardFrameToPeers(frame)
                 continue
             }
             if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1379,13 +1400,36 @@ final class PrivateNetworkRuntime {
         var framesRead = 0
 
         while framesRead < Self.maxFramesPerReadEvent {
-            let count = recv(peerDescriptor, &buffer, buffer.count, MSG_DONTWAIT)
+            var sourceAddress = sockaddr_un()
+            var sourceLength = socklen_t(MemoryLayout<sockaddr_un>.size)
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                withUnsafeMutablePointer(to: &sourceAddress) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        recvfrom(
+                            peerDescriptor,
+                            bytes.baseAddress,
+                            bytes.count,
+                            MSG_DONTWAIT,
+                            $0,
+                            &sourceLength
+                        )
+                    }
+                }
+            }
             if count > 0 {
                 framesRead += 1
-                notifyObservers(direction: .fromPeer, frame: Data(buffer.prefix(count)))
-                buffer.withUnsafeBufferPointer { pointer in
-                    writeFrameToGuest(pointer.baseAddress, count: count, source: "peer")
+                let frame = Data(buffer.prefix(count))
+                let sourceURL = validatedPeerURL(Self.unixDatagramURL(
+                    from: sourceAddress,
+                    length: sourceLength
+                ))
+                let currentDate = Date()
+                learnPeerRoute(from: frame, peerURL: sourceURL, now: currentDate)
+                guard shouldInjectPeerFrame(frame, from: sourceURL, now: currentDate) else {
+                    continue
                 }
+                notifyObservers(direction: .fromPeer, frame: frame)
+                writeFrameToGuest(frame, source: "peer")
                 continue
             }
             if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1395,26 +1439,104 @@ final class PrivateNetworkRuntime {
         }
     }
 
-    private func broadcastFrame(_ frame: [UInt8], count: Int) {
+    private func forwardFrameToPeers(_ frame: Data) {
         guard !cachedPeerURLs.isEmpty else { return }
 
-        var stalePeers: [URL] = []
-        for peer in cachedPeerURLs {
-            let result = frame.withUnsafeBufferPointer { pointer in
+        let currentDate = Date()
+        expirePeerMACs(now: currentDate)
+        let header = EthernetFrameHeader.parse(frame)
+        if let header, header.source.isUnicast {
+            localGuestMACs[header.source] = currentDate
+        }
+
+        let targets: [URL]
+        if let header, header.destination.isUnicast {
+            if localGuestMACs[header.destination] != nil {
+                return
+            }
+            if let route = peerMACRoutes[header.destination], cachedPeerURLs.contains(route.peerURL) {
+                targets = [route.peerURL]
+            } else {
+                peerMACRoutes[header.destination] = nil
+                targets = cachedPeerURLs
+            }
+        } else {
+            guard peerEgressFloodLimiter.allow(at: currentDate) else {
+                recordPeerFloodDrop(direction: "egress", frame: frame, reason: "rate limit")
+                return
+            }
+            targets = cachedPeerURLs
+        }
+
+        var stalePeers: [(url: URL, errorCode: Int32)] = []
+        for peer in targets {
+            let result = frame.withUnsafeBytes { bytes in
                 Self.sendUnixDatagram(
                     descriptor: peerDescriptor,
-                    buffer: pointer.baseAddress,
-                    count: count,
+                    buffer: bytes.baseAddress,
+                    count: bytes.count,
                     to: peer.path
                 )
             }
-            if result < 0 && errno == ENOENT {
-                stalePeers.append(peer)
+            guard result < 0 else { continue }
+            let errorCode = errno
+            if errorCode == ENOENT || errorCode == ECONNREFUSED {
+                stalePeers.append((peer, errorCode))
+            } else {
+                recordPeerSendFailure(peer: peer, errorCode: errorCode, frame: frame)
             }
         }
 
-        if !stalePeers.isEmpty {
-            cachedPeerURLs.removeAll { stalePeers.contains($0) }
+        for stalePeer in stalePeers {
+            prunePeer(stalePeer.url, errorCode: stalePeer.errorCode)
+        }
+    }
+
+    private func shouldInjectPeerFrame(_ frame: Data, from sourceURL: URL?, now currentDate: Date) -> Bool {
+        guard let header = EthernetFrameHeader.parse(frame) else {
+            recordPeerFloodDrop(direction: "ingress", frame: frame, reason: "malformed ethernet")
+            return false
+        }
+        guard !header.destination.isUnicast else { return true }
+
+        if guestWriteBackoff.blocksFloodTraffic(at: currentDate) {
+            recordPeerFloodDrop(direction: "ingress", frame: frame, reason: "guest queue backoff")
+            return false
+        }
+
+        let key = sourceURL?.path ?? "unknown-peer"
+        var limiter = peerIngressFloodLimiters[key] ?? PrivateNetworkTokenBucket(
+            burstLimit: Self.peerFloodBurstLimit,
+            refillPerSecond: Self.peerFloodRefillPerSecond,
+            now: currentDate
+        )
+        let allowed = limiter.allow(at: currentDate)
+        peerIngressFloodLimiters[key] = limiter
+        if !allowed {
+            recordPeerFloodDrop(direction: "ingress", frame: frame, reason: "rate limit")
+        }
+        return allowed
+    }
+
+    private func learnPeerRoute(from frame: Data, peerURL: URL?, now currentDate: Date) {
+        guard let peerURL,
+              let header = EthernetFrameHeader.parse(frame),
+              header.source.isUnicast else {
+            return
+        }
+        if !cachedPeerURLs.contains(peerURL) {
+            cachedPeerURLs.append(peerURL)
+        }
+        peerMACRoutes[header.source] = PeerMACRoute(peerURL: peerURL, updatedAt: currentDate)
+    }
+
+    private func expirePeerMACs(now currentDate: Date) {
+        localGuestMACs = localGuestMACs.filter {
+            currentDate.timeIntervalSince($0.value) <= Self.peerMacTtl
+        }
+        peerMACRoutes = peerMACRoutes.filter {
+            currentDate.timeIntervalSince($0.value.updatedAt) <= Self.peerMacTtl
+                && cachedPeerURLs.contains($0.value.peerURL)
         }
     }
 
@@ -1423,7 +1545,44 @@ final class PrivateNetworkRuntime {
             at: networkDirectory,
             includingPropertiesForKeys: nil
         )) ?? []
-        cachedPeerURLs = peers.filter { $0.pathExtension == "sock" && $0 != peerURL }
+        let ownPeerPath = peerURL.standardizedFileURL.path
+        cachedPeerURLs = Array(Set(peers.compactMap { candidate -> URL? in
+            let standardized = candidate.standardizedFileURL
+            guard standardized.pathExtension == "sock", standardized.path != ownPeerPath else {
+                return nil
+            }
+            return standardized
+        })).sorted { $0.path < $1.path }
+        let cachedPeers = Set(cachedPeerURLs)
+        peerMACRoutes = peerMACRoutes.filter { cachedPeers.contains($0.value.peerURL) }
+        peerIngressFloodLimiters = peerIngressFloodLimiters.filter { key, _ in
+            key == "unknown-peer" || cachedPeers.contains(URL(fileURLWithPath: key))
+        }
+    }
+
+    private func prunePeer(_ peer: URL, errorCode: Int32) {
+        cachedPeerURLs.removeAll { $0 == peer }
+        peerMACRoutes = peerMACRoutes.filter { $0.value.peerURL != peer }
+        peerIngressFloodLimiters[peer.path] = nil
+        if errorCode == ECONNREFUSED {
+            try? FileManager.default.removeItem(at: peer)
+        }
+
+        prunedPeerCount += 1
+        AppLog.virtualMachine.info(
+            "Pruned stale private network peer privateNetwork=\(self.identifier, privacy: .public) peer=\(peer.lastPathComponent, privacy: .public) pruned=\(self.prunedPeerCount, privacy: .public) reason=\(String(cString: strerror(errorCode)), privacy: .public)"
+        )
+    }
+
+    private func validatedPeerURL(_ candidate: URL?) -> URL? {
+        guard let candidate else { return nil }
+        let standardized = candidate.standardizedFileURL
+        guard standardized.pathExtension == "sock",
+              standardized != peerURL.standardizedFileURL,
+              standardized.deletingLastPathComponent() == networkDirectory.standardizedFileURL else {
+            return nil
+        }
+        return standardized
     }
 
     private func startDirectoryWatch() {
@@ -1457,9 +1616,15 @@ final class PrivateNetworkRuntime {
     }
 
     func injectFrameToGuest(_ frame: Data) {
-        frame.withUnsafeBytes { bytes in
-            guard let baseAddress = bytes.baseAddress else { return }
-            writeFrameToGuest(baseAddress, count: frame.count, source: "remote")
+        queue.async { [weak self] in
+            guard let self else { return }
+            if let header = EthernetFrameHeader.parse(frame),
+               !header.destination.isUnicast,
+               self.guestWriteBackoff.blocksFloodTraffic(at: Date()) {
+                self.recordPeerFloodDrop(direction: "remote-ingress", frame: frame, reason: "guest queue backoff")
+                return
+            }
+            self.writeFrameToGuest(frame, source: "remote")
         }
     }
 
@@ -1493,28 +1658,64 @@ final class PrivateNetworkRuntime {
         }
     }
 
-    private func writeFrameToGuest(_ buffer: UnsafeRawPointer?, count: Int, source: String) {
-        guard count > 0, let buffer else { return }
-        let result = write(hostDescriptor, buffer, count)
-        guard result == count else {
-            let reason: String
+    private func writeFrameToGuest(_ frame: Data, source: String) {
+        guard !frame.isEmpty else { return }
+        let result = frame.withUnsafeBytes { bytes in
+            write(hostDescriptor, bytes.baseAddress, bytes.count)
+        }
+        guard result == frame.count else {
+            let errorCode = result < 0 ? errno : 0
+            var reason: String
             if result < 0 {
-                reason = String(cString: strerror(errno))
+                reason = String(cString: strerror(errorCode))
+                if errorCode == ENOBUFS || errorCode == EAGAIN || errorCode == EWOULDBLOCK {
+                    let delay = guestWriteBackoff.recordCongestion(at: Date())
+                    reason += " backoffMs=\(Int((delay * 1_000).rounded()))"
+                }
             } else {
-                reason = "partial write \(result)/\(count)"
+                reason = "partial write \(result)/\(frame.count)"
             }
-            recordDroppedGuestFrame(source: source, reason: reason)
+            recordDroppedGuestFrame(source: source, reason: reason, frame: frame)
             return
         }
+        guestWriteBackoff.recordSuccess()
     }
 
-    private func recordDroppedGuestFrame(source: String, reason: String) {
+    private func recordDroppedGuestFrame(source: String, reason: String, frame: Data) {
         droppedGuestFrameCount += 1
         guard droppedGuestFrameCount == 1 || droppedGuestFrameCount.isMultiple(of: 100) else {
             return
         }
+        let frameDescription = EthernetFrameHeader.parse(frame)?.logDescription ?? "malformedEthernet=true"
         AppLog.virtualMachine.warning(
-            "Dropped private network frame privateNetwork=\(self.identifier, privacy: .public) source=\(source, privacy: .public) dropped=\(self.droppedGuestFrameCount, privacy: .public) reason=\(reason, privacy: .public)"
+            "Dropped private network frame privateNetwork=\(self.identifier, privacy: .public) source=\(source, privacy: .public) dropped=\(self.droppedGuestFrameCount, privacy: .public) reason=\(reason, privacy: .public) \(frameDescription, privacy: .public)"
+        )
+    }
+
+    private func recordPeerFloodDrop(direction: String, frame: Data, reason: String) {
+        let dropped: UInt64
+        if direction == "egress" {
+            droppedPeerEgressFloodFrames += 1
+            dropped = droppedPeerEgressFloodFrames
+        } else {
+            droppedPeerIngressFloodFrames += 1
+            dropped = droppedPeerIngressFloodFrames
+        }
+        guard dropped == 1 || dropped.isMultiple(of: 1_000) else { return }
+
+        let frameDescription = EthernetFrameHeader.parse(frame)?.logDescription ?? "malformedEthernet=true"
+        AppLog.virtualMachine.warning(
+            "Rate limited private network peer flood privateNetwork=\(self.identifier, privacy: .public) direction=\(direction, privacy: .public) dropped=\(dropped, privacy: .public) reason=\(reason, privacy: .public) \(frameDescription, privacy: .public)"
+        )
+    }
+
+    private func recordPeerSendFailure(peer: URL, errorCode: Int32, frame: Data) {
+        failedPeerSendCount += 1
+        guard failedPeerSendCount == 1 || failedPeerSendCount.isMultiple(of: 100) else { return }
+
+        let frameDescription = EthernetFrameHeader.parse(frame)?.logDescription ?? "malformedEthernet=true"
+        AppLog.virtualMachine.warning(
+            "Failed to send private network peer frame privateNetwork=\(self.identifier, privacy: .public) peer=\(peer.lastPathComponent, privacy: .public) failed=\(self.failedPeerSendCount, privacy: .public) reason=\(String(cString: strerror(errorCode)), privacy: .public) \(frameDescription, privacy: .public)"
         )
     }
 
@@ -1537,7 +1738,9 @@ final class PrivateNetworkRuntime {
             }
         }
 
-        let length = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
+        let addressHeaderSize = MemoryLayout<sockaddr_un>.size - pathCapacity
+        let length = socklen_t(addressHeaderSize + path.utf8.count + 1)
+        address.sun_len = UInt8(length)
         let result = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(descriptor, $0, length)
@@ -1550,7 +1753,7 @@ final class PrivateNetworkRuntime {
 
     private static func sendUnixDatagram(
         descriptor: Int32,
-        buffer: UnsafePointer<UInt8>?,
+        buffer: UnsafeRawPointer?,
         count: Int,
         to path: String
     ) -> Int {
@@ -1558,6 +1761,7 @@ final class PrivateNetworkRuntime {
         address.sun_family = sa_family_t(AF_UNIX)
         let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
         guard path.utf8.count < pathCapacity else {
+            errno = ENAMETOOLONG
             return -1
         }
 
@@ -1567,12 +1771,34 @@ final class PrivateNetworkRuntime {
             }
         }
 
-        let length = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
+        let addressHeaderSize = MemoryLayout<sockaddr_un>.size - pathCapacity
+        let length = socklen_t(addressHeaderSize + path.utf8.count + 1)
+        address.sun_len = UInt8(length)
         return withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 sendto(descriptor, buffer, count, MSG_DONTWAIT, $0, length)
             }
         }
+    }
+
+    private static func unixDatagramURL(from address: sockaddr_un, length: socklen_t) -> URL? {
+        var address = address
+        let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
+        let addressHeaderSize = MemoryLayout<sockaddr_un>.size - pathCapacity
+        guard Int(length) > addressHeaderSize else { return nil }
+
+        let encodedLength = min(Int(length) - addressHeaderSize, pathCapacity)
+        let pathBytes = withUnsafeBytes(of: &address.sun_path) { bytes -> [UInt8] in
+            var result = Array(bytes.prefix(encodedLength))
+            if result.last == 0 {
+                result.removeLast()
+            }
+            return result
+        }
+        guard !pathBytes.isEmpty, let path = String(bytes: pathBytes, encoding: .utf8) else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
     }
 }
 

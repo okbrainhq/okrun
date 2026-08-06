@@ -8,6 +8,32 @@ section() {
 section "Okrun processes"
 pgrep -fl "OkrunVM|com.apple.Virtualization.VirtualMachine|com.apple.Virtualization.EventTap" || true
 
+section "Private network peer sockets"
+socket_root="${OKRUN_PRIVATE_NETWORK_SOCKET_ROOT:-/tmp/okrun-vnet}"
+if [[ -d "$socket_root" ]]; then
+  active_peer_paths="$(netstat -anv -f unix 2>/dev/null | awk -v root="$socket_root/" 'index($0, root) { print $NF }' || true)"
+  total_peers=0
+  active_peers=0
+  stale_peers=0
+  while IFS= read -r peer; do
+    [[ -n "$peer" ]] || continue
+    total_peers=$((total_peers + 1))
+    if printf '%s\n' "$active_peer_paths" | grep -Fqx "$peer"; then
+      active_peers=$((active_peers + 1))
+      printf 'ACTIVE %s\n' "$peer"
+    else
+      stale_peers=$((stale_peers + 1))
+      printf 'STALE  %s\n' "$peer"
+    fi
+  done < <(find "$socket_root" -type s -name '*.sock' -print 2>/dev/null | sort)
+  printf 'Summary total=%s active=%s stale=%s\n' "$total_peers" "$active_peers" "$stale_peers"
+
+  printf '\nActive socket counters:\n'
+  netstat -anv -f unix 2>/dev/null | awk -v root="$socket_root/" 'index($0, root)' || true
+else
+  printf 'No private network socket directory at %s.\n' "$socket_root"
+fi
+
 section "VM service resource use"
 vm_pids="$(pgrep -f "com.apple.Virtualization.VirtualMachine" || true)"
 if [[ -n "$vm_pids" ]]; then

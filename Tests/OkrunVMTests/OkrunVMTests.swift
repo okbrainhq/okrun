@@ -1336,6 +1336,57 @@ struct OkrunVMTests {
         throw AppError("Timed out waiting for private network frame.")
     }
 
+    private func waitForOptionalFrame(on descriptor: Int32, timeout: TimeInterval) -> Data? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let frame = readFrame(on: descriptor) {
+                return frame
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        return nil
+    }
+
+    private func waitForCondition(timeout: TimeInterval, condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        return condition()
+    }
+
+    private func makeStaleUnixDatagramSocket(at url: URL) throws {
+        let descriptor = socket(AF_UNIX, SOCK_DGRAM, 0)
+        guard descriptor >= 0 else {
+            throw AppError("Failed to create stale peer test socket: \(String(cString: strerror(errno))).")
+        }
+        defer { close(descriptor) }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
+        guard url.path.utf8.count < pathCapacity else {
+            throw AppError("Stale peer test socket path is too long.")
+        }
+        _ = withUnsafeMutablePointer(to: &address.sun_path.0) { pointer in
+            url.path.withCString { source in
+                strncpy(pointer, source, pathCapacity - 1)
+            }
+        }
+        let addressHeaderSize = MemoryLayout<sockaddr_un>.size - pathCapacity
+        let length = socklen_t(addressHeaderSize + url.path.utf8.count + 1)
+        address.sun_len = UInt8(length)
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, length)
+            }
+        }
+        guard result == 0 else {
+            throw AppError("Failed to bind stale peer test socket: \(String(cString: strerror(errno))).")
+        }
+    }
+
     @Test
     func switchFrameProtocolRoundTripsAndHandlesPartialReads() throws {
         let frame = SwitchFrame(
@@ -1418,6 +1469,140 @@ struct OkrunVMTests {
         #expect(SwitchServerErrorRetryPolicy.policy(for: nil) == .delayed(60))
         #expect(SwitchServerErrorRetryPolicy.policy(for: "invalid_init") == .none)
         #expect(SwitchServerErrorRetryPolicy.policy(for: "frame_too_large") == .none)
+    }
+
+    @Test
+    func privateNetworkTokenBucketRefillsWithoutExceedingItsBurst() {
+        let start = Date(timeIntervalSince1970: 100)
+        var bucket = PrivateNetworkTokenBucket(burstLimit: 2, refillPerSecond: 1, now: start)
+
+        let first = bucket.allow(at: start)
+        let second = bucket.allow(at: start)
+        let exhausted = bucket.allow(at: start)
+        let refilled = bucket.allow(at: start.addingTimeInterval(1))
+        let exhaustedAgain = bucket.allow(at: start.addingTimeInterval(1))
+        let burstFirst = bucket.allow(at: start.addingTimeInterval(10))
+        let burstSecond = bucket.allow(at: start.addingTimeInterval(10))
+        let burstExhausted = bucket.allow(at: start.addingTimeInterval(10))
+
+        #expect(first)
+        #expect(second)
+        #expect(!exhausted)
+        #expect(refilled)
+        #expect(!exhaustedAgain)
+        #expect(burstFirst)
+        #expect(burstSecond)
+        #expect(!burstExhausted)
+    }
+
+    @Test
+    func privateNetworkGuestWriteBackoffIsBoundedAndResetsAfterSuccess() {
+        let start = Date(timeIntervalSince1970: 200)
+        var backoff = PrivateNetworkGuestWriteBackoff(initialDelay: 0.01, maximumDelay: 0.04)
+
+        let firstDelay = backoff.recordCongestion(at: start)
+        let secondDelay = backoff.recordCongestion(at: start)
+        let thirdDelay = backoff.recordCongestion(at: start)
+        let boundedDelay = backoff.recordCongestion(at: start)
+        #expect(firstDelay == 0.01)
+        #expect(secondDelay == 0.02)
+        #expect(thirdDelay == 0.04)
+        #expect(boundedDelay == 0.04)
+        #expect(backoff.blocksFloodTraffic(at: start.addingTimeInterval(0.039)))
+        #expect(!backoff.blocksFloodTraffic(at: start.addingTimeInterval(0.041)))
+
+        backoff.recordSuccess()
+        #expect(backoff.consecutiveFailures == 0)
+        #expect(!backoff.blocksFloodTraffic(at: start))
+        let resetDelay = backoff.recordCongestion(at: start)
+        #expect(resetDelay == 0.01)
+    }
+
+    @Test
+    func privateNetworkRouterRateLimitsFloodTrafficOnTheActiveSendPath() {
+        let clock = TestClock(now: Date(timeIntervalSince1970: 300))
+        let router = PrivateNetworkTransportRouter(
+            identifier: "router-\(UUID().uuidString)",
+            remoteFloodBurstLimit: 2,
+            remoteFloodRefillPerSecond: 1,
+            now: { clock.now }
+        )
+        let webSwitch = MockRoutableTransport()
+        router.setWebSwitch(webSwitch)
+        let destination = [UInt8](repeating: 0xff, count: 6)
+        let source: [UInt8] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01]
+        let frames = (0..<4).map {
+            ethernetFrame(destination: destination, source: source, payload: [UInt8($0)])
+        }
+
+        router.routeLocalFrame(frames[0])
+        router.routeLocalFrame(frames[1])
+        router.routeLocalFrame(frames[2])
+        #expect(webSwitch.sentFrames == Array(frames.prefix(2)))
+
+        clock.advance(by: 1)
+        router.routeLocalFrame(frames[3])
+        #expect(webSwitch.sentFrames == [frames[0], frames[1], frames[3]])
+    }
+
+    @Test
+    func privateNetworkRuntimeExcludesSelfAndUsesLearnedMACToAvoidUnicastFanout() throws {
+        let identifier = "runtime-mac-\(UUID().uuidString)"
+        let runtimeA = try PrivateNetworkRuntime(identifier: identifier)
+        let runtimeB = try PrivateNetworkRuntime(identifier: identifier)
+        let runtimeC = try PrivateNetworkRuntime(identifier: identifier)
+        let macA: [UInt8] = [0x02, 0xa0, 0xa0, 0xa0, 0xa0, 0x01]
+        let macB: [UInt8] = [0x02, 0xb0, 0xb0, 0xb0, 0xb0, 0x01]
+        let macC: [UInt8] = [0x02, 0xc0, 0xc0, 0xc0, 0xc0, 0x01]
+        let broadcast = [UInt8](repeating: 0xff, count: 6)
+
+        let announceC = ethernetFrame(destination: broadcast, source: macC, payload: [0x01])
+        runtimeC.fileHandle.write(announceC)
+        #expect(try waitForFrame(on: runtimeA.fileHandle.fileDescriptor, timeout: 1) == announceC)
+        #expect(try waitForFrame(on: runtimeB.fileHandle.fileDescriptor, timeout: 1) == announceC)
+
+        let announceB = ethernetFrame(destination: broadcast, source: macB, payload: [0x02])
+        runtimeB.fileHandle.write(announceB)
+        #expect(try waitForFrame(on: runtimeA.fileHandle.fileDescriptor, timeout: 1) == announceB)
+        #expect(try waitForFrame(on: runtimeC.fileHandle.fileDescriptor, timeout: 1) == announceB)
+        #expect(waitForOptionalFrame(on: runtimeB.fileHandle.fileDescriptor, timeout: 0.1) == nil)
+
+        let unicastToB = ethernetFrame(destination: macB, source: macA, payload: [0x03])
+        runtimeA.fileHandle.write(unicastToB)
+        let receivedByB = try waitForFrame(on: runtimeB.fileHandle.fileDescriptor, timeout: 1)
+        let receivedByC = waitForOptionalFrame(on: runtimeC.fileHandle.fileDescriptor, timeout: 0.2)
+        #expect(receivedByB == unicastToB, "receivedByB=\([UInt8](receivedByB))")
+        #expect(receivedByC == nil, "receivedByC=\(receivedByC.map { [UInt8]($0) } ?? [])")
+        withExtendedLifetime((runtimeA, runtimeB, runtimeC)) {}
+    }
+
+    @Test
+    func privateNetworkRuntimePrunesConnectionRefusedPeers() throws {
+        let identifier = "runtime-stale-\(UUID().uuidString)"
+        let socketRoot = ProcessInfo.processInfo.environment["OKRUN_PRIVATE_NETWORK_SOCKET_ROOT"]
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? "/tmp/okrun-vnet"
+        let networkDirectory = URL(fileURLWithPath: socketRoot, isDirectory: true)
+            .appendingPathComponent(identifier, isDirectory: true)
+        try FileManager.default.createDirectory(at: networkDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: networkDirectory) }
+
+        let stalePeer = networkDirectory.appendingPathComponent("stale.sock")
+        try makeStaleUnixDatagramSocket(at: stalePeer)
+        #expect(FileManager.default.fileExists(atPath: stalePeer.path))
+
+        let runtime = try PrivateNetworkRuntime(identifier: identifier)
+        let frame = ethernetFrame(
+            destination: [UInt8](repeating: 0xff, count: 6),
+            source: [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x01],
+            payload: [0x04]
+        )
+        runtime.fileHandle.write(frame)
+
+        #expect(waitForCondition(timeout: 1) {
+            !FileManager.default.fileExists(atPath: stalePeer.path)
+        })
+        withExtendedLifetime(runtime) {}
     }
 
     @Test
