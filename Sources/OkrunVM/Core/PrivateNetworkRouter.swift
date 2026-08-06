@@ -108,17 +108,21 @@ final class PrivateNetworkTransportRouter {
         var candidates: [TransportCandidate]
         var sendsToAllReachable: Bool
         var logsNoReachableTransport: Bool
+        var rateLimitsFloodTraffic: Bool
 
         static let none = LocalFrameSendPlan(
             candidates: [],
             sendsToAllReachable: false,
-            logsNoReachableTransport: false
+            logsNoReachableTransport: false,
+            rateLimitsFloodTraffic: false
         )
     }
 
     private static let queueKey = DispatchSpecificKey<UUID>()
     private static let defaultMacTtl: TimeInterval = 5 * 60
     private static let remoteFrameDedupTtl: TimeInterval = 0.25
+    private static let defaultRemoteFloodBurstLimit: Double = 256
+    private static let defaultRemoteFloodRefillPerSecond: Double = 64
 
     private let identifier: String
     private let queueID = UUID()
@@ -132,15 +136,24 @@ final class PrivateNetworkTransportRouter {
     private var localMACs: [EthernetAddress: Date] = [:]
     private var remoteRoutes: [EthernetAddress: RemoteRouteEntry] = [:]
     private var remoteFrameFingerprints: [RemoteFrameFingerprint: RemoteFrameObservation] = [:]
+    private var remoteFloodLimiter: PrivateNetworkTokenBucket
+    private var droppedRemoteFloodFrames: UInt64 = 0
 
     init(
         identifier: String,
         macTtl: TimeInterval = defaultMacTtl,
+        remoteFloodBurstLimit: Double = defaultRemoteFloodBurstLimit,
+        remoteFloodRefillPerSecond: Double = defaultRemoteFloodRefillPerSecond,
         now: @escaping () -> Date = Date.init
     ) {
         self.identifier = identifier
         self.macTtl = macTtl
         self.now = now
+        remoteFloodLimiter = PrivateNetworkTokenBucket(
+            burstLimit: remoteFloodBurstLimit,
+            refillPerSecond: remoteFloodRefillPerSecond,
+            now: now()
+        )
         queue = DispatchQueue(label: "okrun.private-network-router.\(identifier).\(UUID().uuidString)")
         queue.setSpecific(key: Self.queueKey, value: queueID)
     }
@@ -323,7 +336,8 @@ final class PrivateNetworkTransportRouter {
                     TransportCandidate(transport: webSwitch, route: .webSwitch)
                 ],
                 sendsToAllReachable: false,
-                logsNoReachableTransport: logsNoReachableTransport
+                logsNoReachableTransport: logsNoReachableTransport,
+                rateLimitsFloodTraffic: false
             )
         }
 
@@ -334,7 +348,8 @@ final class PrivateNetworkTransportRouter {
                     TransportCandidate(transport: localSwitch, route: .localSwitch)
                 ],
                 sendsToAllReachable: false,
-                logsNoReachableTransport: logsNoReachableTransport
+                logsNoReachableTransport: logsNoReachableTransport,
+                rateLimitsFloodTraffic: false
             )
         }
 
@@ -348,7 +363,8 @@ final class PrivateNetworkTransportRouter {
                 TransportCandidate(transport: localSwitch, route: .localSwitch)
             ],
             sendsToAllReachable: false,
-            logsNoReachableTransport: logsNoReachableTransport
+            logsNoReachableTransport: logsNoReachableTransport,
+            rateLimitsFloodTraffic: false
         )
     }
 
@@ -359,7 +375,8 @@ final class PrivateNetworkTransportRouter {
                 TransportCandidate(transport: localSwitch, route: .localSwitch)
             ],
             sendsToAllReachable: true,
-            logsNoReachableTransport: logsNoReachableTransport
+            logsNoReachableTransport: logsNoReachableTransport,
+            rateLimitsFloodTraffic: true
         )
     }
 
@@ -372,6 +389,10 @@ final class PrivateNetworkTransportRouter {
             return
         }
 
+        if plan.rateLimitsFloodTraffic && !allowRemoteFloodFrame(frame) {
+            return
+        }
+
         let selectedTransports = plan.sendsToAllReachable ? transports : [transports[0]]
         for transport in selectedTransports {
             let routeName = transport.route.logName
@@ -380,6 +401,25 @@ final class PrivateNetworkTransportRouter {
             )
             transport.transport.sendFrameToRemote(frame)
         }
+    }
+
+    private func allowRemoteFloodFrame(_ frame: Data) -> Bool {
+        let result: (allowed: Bool, dropped: UInt64) = runOnQueue {
+            guard self.remoteFloodLimiter.allow(at: self.now()) else {
+                self.droppedRemoteFloodFrames += 1
+                return (false, self.droppedRemoteFloodFrames)
+            }
+            return (true, self.droppedRemoteFloodFrames)
+        }
+        guard !result.allowed else { return true }
+
+        if result.dropped == 1 || result.dropped.isMultiple(of: 1_000) {
+            let frameDescription = EthernetFrameHeader.parse(frame)?.logDescription ?? "malformedEthernet=true"
+            AppLog.virtualMachine.warning(
+                "Rate limited private network flood traffic to remote switch privateNetwork=\(self.identifier, privacy: .public) dropped=\(result.dropped, privacy: .public) \(frameDescription, privacy: .public)"
+            )
+        }
+        return false
     }
 
     private func removeRemoteRoutesOnQueue(_ route: PrivateNetworkTransportRoute) {

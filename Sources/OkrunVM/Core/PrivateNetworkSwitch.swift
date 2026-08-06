@@ -1648,19 +1648,12 @@ private enum SwitchTLSIdentity {
 }
 
 final class PrivateNetworkSwitchTransport {
-    private struct WeakRuntime {
-        weak var runtime: PrivateNetworkRuntime?
-    }
-
     enum RouteAvailability {
         case allowConnecting
         case connectedOnly
     }
 
     private static let queueKey = DispatchSpecificKey<UUID>()
-    private static let localMacTtl: TimeInterval = 5 * 60
-    private static let remoteNonUnicastBurstLimit: Double = 256
-    private static let remoteNonUnicastRefillPerSecond: Double = 64
 
     private let identifier: String
     private let config: PrivateNetworkSwitchConnectionConfig
@@ -1671,12 +1664,7 @@ final class PrivateNetworkSwitchTransport {
     private let queueID = UUID()
     private let queue: DispatchQueue
     private let client: PrivateNetworkSwitchClient
-    private var runtimes: [WeakRuntime] = []
-    private var localMACs: [EthernetAddress: Date] = [:]
     private var status: PrivateNetworkSwitchStatus
-    private var remoteNonUnicastTokens = PrivateNetworkSwitchTransport.remoteNonUnicastBurstLimit
-    private var remoteNonUnicastLastRefill = Date()
-    private var droppedRemoteNonUnicastFrames: UInt64 = 0
 
     convenience init(
         identifier: String,
@@ -1772,28 +1760,6 @@ final class PrivateNetworkSwitchTransport {
         client.stop()
     }
 
-    func addRuntime(_ runtime: PrivateNetworkRuntime) {
-        runtime.addFrameObserver { [weak self] direction, frame in
-            guard direction == .fromGuest else { return }
-            self?.queue.async {
-                self?.handleLocalFrame(frame)
-            }
-        }
-
-        queue.async { [weak self, weak runtime] in
-            guard let self, let runtime else { return }
-            self.runtimes.removeAll { $0.runtime == nil || $0.runtime === runtime }
-            self.runtimes.append(WeakRuntime(runtime: runtime))
-        }
-    }
-
-    func removeRuntime(_ runtime: PrivateNetworkRuntime) {
-        queue.async { [weak self, weak runtime] in
-            guard let self, let runtime else { return }
-            self.runtimes.removeAll { $0.runtime == nil || $0.runtime === runtime }
-        }
-    }
-
     func statusSnapshot() -> PrivateNetworkSwitchStatus {
         runOnQueue {
             status
@@ -1830,74 +1796,15 @@ final class PrivateNetworkSwitchTransport {
         client.send(frame)
     }
 
-    private func handleLocalFrame(_ frame: Data) {
-        let currentDate = Date()
-        expireLocalMACsOnQueue(now: currentDate)
-        if let header = EthernetFrameHeader.parse(frame) {
-            localMACs[header.source] = currentDate
-            guard shouldForwardLocalFrameToRemote(destination: header.destination) else {
-                SwitchDebug.log("skip local destination=\(header.destination.description) bytes=\(frame.count)")
-                return
-            }
-            if !header.destination.isUnicast && !allowNonUnicastFrameToRemote(now: currentDate) {
-                SwitchDebug.log("drop rate-limited non-unicast destination=\(header.destination.description) bytes=\(frame.count)")
-                return
-            }
-            SwitchDebug.log("send local destination=\(header.destination.description) source=\(header.source.description) bytes=\(frame.count)")
-        } else {
-            SwitchDebug.log("send local malformed-ethernet bytes=\(frame.count)")
-        }
-        sendFrameToRemote(frame)
-    }
-
-    private func allowNonUnicastFrameToRemote(now: Date) -> Bool {
-        let elapsed = now.timeIntervalSince(remoteNonUnicastLastRefill)
-        if elapsed > 0 {
-            remoteNonUnicastTokens = min(
-                Self.remoteNonUnicastBurstLimit,
-                remoteNonUnicastTokens + elapsed * Self.remoteNonUnicastRefillPerSecond
-            )
-            remoteNonUnicastLastRefill = now
-        }
-
-        guard remoteNonUnicastTokens >= 1 else {
-            droppedRemoteNonUnicastFrames += 1
-            if droppedRemoteNonUnicastFrames == 1 || droppedRemoteNonUnicastFrames.isMultiple(of: 1000) {
-                AppLog.webSwitch.warning(
-                    "Rate limited broadcast/multicast frames to remote switch network=\(self.identifier, privacy: .public) dropped=\(self.droppedRemoteNonUnicastFrames, privacy: .public)"
-                )
-            }
-            return false
-        }
-
-        remoteNonUnicastTokens -= 1
-        return true
-    }
-
     private func injectFrameToLocalGuests(_ frame: Data) {
         if let header = EthernetFrameHeader.parse(frame) {
             SwitchDebug.log("inject remote destination=\(header.destination.description) source=\(header.source.description) bytes=\(frame.count)")
         } else {
             SwitchDebug.log("inject remote malformed-ethernet bytes=\(frame.count)")
         }
-        if let onRemoteFrame {
-            onRemoteFrame(frame)
-        } else {
-            runtimes.removeAll { $0.runtime == nil }
-            for weakRuntime in runtimes {
-                weakRuntime.runtime?.injectFrameToGuest(frame)
-            }
-        }
+        onRemoteFrame?(frame)
     }
 
-    private func shouldForwardLocalFrameToRemote(destination: EthernetAddress) -> Bool {
-        guard destination.isUnicast else { return true }
-        return localMACs[destination] == nil
-    }
-
-    private func expireLocalMACsOnQueue(now currentDate: Date) {
-        localMACs = localMACs.filter { currentDate.timeIntervalSince($0.value) <= Self.localMacTtl }
-    }
 
     private func runOnQueue<T>(_ work: () -> T) -> T {
         if DispatchQueue.getSpecific(key: Self.queueKey) == queueID {
