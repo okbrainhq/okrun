@@ -117,6 +117,136 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/status
 ```
 
+## Ubuntu Network-Only Client
+
+An Ubuntu machine (physical or virtual) can join an existing **Web Switch** using
+its own host bundle, without installing the Swift app or hosting any VMs. The
+client creates `okrun0`, an Ethernet TAP interface, and connects outbound using
+mTLS. Ubuntu and existing OKRun VMs can then communicate using their private IPs.
+This is a client of the existing switch, not another switch server.
+
+### Local + cloud routing (same policy as macOS)
+
+Add `--local-server LAN_HOST:9444` to the CLI, or supply a fifth installer
+argument. The cloud endpoint and mTLS keys still come from the host bundle:
+
+```bash
+sudo bash scripts/install-network-client.sh \
+  ~/okrun-switch-bundle.json 10.77.0.2/24 okrun okrun0 192.168.1.10:9444
+
+# Or run in the foreground:
+sudo node web-switch/bin/okrun-network.js \
+  --bundle ~/okrun-switch-bundle.json --ip 10.77.0.2/24 \
+  --local-server 192.168.1.10:9444
+```
+
+Replace the example LAN address with your local switch's reachable address.
+It must listen on its LAN interface, not only `127.0.0.1`; allow its TCP port
+through the LAN firewall. No LAN address discovery is performed.
+
+Both transports stay connected. Broadcast/unknown destinations use both paths;
+learned local peers prefer local, falling back to cloud when local is down.
+Cloud-only peers use cloud. Failed transports retry every five seconds without
+recreating the TAP. Recovery restores local preference for remembered local
+peers; expired routes are learned again through discovery. MAC routes expire
+after five minutes. Cross-path duplicates are suppressed for 250 ms, discovery
+is rate-limited (256-frame burst, 64 frames/second), and incoming traffic is
+never bridged from one switch to the other.
+
+**Security:** the macOS local switch protocol is unauthenticated, unencrypted
+TCP. Only enable it on a trusted LAN and restrict the listener with a firewall.
+Private keys are not transmitted; client certificates are used only for cloud
+mTLS. Omitting `--local-server` preserves cloud-only behavior.
+
+### Credentials and address
+
+On your CA/admin machine, issue a separate host bundle for each Ubuntu machine:
+
+```bash
+# From web-switch/; use the same CA/cert root as your existing switch.
+./issue-client.sh ubuntu-box switch.example.com:9443 --certs-dir .certs/prod
+```
+
+Securely copy `.certs/prod/hosts/ubuntu-box/okrun-switch-bundle.json` to Ubuntu.
+Only the host bundle is needed: **never copy the CA private key or server bundle**.
+The bundle contains `server`, `caCertPem`, `clientCertPem`, and `clientKeyPem`.
+Treat it as a password; revoke it with the existing certificate-revocation tools
+if the machine is lost.
+
+Choose an unused private address and prefix in the same subnet as your VMs,
+**outside all VM DHCP pools**. The example below uses `10.77.0.2/24`; substitute
+an address appropriate for your network. The client does not run DHCP or allocate
+addresses automatically. Avoid a subnet overlapping Ubuntu's existing LAN/VPN.
+The network name must exactly match the VMs' `networkIdentifier` (usually `okrun`).
+
+### Run or install on Ubuntu
+
+Prerequisites: system-wide Node.js 20+ (`/usr/bin/node` or `/usr/local/bin/node` for
+the installer), Python 3, `iproute2`, and `/dev/net/tun`. Run as root or with
+`CAP_NET_ADMIN`. A container must additionally be granted TUN/TAP device access.
+From a checkout of this repository on Ubuntu:
+
+```bash
+chmod 600 ~/okrun-switch-bundle.json
+
+# Optional: validate credentials/config without connecting or changing networking.
+node web-switch/bin/okrun-network.js \
+  --bundle ~/okrun-switch-bundle.json --ip 10.77.0.2/24 --network okrun --check
+
+# Foreground connection (Ctrl-C disconnects and removes the interface).
+sudo node web-switch/bin/okrun-network.js \
+  --bundle ~/okrun-switch-bundle.json --ip 10.77.0.2/24 --network okrun
+
+# Or install an auto-starting service with automatic reconnect after failures.
+sudo bash scripts/install-network-client.sh \
+  ~/okrun-switch-bundle.json 10.77.0.2/24 okrun okrun0
+
+journalctl -u okrun-network -n 30 --no-pager
+ip address show okrun0
+ping <vm-private-ip>
+ssh <user>@<vm-private-ip>
+```
+
+The installer copies only the network client and TAP helper into
+`/opt/okrun-network`, stores the bundle root-only in `/etc/okrun-network/host.json`,
+and enables `okrun-network.service`. No dependency downloads, firewall changes,
+VM features, NAT, IP forwarding, or default-route changes are performed. The
+cloud-only service retries failed connections after five seconds; cloud-only
+foreground mode exits with an error instead. Those restarts recreate the TAP.
+With `--local-server`, both foreground and service modes reconnect transports
+independently while keeping one TAP alive.
+
+The client verifies the switch certificate/hostname, responds to keepalives, and
+bounds outgoing buffers. It supports optional `--interface` and `--mtu` arguments.
+It refuses to reuse an already-existing interface. One installed service/network
+is supported per machine; re-running the installer replaces its configuration.
+Stop the foreground client before installing the service with the same interface.
+
+Private-network peers can access Ubuntu services listening on this interface:
+configure your host firewall accordingly. For `.local` names, configure mDNS/NSS
+(e.g. `avahi-daemon` and `libnss-mdns`) separately; use private IPs to diagnose
+connectivity first. Local Switch-only peers require the `--local-server` option.
+This joins the Ubuntu machine itself; it does not automatically bridge other
+VMs/containers hosted on Ubuntu into the network.
+
+To stop or remove the service:
+
+```bash
+sudo systemctl disable --now okrun-network
+sudo rm /etc/systemd/system/okrun-network.service
+sudo systemctl daemon-reload
+sudo rm -r /opt/okrun-network /etc/okrun-network
+```
+
+Tests (also runnable on macOS) use a real mTLS switch and a simulated TAP process:
+
+```bash
+bash scripts/test-network-client.sh
+```
+
+These verify Ethernet exchange, isolation, keepalives, reconnect admission, and
+certificate rejection, but do not substitute for a real Ubuntu TAP/systemd test.
+
 ## Linux Access Port
 
 On a Linux cloud switch host, `web-switch` can join one private network through a
