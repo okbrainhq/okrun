@@ -900,7 +900,7 @@ final class PrivateNetworkRuntimeRegistry {
     private var localSwitchFailures: [String: PrivateNetworkSwitchStatus] = [:]
     private var hostSSHServices: [String: PrivateNetworkHostSSHService] = [:]
     private var routers: [String: PrivateNetworkTransportRouter] = [:]
-    private var nodeIDs: [String: UUID] = [:]
+    private var switchIdentities: [String: PrivateNetworkSwitchIdentity] = [:]
 
     init() {}
 
@@ -1110,7 +1110,7 @@ final class PrivateNetworkRuntimeRegistry {
         localSwitchFailures.removeAll()
         hostSSHServices.removeAll()
         routers.removeAll()
-        nodeIDs.removeAll()
+        switchIdentities.removeAll()
     }
 
     func release(_ ownedRuntimes: [PrivateNetworkRuntime]) {
@@ -1130,8 +1130,8 @@ final class PrivateNetworkRuntimeRegistry {
         for identifier in Array(routers.keys) where !hasLocalPresence(identifier: identifier) {
             routers[identifier] = nil
         }
-        for identifier in Array(nodeIDs.keys) where !hasLocalPresence(identifier: identifier) {
-            nodeIDs[identifier] = nil
+        for identifier in Array(switchIdentities.keys) where !hasLocalPresence(identifier: identifier) {
+            switchIdentities[identifier] = nil
         }
     }
 
@@ -1217,7 +1217,7 @@ final class PrivateNetworkRuntimeRegistry {
             identifier: identifier,
             localConfig: localSwitchConfig,
             dhcpRange: dhcpRange,
-            nodeID: nodeID(for: identifier),
+            identity: switchIdentity(for: identifier),
             onRemoteFrame: { [weak transportRouter] frame in
                 transportRouter?.receiveRemoteFrame(frame, via: .localSwitch)
             }
@@ -1234,20 +1234,20 @@ final class PrivateNetworkRuntimeRegistry {
             identifier: identifier,
             config: switchConfig,
             dhcpRange: dhcpRange,
-            nodeID: nodeID(for: identifier),
+            identity: switchIdentity(for: identifier),
             onRemoteFrame: { [weak transportRouter] frame in
                 transportRouter?.receiveRemoteFrame(frame, via: .webSwitch)
             }
         )
     }
 
-    private func nodeID(for identifier: String) -> UUID {
-        if let nodeID = nodeIDs[identifier] {
-            return nodeID
+    private func switchIdentity(for identifier: String) -> PrivateNetworkSwitchIdentity {
+        if let identity = switchIdentities[identifier] {
+            return identity
         }
-        let nodeID = UUID()
-        nodeIDs[identifier] = nodeID
-        return nodeID
+        let identity = PrivateNetworkSwitchIdentity()
+        switchIdentities[identifier] = identity
+        return identity
     }
 
     private func router(for identifier: String) -> PrivateNetworkTransportRouter {

@@ -237,7 +237,12 @@ Re-run the installer to update the code/settings. One service/network per host
 is supported. Existing TAPs are not reused.
 
 Both transports stay connected. Discovery uses both; learned local peers prefer
-local and fall back to cloud if local disconnects. Cloud-only peers use cloud.
+local and fall back to cloud if local disconnects. Fresh cloud traffic also
+relearns a peer's return path when only that peer loses its LAN connection, even
+if this host's local session is still ready. Delayed duplicate discovery copies
+keep local preference, and fresh local traffic restores it. Cloud-only peers
+use cloud. As on macOS, both sessions share one host identity and outgoing
+sequence counter, including across reconnects and dual-path discovery sends.
 Transport retries preserve the TAP unless address admission conflicts. The
 cloud-only service restarts on failure. The unit limits capabilities to
 `CAP_NET_ADMIN`, restricts filesystem/device access, and restarts on crashes.

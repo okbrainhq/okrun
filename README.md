@@ -396,9 +396,14 @@ npm run start -- \
 Then open Okrun's **Private Network > Local Switch**, enable it, set the server
 to `127.0.0.1:9444` or another trusted LAN host, and click **Apply & Connect**.
 
-When both Local Switch and Web Switch are configured, Okrun uses Local Switch
-while it is connected and falls back to Web Switch if the local listener is not
-available.
+When both Local Switch and Web Switch are configured, discovery uses both and
+learned local peers prefer Local Switch. If either host loses its local path,
+fresh Web Switch traffic relearns that peer's return path immediately, even when
+the receiving host's Local Switch is still connected to other peers. Duplicate
+discovery copies preserve local preference; fresh local traffic restores it.
+Both transports share a host identity and outgoing sequence counter across
+reconnects, so failover traffic is not mistaken for old packets by the switch.
+The Ubuntu routed network client follows the same policy.
 
 **Host access** lets VMs connect back to whitelisted TCP ports on the running
 Mac over the same private subnet. Enable it in **Private Network > Host**, add
