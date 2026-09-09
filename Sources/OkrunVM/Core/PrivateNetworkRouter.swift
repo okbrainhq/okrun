@@ -43,6 +43,9 @@ final class PrivateNetworkTransportRouter {
     private struct RemoteRouteEntry {
         var localUpdatedAt: Date?
         var webUpdatedAt: Date?
+        // Separate from web freshness: active fallback traffic must not keep
+        // postponing discovery of a recovered LAN path.
+        var localProbeAt: Date?
 
         init(localUpdatedAt: Date? = nil, webUpdatedAt: Date? = nil) {
             self.localUpdatedAt = localUpdatedAt
@@ -58,6 +61,9 @@ final class PrivateNetworkTransportRouter {
         }
 
         mutating func record(_ route: PrivateNetworkTransportRoute, at date: Date) {
+            if route == .localSwitch || localProbeAt == nil {
+                localProbeAt = date
+            }
             switch route {
             case .localSwitch:
                 localUpdatedAt = date
@@ -109,6 +115,7 @@ final class PrivateNetworkTransportRouter {
         var sendsToAllReachable: Bool
         var logsNoReachableTransport: Bool
         var rateLimitsFloodTraffic: Bool
+        var localRecoveryDestination: EthernetAddress? = nil
 
         static let none = LocalFrameSendPlan(
             candidates: [],
@@ -121,6 +128,7 @@ final class PrivateNetworkTransportRouter {
     private static let queueKey = DispatchSpecificKey<UUID>()
     private static let defaultMacTtl: TimeInterval = 5 * 60
     private static let remoteFrameDedupTtl: TimeInterval = 0.25
+    private static let localRecoveryProbeInterval: TimeInterval = 5
     private static let defaultRemoteFloodBurstLimit: Double = 256
     private static let defaultRemoteFloodRefillPerSecond: Double = 64
 
@@ -293,7 +301,13 @@ final class PrivateNetworkTransportRouter {
             return discoverySendPlanOnQueue(logsNoReachableTransport: true)
         }
 
-        return sendPlanOnQueue(for: remoteRoute, logsNoReachableTransport: false)
+        var plan = sendPlanOnQueue(for: remoteRoute, logsNoReachableTransport: false)
+        if !remoteRoute.hasLocalRoute, remoteRoute.hasWebRoute,
+           let lastProbe = remoteRoute.localProbeAt,
+           currentDate.timeIntervalSince(lastProbe) >= Self.localRecoveryProbeInterval {
+            plan.localRecoveryDestination = header.destination
+        }
+        return plan
     }
 
     private func remoteFrameActionOnQueue(_ frame: Data, via route: PrivateNetworkTransportRoute) -> RemoteFrameAction {
@@ -400,13 +414,40 @@ final class PrivateNetworkTransportRouter {
             return
         }
 
-        let selectedTransports = plan.sendsToAllReachable ? transports : [transports[0]]
+        var selectedTransports = plan.sendsToAllReachable ? transports : [transports[0]]
+        if let destination = plan.localRecoveryDestination,
+           transports.count == 2,
+           claimLocalRecoveryProbe(for: destination),
+           allowRemoteFloodFrame(frame) {
+            // Probe with a copy of ordinary traffic, so no guest ARP refresh or
+            // switch protocol change is needed. Keep the web copy until local
+            // traffic confirms recovery, including for peers only on the web.
+            // Give the local copy a head start; receive-side dedup handles both.
+            selectedTransports = Array(transports.reversed())
+        }
         for transport in selectedTransports {
             let routeName = transport.route.logName
             AppLog.virtualMachine.debug(
                 "Private network router sending frame privateNetwork=\(self.identifier, privacy: .public) route=\(routeName, privacy: .public) bytes=\(frame.count, privacy: .public)"
             )
             transport.transport.sendFrameToRemote(frame)
+        }
+    }
+
+    private func claimLocalRecoveryProbe(for destination: EthernetAddress) -> Bool {
+        // Reachability is checked outside the router queue, just like regular
+        // forwarding, to avoid taking a transport's queue while holding ours.
+        runOnQueue {
+            let currentDate = self.now()
+            guard var entry = self.remoteRoutes[destination],
+                  !entry.hasLocalRoute, entry.hasWebRoute,
+                  let lastProbe = entry.localProbeAt,
+                  currentDate.timeIntervalSince(lastProbe) >= Self.localRecoveryProbeInterval else {
+                return false
+            }
+            entry.localProbeAt = currentDate
+            self.remoteRoutes[destination] = entry
+            return true
         }
     }
 

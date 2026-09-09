@@ -240,8 +240,13 @@ Both transports stay connected. Discovery uses both; learned local peers prefer
 local and fall back to cloud if local disconnects. Fresh cloud traffic also
 relearns a peer's return path when only that peer loses its LAN connection, even
 if this host's local session is still ready. Delayed duplicate discovery copies
-keep local preference, and fresh local traffic restores it. Cloud-only peers
-use cloud. As on macOS, both sessions share one host identity and outgoing
+keep local preference, and fresh local traffic restores it. While using cloud,
+active unicast traffic also probes an available local session at most once every
+five seconds per peer, without dropping the cloud copy. Local replies restore
+local preference automatically; no ARP refresh or MAC expiry is required.
+Probe copies use the discovery flood budget and cross-path deduplication. Fresh
+cloud traffic does not postpone probing, and cloud-only peers keep using cloud.
+As on macOS, both sessions share one host identity and outgoing
 sequence counter, including across reconnects and dual-path discovery sends.
 Transport retries preserve the TAP unless address admission conflicts. The
 cloud-only service restarts on failure. The unit limits capabilities to
