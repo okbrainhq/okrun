@@ -4,6 +4,13 @@ Okrun VM is a small native macOS app for running Linux and macOS VMs with
 Virtualization.framework. The app is organized around VM projects: each project
 is a folder with its own config, disk, boot metadata, and machine identity.
 
+## Ubuntu Network-Only Client
+
+Ubuntu machines can join an existing OKRun Web Switch with a host certificate
+bundle, without the macOS app or VM-management features. See the
+[Ubuntu client setup](web-switch/README.md#ubuntu-network-only-client) for
+credentials, private-IP configuration, and the auto-starting systemd installer.
+
 ## Clone & Build It
 
 Install Xcode Command Line Tools first if Swift is not already available:

@@ -6,6 +6,8 @@
   "description": "Plain Node.js layer-2 switch for OkRun private networks",
   "scripts": {
     "start": "node src/index.js",
+    "client": "node bin/okrun-network.js",
+    "test:client": "bash ../scripts/test-network-client.sh",
     "dev": "node src/index.js --tls-port 9443 --status-port 8080 --server-bundle .certs/server/okrun-switch-server-bundle.json --crl .ca/crl.txt",
     "test": "node tests/e2e/run.js",
     "test:access": "../scripts/e2e-web-switch-access-linux.sh",
