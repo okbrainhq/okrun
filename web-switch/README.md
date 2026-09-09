@@ -117,135 +117,194 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/status
 ```
 
-## Ubuntu Network-Only Client
+## Ubuntu Physical-Host Client
 
-An Ubuntu machine (physical or virtual) can join an existing **Web Switch** using
-its own host bundle, without installing the Swift app or hosting any VMs. The
-client creates `okrun0`, an Ethernet TAP interface, and connects outbound using
-mTLS. Ubuntu and existing OKRun VMs can then communicate using their private IPs.
-This is a client of the existing switch, not another switch server.
+This attaches **the Ubuntu host itself** to the same virtual Ethernet network as
+Okrun VMs. It creates one TAP (`okrun0`) connected to the host's own IP stack,
+not another switch, VM, LAN bridge, NAT gateway, or DHCP server. VMs can access
+services on this host as **`azero.local`** when its hostname is `azero`.
 
-### Local + cloud routing (same policy as macOS)
+For credential storage, updates, backup/rotation, and verification commands, see
+the [Ubuntu host operations runbook](docs/ubuntu-host-operations.md).
 
-Add `--local-server LAN_HOST:9444` to the CLI, or supply a fifth installer
-argument. The cloud endpoint and mTLS keys still come from the host bundle:
+### Install this deployment (no manual IP)
 
-```bash
-sudo bash scripts/install-network-client.sh \
-  ~/okrun-switch-bundle.json 10.77.0.2/24 okrun okrun0 192.168.1.10:9444
+Prerequisites: system-wide Node.js 20+ (`/usr/bin/node` or `/usr/local/bin/node`),
+Python 3, `iproute2`, systemd, `/dev/net/tun`, and `avahi-daemon`. The installer
+checks dependencies but does not download packages. `libnss-mdns` or an enabled
+systemd-resolved mDNS resolver is needed for normal `.local` lookups on clients.
 
-# Or run in the foreground:
-sudo node web-switch/bin/okrun-network.js \
-  --bundle ~/okrun-switch-bundle.json --ip 10.77.0.2/24 \
-  --local-server 192.168.1.10:9444
-```
-
-Replace the example LAN address with your local switch's reachable address.
-It must listen on its LAN interface, not only `127.0.0.1`; allow its TCP port
-through the LAN firewall. No LAN address discovery is performed.
-
-Both transports stay connected. Broadcast/unknown destinations use both paths;
-learned local peers prefer local, falling back to cloud when local is down.
-Cloud-only peers use cloud. Failed transports retry every five seconds without
-recreating the TAP. Recovery restores local preference for remembered local
-peers; expired routes are learned again through discovery. MAC routes expire
-after five minutes. Cross-path duplicates are suppressed for 250 ms, discovery
-is rate-limited (256-frame burst, 64 frames/second), and incoming traffic is
-never bridged from one switch to the other.
-
-**Security:** the macOS local switch protocol is unauthenticated, unencrypted
-TCP. Only enable it on a trusted LAN and restrict the listener with a firewall.
-Private keys are not transmitted; client certificates are used only for cloud
-mTLS. Omitting `--local-server` preserves cloud-only behavior.
-
-### Credentials and address
-
-On your CA/admin machine, issue a separate host bundle for each Ubuntu machine:
+Run from the repository root:
 
 ```bash
-# From web-switch/; use the same CA/cert root as your existing switch.
-./issue-client.sh ubuntu-box switch.example.com:9443 --certs-dir .certs/prod
-```
+# Existing installation: reuse the root-only bundle in /etc.
+sudo bash web-switch/scripts/setup-ubuntu.sh
 
-Securely copy `.certs/prod/hosts/ubuntu-box/okrun-switch-bundle.json` to Ubuntu.
-Only the host bundle is needed: **never copy the CA private key or server bundle**.
-The bundle contains `server`, `caCertPem`, `clientCertPem`, and `clientKeyPem`.
-Treat it as a password; revoke it with the existing certificate-revocation tools
-if the machine is lost.
-
-Choose an unused private address and prefix in the same subnet as your VMs,
-**outside all VM DHCP pools**. The example below uses `10.77.0.2/24`; substitute
-an address appropriate for your network. The client does not run DHCP or allocate
-addresses automatically. Avoid a subnet overlapping Ubuntu's existing LAN/VPN.
-The network name must exactly match the VMs' `networkIdentifier` (usually `okrun`).
-
-### Run or install on Ubuntu
-
-Prerequisites: system-wide Node.js 20+ (`/usr/bin/node` or `/usr/local/bin/node` for
-the installer), Python 3, `iproute2`, and `/dev/net/tun`. Run as root or with
-`CAP_NET_ADMIN`. A container must additionally be granted TUN/TAP device access.
-From a checkout of this repository on Ubuntu:
-
-```bash
-chmod 600 ~/okrun-switch-bundle.json
-
-# Optional: validate credentials/config without connecting or changing networking.
-node web-switch/bin/okrun-network.js \
-  --bundle ~/okrun-switch-bundle.json --ip 10.77.0.2/24 --network okrun --check
-
-# Foreground connection (Ctrl-C disconnects and removes the interface).
-sudo node web-switch/bin/okrun-network.js \
-  --bundle ~/okrun-switch-bundle.json --ip 10.77.0.2/24 --network okrun
-
-# Or install an auto-starting service with automatic reconnect after failures.
-sudo bash scripts/install-network-client.sh \
-  ~/okrun-switch-bundle.json 10.77.0.2/24 okrun okrun0
-
-journalctl -u okrun-network -n 30 --no-pager
+systemctl is-enabled okrun-network
+systemctl is-active okrun-network
+journalctl -u okrun-network -n 50 --no-pager
 ip address show okrun0
-ping <vm-private-ip>
-ssh <user>@<vm-private-ip>
+ping -I okrun0 devbox2.local
 ```
 
-The installer copies only the network client and TAP helper into
-`/opt/okrun-network`, stores the bundle root-only in `/etc/okrun-network/host.json`,
-and enables `okrun-network.service`. No dependency downloads, firewall changes,
-VM features, NAT, IP forwarding, or default-route changes are performed. The
-cloud-only service retries failed connections after five seconds; cloud-only
-foreground mode exits with an error instead. Those restarts recreate the TAP.
-With `--local-server`, both foreground and service modes reconnect transports
-independently while keeping one TAP alive.
+Setup selects network `okrun`, local switch **172.16.0.10:9443**, and the cloud
+endpoint/credentials from **`/etc/okrun-network/host.json`** by default. No IP
+argument is needed. The existing VM subnet for this deployment is **10.77.0.0/24**.
+For a new host or credential rotation, pass a private import file outside Git:
 
-The client verifies the switch certificate/hostname, responds to keepalives, and
-bounds outgoing buffers. It supports optional `--interface` and `--mtu` arguments.
-It refuses to reuse an already-existing interface. One installed service/network
-is supported per machine; re-running the installer replaces its configuration.
-Stop the foreground client before installing the service with the same interface.
+```bash
+chmod 600 /path/to/private/host.json
+sudo bash web-switch/scripts/setup-ubuntu.sh /path/to/private/host.json
+```
 
-Private-network peers can access Ubuntu services listening on this interface:
-configure your host firewall accordingly. For `.local` names, configure mDNS/NSS
-(e.g. `avahi-daemon` and `libnss-mdns`) separately; use private IPs to diagnose
-connectivity first. Local Switch-only peers require the `--local-server` option.
-This joins the Ubuntu machine itself; it does not automatically bridge other
-VMs/containers hosted on Ubuntu into the network.
+The installer stores it as `root:root`, mode `0600`, inside a mode `0700`
+directory. It safely stages/validates replacements, including when source and
+destination are the same installed file. After verification, remove any redundant
+import copy. Setup never falls back to the old bundle location in the checkout.
 
-To stop or remove the service:
+The canonical installer and unit template are in this directory:
+
+- `scripts/install-network-client.sh` (the repository-level script forwards here)
+- `scripts/setup-ubuntu.sh` (this deployment's defaults)
+- `systemd/okrun-network.service.in`
+- `src/host-client.js`, `src/host-address.js` (automatic host attachment)
+- `bin/okrun-network.js`, `bin/okrun-switch-tap-helper.py` (transport and host TAP)
+
+### How automatic attachment works
+
+The virtual switch is layer 2; it does not hand out DHCP leases. Okrun's VM DHCP
+responder only serves frames originating from its own guests (`HostDHCP.swift`).
+A physical host therefore cannot obtain a VM lease merely by sending DHCP into
+the switch. IPv4 link-local would not solve this either: guest tools disable
+link-local addressing on the private NIC.
+
+The client handles the host-side configuration without manual address selection:
+
+1. Chooses a stable candidate on the configured VM subnet, preferring addresses
+   above the usual VM pools. It excludes network, gateway (.1), and broadcast.
+2. Reserves **only that one host address** using the switch's existing
+   `INIT.dhcpRange` overlap admission check, on each connected transport. This is
+   reservation metadata, not a DHCP pool/server; it does not lease addresses to VMs.
+3. Sends three ARP probes before assigning the address. An active pool overlap or
+   ARP collision causes selection of another address. It continues detecting ARP
+   conflicts after assignment and relinquishes/retries if another owner appears.
+4. Assigns the address to `okrun0`; Avahi advertises the machine's existing
+   hostname on that interface. MAC identity and last successful address persist
+   in `/var/lib/okrun-network/host-state.json` (root-only).
+
+Probing follows the timing/packet conventions in RFC 5227.
+[source](https://datatracker.ietf.org/doc/html/rfc5227)
+Address reservations protect against *active advertised* pools; ARP detects
+reachable owners, not powered-off hosts or unavailable transports. Do not place
+manually reserved/offline addresses in a subnet used for automatic attachment
+without coordinating them with your network administrator. The subnet is a
+configuration default, **not discovered from the credential bundle**. For a
+custom VM subnet use `--subnet` (canonical RFC1918 /16 through /30), or the sixth
+installer argument. Avoid overlapping existing physical LAN/VPN routes.
+
+Avahi must allow `okrun0` and address publishing. The installer starts/enables
+Avahi but does not replace `/etc/avahi/avahi-daemon.conf` or rename the machine.
+Custom `allow-interfaces`, `deny-interfaces`, `host-name`, or disabled publishing
+settings can prevent the expected name; the live verifier below detects this.
+The Avahi settings manual describes these options.
+[source](https://linux.die.net/man/5/avahi-daemon.conf)
+
+### Other configurations and security
+
+```bash
+# Cloud-only, automatic host addressing:
+sudo bash web-switch/scripts/install-network-client.sh /etc/okrun-network/host.json
+
+# Custom subnet/network and optional LAN switch:
+sudo bash web-switch/scripts/install-network-client.sh \
+  /etc/okrun-network/host.json auto mynetwork okrun0 192.168.1.10:9444 10.88.0.0/24
+
+# Foreground (stop any service using okrun0 first):
+sudo node web-switch/bin/okrun-network.js \
+  --bundle /etc/okrun-network/host.json --local-server 172.16.0.10:9443
+
+# Legacy explicitly configured address remains supported:
+sudo node web-switch/bin/okrun-network.js \
+  --bundle /etc/okrun-network/host.json --ip 10.77.0.2/24
+```
+
+Use a separate **host bundle** for each machine, issued by the existing CA. Never
+copy the CA private key or server bundle. Keep the host credential out of Git
+and checkouts; the old filename stays ignored only as a defensive guard. Only
+client code goes into `/opt/okrun-network`; the canonical credential is
+`/etc/okrun-network/host.json` (`root:root`, mode `0600`, parent directory `0700`).
+Re-run the installer to update the code/settings. One service/network per host
+is supported. Existing TAPs are not reused.
+
+Both transports stay connected. Discovery uses both; learned local peers prefer
+local and fall back to cloud if local disconnects. Cloud-only peers use cloud.
+Transport retries preserve the TAP unless address admission conflicts. The
+cloud-only service restarts on failure. The unit limits capabilities to
+`CAP_NET_ADMIN`, restricts filesystem/device access, and restarts on crashes.
+Stopping it removes the non-persistent TAP and its connected route.
+
+**The local protocol is unauthenticated, unencrypted TCP**, even on port 9443;
+use only on a trusted LAN. Cloud uses verified mTLS. Incoming Ethernet traffic
+is never bridged between the two switches or onto physical NICs. Cross-path
+duplicate suppression and bounded routing tables/queues remain in effect.
+
+The installer excludes only the dedicated TAP from NetworkManager management.
+It does not restart physical networking, enable IP forwarding, change firewall
+rules, add a default route, or run DHCP/DNS servers. IPv6 is disabled only on
+the auto-addressed TAP so router advertisements cannot alter host routing.
+Services must listen on the TAP address or `0.0.0.0` (not just `127.0.0.1`);
+allow only intended ports from the VM network in your host firewall. Discovery
+is not a promise that every service is reachable or that peers enable mDNS.
+
+### Verification
+
+```bash
+# Admission check only: no TAP/address/traffic. sudo reads the protected bundle.
+sudo node web-switch/bin/check-network.js \
+  --bundle /etc/okrun-network/host.json --local-server 172.16.0.10:9443
+
+# With the host service running: actual peer -> azero.local -> host TCP/HTTP.
+sudo node web-switch/bin/verify-host.js \
+  --bundle /etc/okrun-network/host.json \
+  --local-server 172.16.0.10:9443 --name azero.local
+
+# Unprivileged automated tests (real test switches, simulated TAPs).
+bash scripts/test-network-client.sh
+
+# Opt-in real systemd/TAP tests; temporary services, not the production unit.
+sudo node web-switch/tests/network-service.test.js
+sudo node web-switch/tests/network-service.test.js --auto
+```
+
+`check-network.js` checks only protocol admission/certificate validation.
+`verify-host.js` creates a temporary VM-like Linux network namespace with a TAP
+but **no physical interface or default route**. It joins the real switch using
+automatic addressing, queries mDNS on that virtual link, then checks a one-time
+HTTP response from the physical host. It tests local-only and cloud-only paths
+separately and removes its namespace, TAP, and temporary HTTP listener. It is
+not a login to an existing VM. Avoid concurrent verifier runs on this host.
+
+Systemd tests use generated certificates, an isolated network identifier,
+`192.0.2.254/32` in static mode or `10.253.239.0/24` in auto mode, and unique units
+under `/run/systemd/system`. They verify real ARP conflict recovery in auto mode,
+address persistence, ARP exchange, crash restart, and cleanup. Do not run these test modes where their test subnet
+is already in use. `systemctl is-active` alone does not prove network health;
+check `local switch connected`, `cloud switch connected`, `Joined okrun`, and
+peer discovery/reachability.
+
+### Stop/remove
 
 ```bash
 sudo systemctl disable --now okrun-network
 sudo rm /etc/systemd/system/okrun-network.service
 sudo systemctl daemon-reload
-sudo rm -r /opt/okrun-network /etc/okrun-network
+sudo rm -r /opt/okrun-network /etc/okrun-network /var/lib/okrun-network
+sudo rm -f /etc/NetworkManager/conf.d/90-okrun-network.conf
+# If NetworkManager is running:
+sudo nmcli general reload conf
 ```
 
-Tests (also runnable on macOS) use a real mTLS switch and a simulated TAP process:
-
-```bash
-bash scripts/test-network-client.sh
-```
-
-These verify Ethernet exchange, isolation, keepalives, reconnect admission, and
-certificate rejection, but do not substitute for a real Ubuntu TAP/systemd test.
+Avahi is shared with the rest of the host and is intentionally left running.
 
 ## Linux Access Port
 
