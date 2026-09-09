@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { NetworkClient, parseLocalEndpoint } = require('./network-client');
+const LOCAL_RECOVERY_PROBE_MS = 5000;
 
 // Mirrors PrivateNetworkTransportRouter: per-MAC local preference, discovery
 // on both transports, cross-transport duplicate suppression, and no bridging.
@@ -19,8 +20,8 @@ class EthernetRouter {
   prune(now) {
     for (const [mac, at] of this.local) if (now - at > 300000) this.local.delete(mac);
     for (const [mac, routes] of this.remote) {
-      for (const route of Object.keys(routes)) if (now - routes[route] > 300000) delete routes[route];
-      if (!Object.keys(routes).length) this.remote.delete(mac);
+      for (const route of ['local', 'cloud']) if (now - routes[route] > 300000) delete routes[route];
+      if (routes.local === undefined && routes.cloud === undefined) this.remote.delete(mac);
     }
     for (const [hash, entry] of this.seen) if (now - entry.at > 250) this.seen.delete(hash);
   }
@@ -43,15 +44,26 @@ class EthernetRouter {
     const entry = unicast && this.remote.get(dest);
     if (entry) {
       const order = entry.local !== undefined ? ['local', 'cloud'] : ['cloud', 'local'];
-      return order.filter((route) => reachable(route)).slice(0, 1);
+      const routes = order.filter((route) => reachable(route));
+      if (entry.local === undefined && routes.length === 2 && now - entry.localProbeAt >= LOCAL_RECOVERY_PROBE_MS) {
+        entry.localProbeAt = now;
+        // A bounded copy of ordinary traffic discovers recovered LAN peers.
+        // Never replace the working cloud path until local traffic is observed,
+        // and never let the probe flood budget drop the original cloud packet.
+        if (this.allowFlood(now)) return ['local', 'cloud'];
+      }
+      return routes.slice(0, 1);
     }
     const routes = ['cloud', 'local'].filter((route) => reachable(route));
-    if (!routes.length) return [];
+    return routes.length && this.allowFlood(now) ? routes : [];
+  }
+
+  allowFlood(now) {
     this.tokens = Math.min(256, this.tokens + (now - this.updated) * 64 / 1000);
     this.updated = now;
-    if (this.tokens < 1) return [];
+    if (this.tokens < 1) return false;
     this.tokens--;
-    return routes;
+    return true;
   }
 
   receive(frame, route) {
@@ -65,6 +77,9 @@ class EthernetRouter {
     this.remember(this.seen, hash, { route, at: now });
     const fresh = !previous || previous.route === route || now - previous.at > 250;
     const routes = this.remote.get(source) || {};
+    // Keep the probe clock independent of fresh cloud traffic, otherwise active
+    // connections remain on the fallback forever after a local-switch outage.
+    if (route === 'local' || routes.localProbeAt === undefined) routes.localProbeAt = now;
     routes[route] = now;
     // A peer can lose its LAN path while our local session is still ready.
     // Follow fresh cloud traffic, but don't let a delayed discovery duplicate

@@ -401,6 +401,13 @@ learned local peers prefer Local Switch. If either host loses its local path,
 fresh Web Switch traffic relearns that peer's return path immediately, even when
 the receiving host's Local Switch is still connected to other peers. Duplicate
 discovery copies preserve local preference; fresh local traffic restores it.
+While a peer uses Web Switch, ongoing unicast traffic probes the available Local
+Switch with a packet copy at most once every five seconds per peer. The Web
+Switch copy is still sent, so an unreachable or web-only peer stays connected.
+Local replies automatically restore local preference without waiting for ARP
+refresh or MAC-table expiry. Probe copies share the discovery flood limit and
+cross-transport duplicate suppression; fresh web traffic does not reset the
+probe schedule.
 Both transports share a host identity and outgoing sequence counter across
 reconnects, so failover traffic is not mistaken for old packets by the switch.
 The Ubuntu routed network client follows the same policy.
