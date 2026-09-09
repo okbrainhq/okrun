@@ -563,6 +563,25 @@ private enum SwitchDebug {
     }
 }
 
+// All sockets advertising one node ID must share their outgoing sequence space.
+// Keep this object for the host's lifetime, not the lifetime of a TCP connection.
+final class PrivateNetworkSwitchIdentity {
+    let nodeID: UUID
+    private let lock = NSLock()
+    private var outgoingSequenceNumber: UInt32 = 0
+
+    init(nodeID: UUID = UUID()) {
+        self.nodeID = nodeID
+    }
+
+    func nextSequenceNumber() -> UInt32 {
+        lock.lock()
+        defer { lock.unlock() }
+        outgoingSequenceNumber = outgoingSequenceNumber == UInt32.max ? 1 : outgoingSequenceNumber + 1
+        return outgoingSequenceNumber
+    }
+}
+
 final class PrivateNetworkSwitchClient {
     var onFrame: ((Data) -> Void)?
     var onStatusChange: ((PrivateNetworkSwitchConnectionState, String, Int, String?) -> Void)?
@@ -570,7 +589,6 @@ final class PrivateNetworkSwitchClient {
     private let identifier: String
     private let config: PrivateNetworkSwitchConnectionConfig
     private let dhcpRange: PrivateNetworkDHCPLeaseRange?
-    private let nodeID: UUID
     private let interfaceName: String
     private let socket: VirtualSwitchSocket
 
@@ -579,18 +597,17 @@ final class PrivateNetworkSwitchClient {
         config: PrivateNetworkSwitchConnectionConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange?,
         interfaceName: String,
-        nodeID: UUID = UUID()
+        identity: PrivateNetworkSwitchIdentity = PrivateNetworkSwitchIdentity()
     ) throws {
         self.identifier = identifier
         self.config = config
         self.dhcpRange = dhcpRange
-        self.nodeID = nodeID
         self.interfaceName = interfaceName
         socket = try VirtualSwitchSocket(
             identifier: identifier,
             config: self.config,
             dhcpRange: dhcpRange,
-            nodeID: nodeID,
+            identity: identity,
             interfaceName: interfaceName
         )
 
@@ -625,7 +642,7 @@ private final class VirtualSwitchSocket {
 
     private let identifier: String
     private let realSocket: RealSwitchSocket
-    private var outgoingSequenceNumber: UInt32 = 0
+    private let identity: PrivateNetworkSwitchIdentity
     private let incomingDedup = SwitchDedupWindow()
     private let queue = DispatchQueue(label: "okrun.switch.virtual.\(UUID().uuidString)")
 
@@ -633,15 +650,16 @@ private final class VirtualSwitchSocket {
         identifier: String,
         config: PrivateNetworkSwitchConnectionConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange?,
-        nodeID: UUID,
+        identity: PrivateNetworkSwitchIdentity,
         interfaceName: String
     ) throws {
         self.identifier = identifier
+        self.identity = identity
         realSocket = try RealSwitchSocket(
             identifier: identifier,
             config: config,
             dhcpRange: dhcpRange,
-            nodeID: nodeID,
+            nodeID: identity.nodeID,
             interfaceName: interfaceName
         )
 
@@ -684,7 +702,7 @@ private final class VirtualSwitchSocket {
     func send(_ frame: Data) {
         queue.async { [weak self] in
             guard let self else { return }
-            outgoingSequenceNumber = outgoingSequenceNumber == UInt32.max ? 1 : outgoingSequenceNumber + 1
+            let outgoingSequenceNumber = identity.nextSequenceNumber()
             let switchFrame = SwitchFrame(
                 streamID: SwitchFrame.ethernetStreamID,
                 type: .data,
@@ -1670,7 +1688,7 @@ final class PrivateNetworkSwitchTransport {
         identifier: String,
         config: PrivateNetworkSwitchConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange? = nil,
-        nodeID: UUID = UUID(),
+        identity: PrivateNetworkSwitchIdentity = PrivateNetworkSwitchIdentity(),
         onRemoteFrame: ((Data) -> Void)? = nil
     ) throws {
         try self.init(
@@ -1679,7 +1697,7 @@ final class PrivateNetworkSwitchTransport {
             dhcpRange: dhcpRange,
             routeAvailability: .allowConnecting,
             interfaceName: "web",
-            nodeID: nodeID,
+            identity: identity,
             onRemoteFrame: onRemoteFrame
         )
     }
@@ -1688,7 +1706,7 @@ final class PrivateNetworkSwitchTransport {
         identifier: String,
         localConfig: PrivateNetworkLocalSwitchConfig,
         dhcpRange: PrivateNetworkDHCPLeaseRange? = nil,
-        nodeID: UUID = UUID(),
+        identity: PrivateNetworkSwitchIdentity = PrivateNetworkSwitchIdentity(),
         onRemoteFrame: ((Data) -> Void)? = nil
     ) throws {
         try self.init(
@@ -1697,7 +1715,7 @@ final class PrivateNetworkSwitchTransport {
             dhcpRange: dhcpRange,
             routeAvailability: .connectedOnly,
             interfaceName: "local",
-            nodeID: nodeID,
+            identity: identity,
             onRemoteFrame: onRemoteFrame
         )
     }
@@ -1708,7 +1726,7 @@ final class PrivateNetworkSwitchTransport {
         dhcpRange: PrivateNetworkDHCPLeaseRange?,
         routeAvailability: RouteAvailability,
         interfaceName: String,
-        nodeID: UUID,
+        identity: PrivateNetworkSwitchIdentity,
         onRemoteFrame: ((Data) -> Void)?
     ) throws {
         self.identifier = identifier
@@ -1724,7 +1742,7 @@ final class PrivateNetworkSwitchTransport {
             config: self.config,
             dhcpRange: dhcpRange,
             interfaceName: interfaceName,
-            nodeID: nodeID
+            identity: identity
         )
         status = PrivateNetworkSwitchStatus(
             identifier: identifier,

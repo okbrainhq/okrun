@@ -313,6 +313,13 @@ final class PrivateNetworkTransportRouter {
 
         var entry = remoteRoutes[header.source] ?? RemoteRouteEntry()
         entry.record(route, at: currentDate)
+        if route == .webSwitch && shouldInject {
+            // The peer may have lost its LAN path even while our local switch
+            // is healthy. Follow fresh web traffic instead of blackholing replies
+            // on a five-minute-old local route. A delayed discovery duplicate
+            // must not undo local preference; a new local observation restores it.
+            entry.remove(.localSwitch)
+        }
         remoteRoutes[header.source] = entry
         guard shouldInject else { return .drop }
 

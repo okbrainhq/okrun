@@ -60,13 +60,18 @@ class EthernetRouter {
     this.prune(now);
     const source = frame.subarray(6, 12).toString('hex');
     if (this.local.has(source)) return false;
-    const routes = this.remote.get(source) || {};
-    routes[route] = now;
-    this.remember(this.remote, source, routes);
     const hash = crypto.createHash('sha256').update(frame).digest('hex');
     const previous = this.seen.get(hash);
     this.remember(this.seen, hash, { route, at: now });
-    return !previous || previous.route === route || now - previous.at > 250;
+    const fresh = !previous || previous.route === route || now - previous.at > 250;
+    const routes = this.remote.get(source) || {};
+    routes[route] = now;
+    // A peer can lose its LAN path while our local session is still ready.
+    // Follow fresh cloud traffic, but don't let a delayed discovery duplicate
+    // override local preference. A new local observation restores that route.
+    if (route === 'cloud' && fresh) delete routes.local;
+    this.remember(this.remote, source, routes);
+    return fresh;
   }
 }
 
@@ -115,8 +120,8 @@ class RoutedNetworkClient extends NetworkClient {
       if (this.closed) return;
       if (error.code === 'dhcp_range_overlap' && this.config.probeAddress) return this.fail(error);
       this.emit('log', `${route} switch unavailable: ${error.message}; retrying`);
-      // Keep learned routes until TTL, so recovery automatically restores local
-      // preference; readiness gates forwarding while a transport is disconnected.
+      // Readiness gates forwarding while disconnected. Retain route observations
+      // across retries, unless fresh peer traffic relearns a different path.
       this.retries.set(route, setTimeout(() => {
         this.retries.delete(route);
         this.join(route);
