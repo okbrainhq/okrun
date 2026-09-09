@@ -107,12 +107,13 @@ class RoutedNetworkClient extends NetworkClient {
       this.emit('transport-ready', route);
     });
     session.on('frame', (frame) => {
-      if (this.ready && frame.length <= this.tapFrameSizeLimit && this.router.receive(frame, route)) {
+      if ((this.ready || this.probing) && frame.length <= this.tapFrameSizeLimit && this.router.receive(frame, route)) {
         try { this.injectFrame(frame); } catch (error) { this.fail(error); }
       }
     });
     session.on('failure', (error) => {
       if (this.closed) return;
+      if (error.code === 'dhcp_range_overlap' && this.config.probeAddress) return this.fail(error);
       this.emit('log', `${route} switch unavailable: ${error.message}; retrying`);
       // Keep learned routes until TTL, so recovery automatically restores local
       // preference; readiness gates forwarding while a transport is disconnected.

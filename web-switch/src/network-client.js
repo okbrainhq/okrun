@@ -6,6 +6,7 @@ const tls = require('node:tls');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { EventEmitter } = require('node:events');
+const { parseSubnet } = require('./host-address');
 const { FrameDecoder, FrameType, encodeFrame, encodeJsonFrame, decodeJsonPayload } = require('./protocol');
 
 function parseLocalEndpoint(server) {
@@ -32,16 +33,21 @@ function validateConfig(config) {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(network)) throw new Error('Invalid network identifier');
   const iface = config.interface ?? 'okrun0';
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,14}$/.test(iface)) throw new Error('Invalid TAP interface name');
-  const [ip, prefix, extra] = String(config.ip || '').split('/');
-  const family = net.isIP(ip);
-  if (!family || extra !== undefined || !/^\d+$/.test(prefix || '') || +prefix > (family === 4 ? 32 : 128)) {
-    throw new Error('An unused private IP in CIDR notation is required');
+  const address = config.ip ?? 'auto';
+  if (address === 'auto') parseSubnet(config.subnet);
+  else {
+    const [ip, prefix, extra] = String(address).split('/');
+    const family = net.isIP(ip);
+    if (!family || extra !== undefined || !/^\d+$/.test(prefix || '') || +prefix > (family === 4 ? 32 : 128)) {
+      throw new Error('IP must be auto or an address in CIDR notation');
+    }
   }
+  if (config.mac && !/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/i.test(config.mac)) throw new Error('Invalid MAC');
   const mtu = config.mtu ?? 1500;
   if (!Number.isInteger(mtu) || mtu < 1280 || mtu > 9000) throw new Error('MTU must be between 1280 and 9000');
   // Validate key/certificate material before creating a privileged interface.
   tls.createSecureContext({ ca: bundle.caCertPem, cert: bundle.clientCertPem, key: bundle.clientKeyPem });
-  return { ...config, bundle, host, port: +match[2], network, interface: iface, mtu };
+  return { ...config, ip: address, bundle, host, port: +match[2], network, interface: iface, mtu };
 }
 
 // One outbound mTLS connection. The service manager restarts on failure, avoiding
@@ -80,7 +86,8 @@ class NetworkClient extends EventEmitter {
       this.write(encodeJsonFrame(FrameType.INIT, {
         protocol: 'okrun-switch/1', nodeID: this.nodeID,
         networkIdentifier: c.network, interface: c.interface,
-        maxFrameSize: this.maxFrameSize, capabilities: ['ethernet-frame']
+        maxFrameSize: this.maxFrameSize, capabilities: ['ethernet-frame'],
+        ...(c.dhcpRange ? { dhcpRange: c.dhcpRange } : {})
       }));
     });
     this.socket.on('data', (chunk) => {
@@ -102,7 +109,11 @@ class NetworkClient extends EventEmitter {
 
   handleFrame(frame) {
     if (this.closed) return;
-    if (frame.type === FrameType.ERROR) throw new Error('Switch rejected the connection');
+    if (frame.type === FrameType.ERROR) {
+      const payload = decodeJsonPayload(frame.payload);
+      const code = typeof payload.code === 'string' && /^[a-z_]{1,80}$/.test(payload.code) ? payload.code : 'switch_rejected';
+      throw Object.assign(new Error(`Switch rejected the connection (${code})`), { code });
+    }
     if (frame.type === FrameType.PING && frame.streamId === 0) {
       this.write(encodeFrame({ streamId: 0, type: FrameType.PONG }));
     } else if (frame.type === FrameType.INIT && frame.streamId === 0) {
@@ -122,7 +133,7 @@ class NetworkClient extends EventEmitter {
       } else this.startTap();
     } else if (frame.type === FrameType.DATA) {
       if (frame.streamId !== 1 || !this.acknowledged) throw new Error('Unexpected DATA frame');
-      if (!this.ready || frame.payload.length < 14
+      if (!(this.ready || this.probing) || frame.payload.length < 14
           || frame.payload.length > Math.min(this.maxFrameSize, this.tapFrameSizeLimit)) return;
       if (this.frameOnly) this.emit('frame', frame.payload);
       else this.injectFrame(frame.payload);
@@ -142,7 +153,9 @@ class NetworkClient extends EventEmitter {
     const c = this.config;
     this.child = this.spawn('python3', [path.resolve(__dirname, '../bin/okrun-switch-tap-helper.py'),
       '--interface', c.interface, '--ip', c.ip, '--mtu', String(c.mtu),
-      '--max-frame-size', String(this.maxFrameSize)], { stdio: ['pipe', 'pipe', 'pipe'] });
+      '--max-frame-size', String(this.maxFrameSize),
+      ...(c.mac ? ['--mac', c.mac] : []), ...(c.probeAddress ? ['--probe-address'] : [])], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.probing = Boolean(c.probeAddress);
     this.child.on('error', (error) => this.fail(error));
     this.child.on('exit', () => this.fail(new Error('TAP helper exited')));
     this.child.stdin.on('error', (error) => this.fail(error));
@@ -156,8 +169,12 @@ class NetworkClient extends EventEmitter {
       while ((end = this.logBuffer.indexOf('\n')) >= 0) {
         const line = this.logBuffer.slice(0, end);
         this.logBuffer = this.logBuffer.slice(end + 1);
+        if (line.startsWith('OKRUN_SWITCH_ADDRESS_CONFLICT')) {
+          return this.fail(Object.assign(new Error('Automatic host address is already in use'), { code: 'address_conflict' }));
+        }
         if (line.startsWith('OKRUN_SWITCH_TAP_READY ') && !this.ready && !this.closed) {
           clearTimeout(this.timer);
+          this.probing = false;
           this.ready = true;
           this.emit('ready');
         } else { this.emit('log', line); }
@@ -174,13 +191,13 @@ class NetworkClient extends EventEmitter {
       if (this.tapBuffer.length < length + 4) return;
       const payload = this.tapBuffer.subarray(4, length + 4);
       this.tapBuffer = this.tapBuffer.subarray(length + 4);
-      if (length < 14 || !this.ready) continue;
+      if (length < 14 || !(this.ready || this.probing)) continue;
       this.sendEthernet(payload);
     }
   }
 
   sendEthernet(payload) {
-    if (!this.ready || this.closed || payload.length > this.maxFrameSize) return;
+    if (!(this.ready || this.probing) || this.closed || payload.length > this.maxFrameSize) return;
     if (this.seqNo === 0xffffffff) return this.fail(new Error('Sequence exhausted; reconnect required'));
     this.write(encodeFrame({ streamId: 1, type: FrameType.DATA, seqNo: ++this.seqNo, payload }));
   }
@@ -195,6 +212,7 @@ class NetworkClient extends EventEmitter {
     if (this.closed) return;
     this.closed = true;
     this.ready = false;
+    this.probing = false;
     clearTimeout(this.timer);
     this.socket?.destroy();
     if (this.child) {

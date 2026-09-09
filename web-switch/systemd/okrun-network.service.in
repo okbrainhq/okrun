@@ -1,0 +1,28 @@
+[Unit]
+Description=OKRun physical-host network attachment
+Wants=network-online.target avahi-daemon.service
+After=network-online.target avahi-daemon.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=@NODE@ /opt/okrun-network/bin/okrun-network.js --bundle /etc/okrun-network/host.json --network @NETWORK@ --interface @IFACE@ --ip @IP@ --subnet @SUBNET@ --state-file /var/lib/okrun-network/host-state.json @LOCAL_ARGS@
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+User=root
+UMask=0077
+StateDirectory=okrun-network
+StateDirectoryMode=0700
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target

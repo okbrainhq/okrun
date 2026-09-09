@@ -1,1 +1,4 @@
 .deploy.local
+
+# Host credentials must never be committed.
+/okrun-switch-bundle.json

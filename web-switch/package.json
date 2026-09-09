@@ -17,7 +17,11 @@
     "cert:client": "./issue-client.sh",
     "cert:host": "./issue-client.sh",
     "cert:local": "./generate-local-certs.sh",
-    "cert:revoke": "./revoke-host.sh"
+    "cert:revoke": "./revoke-host.sh",
+    "check:network": "node bin/check-network.js",
+    "test:service": "node tests/network-service.test.js",
+    "test:service:auto": "node tests/network-service.test.js --auto",
+    "verify:host": "node bin/verify-host.js"
   },
   "bin": {
     "okrun-switch-ca": "bin/okrun-switch-ca.js"
