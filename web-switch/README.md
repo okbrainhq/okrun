@@ -236,16 +236,19 @@ client code goes into `/opt/okrun-network`; the canonical credential is
 Re-run the installer to update the code/settings. One service/network per host
 is supported. Existing TAPs are not reused.
 
-Both transports stay connected. Discovery uses both; learned local peers prefer
-local and fall back to cloud if local disconnects. Fresh cloud traffic also
-relearns a peer's return path when only that peer loses its LAN connection, even
-if this host's local session is still ready. Delayed duplicate discovery copies
-keep local preference, and fresh local traffic restores it. While using cloud,
-active unicast traffic also probes an available local session at most once every
-five seconds per peer, without dropping the cloud copy. Local replies restore
-local preference automatically; no ARP refresh or MAC expiry is required.
-Probe copies use the discovery flood budget and cross-path deduplication. Fresh
-cloud traffic does not postpone probing, and cloud-only peers keep using cloud.
+Both transports stay connected. Discovery uses both, sending the local copy
+first. Confirmed local peers prefer local; distinct cloud packets and delayed
+duplicates never override a recent local observation. If local disconnects,
+traffic immediately falls back to cloud. If a peer has not been observed locally
+for five seconds, subsequent unicast uses cloud while revalidating local. This
+bounds silent/asymmetric failures even if this host's local session remains ready
+and no cloud traffic has arrived. An idle peer's first packet after that interval
+may use both paths. While using cloud, active unicast probes an available local
+session at most once every five seconds per peer, local copy first, without
+dropping the cloud copy. Local traffic immediately restores local preference;
+no ARP refresh or MAC expiry is required. Probe copies use the discovery flood
+budget and cross-path deduplication. Fresh cloud traffic does not postpone probing,
+and cloud-only peers keep using cloud.
 As on macOS, both sessions share one host identity and outgoing
 sequence counter, including across reconnects and dual-path discovery sends.
 Transport retries preserve the TAP unless address admission conflicts. The

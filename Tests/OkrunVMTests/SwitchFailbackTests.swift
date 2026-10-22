@@ -65,9 +65,11 @@ struct SwitchFailbackTests {
             #expect(a.web.frames.count == webCounts.0)
             #expect(b.web.frames.count == webCounts.1)
         }
-        // Probe copies are deduplicated, not injected twice or bridged.
+        // Probe copies are deduplicated, not injected twice or bridged. An
+        // asymmetric outage takes the five-second confirmation window to detect
+        // (four replies before its boundary in each of the two outage cycles).
         #expect(a.endpoint.frames.count == Int(exchanges))
-        #expect(b.endpoint.frames.count == Int(exchanges))
+        #expect(b.endpoint.frames.count == Int(exchanges) - (onlyPeerLostLocal ? 8 : 0))
         #expect(pending.isEmpty)
     }
 

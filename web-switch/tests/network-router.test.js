@@ -18,7 +18,7 @@ test('macOS routing policy: discovery, learning, fallback, recovery, TTL and ded
   let now = 0;
   const router = new EthernetRouter(() => now);
   const both = () => true;
-  assert.deepEqual(router.destinations(outgoing, both), ['cloud', 'local']);
+  assert.deepEqual(router.destinations(outgoing, both), ['local', 'cloud']);
   assert.equal(router.receive(incoming, 'cloud'), true);
   assert.deepEqual(router.destinations(outgoing, both), ['cloud']);
   assert.equal(router.receive(incoming, 'local'), false);
@@ -30,41 +30,67 @@ test('macOS routing policy: discovery, learning, fallback, recovery, TTL and ded
   now = 251;
   assert.equal(router.receive(incoming, 'cloud'), true);
   now = 300252;
-  assert.deepEqual(router.destinations(outgoing, both), ['cloud', 'local']);
+  assert.deepEqual(router.destinations(outgoing, both), ['local', 'cloud']);
   assert.deepEqual(router.destinations(ethernetFrame(own, own, 'self'), both), []);
 });
 
-test('fresh cloud traffic relearns the return path when only the peer loses local', () => {
+test('distinct cloud traffic and late duplicates never override an active local path', () => {
+  let now = 0;
+  const router = new EthernetRouter(() => now);
+  for (let tick = 0; tick < 30; tick++) {
+    const frame = ethernetFrame(own, peerMAC, `ping ${tick}`);
+    router.receive(frame, 'local');
+    now += 500; // outside the dedup window
+    router.receive(frame, 'cloud');
+    router.receive(ethernetFrame('ff:ff:ff:ff:ff:ff', peerMAC, `broadcast ${tick}`), 'cloud');
+    assert.deepEqual(router.destinations(outgoing, () => true), ['local']);
+    now += 500;
+  }
+});
+
+test('a stale local peer falls back without changing healthy local peers', () => {
   let now = 0;
   const router = new EthernetRouter(() => now);
   const both = () => true;
   const otherMAC = '02:00:00:00:00:03';
   router.receive(incoming, 'local');
+  now = 4900;
   router.receive(ethernetFrame(own, otherMAC, 'other peer'), 'local');
+  router.receive(ethernetFrame('ff:ff:ff:ff:ff:ff', peerMAC, 'ARP discovery'), 'cloud');
   assert.deepEqual(router.destinations(outgoing, both), ['local']);
-  now = 1000;
-  assert.equal(router.receive(incoming, 'cloud'), true);
+  now = 5000;
+  assert.deepEqual(router.destinations(outgoing, both), ['local', 'cloud']);
   assert.deepEqual(router.destinations(outgoing, both), ['cloud']);
   assert.deepEqual(router.destinations(ethernetFrame(otherMAC, own, 'unaffected'), both), ['local']);
   assert.deepEqual(router.destinations(outgoing, (r) => r === 'local'), ['local']);
-  now = 2000;
   router.receive(incoming, 'local');
   assert.deepEqual(router.destinations(outgoing, both), ['local']);
-  // ARP/broadcast discovery must relearn the return path too. This packet is
-  // distinct, so it need not wait for a route TTL or dedup timer to expire.
-  router.receive(ethernetFrame('ff:ff:ff:ff:ff:ff', peerMAC, 'ARP discovery'), 'cloud');
-  assert.deepEqual(router.destinations(outgoing, both), ['cloud']);
 });
 
-test('duplicate discovery preserves local preference in either arrival order', () => {
-  for (const order of [['local', 'cloud'], ['cloud', 'local']]) {
-    let now = 0;
-    const router = new EthernetRouter(() => now);
-    const discovery = ethernetFrame('ff:ff:ff:ff:ff:ff', peerMAC, 'discovery');
-    assert.equal(router.receive(discovery, order[0]), true);
-    now = 200;
-    assert.equal(router.receive(discovery, order[1]), false);
+test('silent local failure reaches the backup without receiving any cloud traffic', () => {
+  let now = 0;
+  const router = new EthernetRouter(() => now);
+  router.receive(incoming, 'local');
+  for (now = 0; now < 5000; now += 1000) {
     assert.deepEqual(router.destinations(outgoing, () => true), ['local']);
+  }
+  assert.deepEqual(router.destinations(outgoing, () => true), ['local', 'cloud']);
+  assert.deepEqual(router.destinations(outgoing, () => true), ['cloud']);
+  // An unavailable web switch must never blackhole traffic on a usable LAN.
+  assert.deepEqual(router.destinations(outgoing, (r) => r === 'local'), ['local']);
+});
+
+test('duplicate discovery preserves local preference in either arrival order, including outside dedup', () => {
+  for (const order of [['local', 'cloud'], ['cloud', 'local']]) {
+    for (const delay of [200, 500, 2000]) {
+      let now = 0;
+      const router = new EthernetRouter(() => now);
+      const discovery = ethernetFrame('ff:ff:ff:ff:ff:ff', peerMAC, 'discovery');
+      assert.equal(router.receive(discovery, order[0]), true);
+      now = delay;
+      assert.equal(router.receive(discovery, order[1]), delay > 250);
+      assert.deepEqual(router.destinations(outgoing, () => true), ['local']);
+    }
   }
 });
 
@@ -105,7 +131,9 @@ test('active unicast fails back without fresh discovery after either end recover
         assert.deepEqual(sent.a.at(-1), ['local']);
         assert.deepEqual(sent.b.at(-1), ['local']);
       }
-      assert.deepEqual(delivered, { a: exchanges, b: exchanges }); // no duplicate delivery
+      // Four replies precede the five-second failover boundary per asymmetric
+      // outage; probe copies never produce duplicate guest delivery.
+      assert.deepEqual(delivered, { a: exchanges, b: exchanges - (asymmetric ? 8 : 0) });
     }
   }
 });
@@ -203,6 +231,11 @@ test('real TCP + mTLS, one TAP, local failure and automatic recovery', async (t)
   assert.equal(received.length, 1);
   // Remote frames are injected, never forwarded to the other switch.
   await cloud.expectNoData(); await local.expectNoData();
+  now += 1000;
+  const webBroadcast = ethernetFrame('ff:ff:ff:ff:ff:ff', peerMAC, 'distinct cloud broadcast');
+  cloud.sendData(webBroadcast);
+  await eventually(() => assert.deepEqual(received[1], webBroadcast));
+  // Both sockets are ready: this must still use only the confirmed LAN path.
   send(outgoing);
   assert.deepEqual((await local.waitForData()).payload, outgoing);
   await cloud.expectNoData();
@@ -213,10 +246,10 @@ test('real TCP + mTLS, one TAP, local failure and automatic recovery', async (t)
   now += 1000;
   const fallbackReply = ethernetFrame(own, peerMAC, 'reply while local is down');
   cloud.sendData(fallbackReply);
-  await eventually(() => assert.deepEqual(received[1], fallbackReply));
+  await eventually(() => assert.deepEqual(received[2], fallbackReply));
   await eventually(() => assert.ok(client.sessions.local !== old && client.sessions.local.ready), 2000);
-  // Both peers have now learned the web path, rather than retaining a local
-  // route from before the outage. A normal send must rediscover the LAN itself.
+  // The old local observation is now stale. A normal send must revalidate
+  // the LAN itself while preserving delivery through the backup.
   now += 5000;
   send(outgoing);
   assert.deepEqual((await local.waitForData()).payload, outgoing);
@@ -224,19 +257,19 @@ test('real TCP + mTLS, one TAP, local failure and automatic recovery', async (t)
   local.seqNo = cloud.seqNo;
   const localReply = ethernetFrame(own, peerMAC, 'reply to recovery probe');
   local.sendData(localReply);
-  await eventually(() => assert.deepEqual(received[2], localReply));
+  await eventually(() => assert.deepEqual(received[3], localReply));
   send(outgoing);
   assert.deepEqual((await local.waitForData()).payload, outgoing);
   await cloud.expectNoData();
   // Asymmetric failure: the peer disconnects from the LAN, but this Ubuntu
-  // host's local socket stays ready. Replies must follow new cloud observations.
+  // host's local socket stays ready. A stale peer must use the backup.
   const healthyLocal = client.sessions.local;
   local.close();
-  now += 1000;
+  now += 5000;
   const moved = ethernetFrame(own, peerMAC, 'peer lost LAN');
   cloud.seqNo = local.seqNo;
   cloud.sendData(moved);
-  await eventually(() => assert.deepEqual(received[3], moved));
+  await eventually(() => assert.deepEqual(received[4], moved));
   send(outgoing);
   assert.deepEqual((await cloud.waitForData()).payload, outgoing);
   assert.equal(healthyLocal.ready, true);
@@ -254,7 +287,7 @@ test('real TCP + mTLS, one TAP, local failure and automatic recovery', async (t)
   recoveredLocal.seqNo = cloud.seqNo;
   const restored = ethernetFrame(own, peerMAC, 'peer LAN restored');
   recoveredLocal.sendData(restored);
-  await eventually(() => assert.deepEqual(received[4], restored));
+  await eventually(() => assert.deepEqual(received[5], restored));
   send(outgoing);
   assert.deepEqual((await recoveredLocal.waitForData()).payload, outgoing);
   await cloud.expectNoData();

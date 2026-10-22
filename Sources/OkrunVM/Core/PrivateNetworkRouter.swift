@@ -52,12 +52,12 @@ final class PrivateNetworkTransportRouter {
             self.webUpdatedAt = webUpdatedAt
         }
 
-        var hasLocalRoute: Bool {
-            localUpdatedAt != nil
-        }
-
-        var hasWebRoute: Bool {
-            webUpdatedAt != nil
+        func prefersLocal(at date: Date) -> Bool {
+            guard let localUpdatedAt else { return false }
+            // A connected switch is not proof that this particular peer is still
+            // reachable. Keep confirmed LAN routes sticky, but revalidate silent
+            // peers without waiting for the five-minute MAC-table TTL.
+            return date.timeIntervalSince(localUpdatedAt) < PrivateNetworkTransportRouter.localRouteFreshnessInterval
         }
 
         mutating func record(_ route: PrivateNetworkTransportRoute, at date: Date) {
@@ -129,6 +129,7 @@ final class PrivateNetworkTransportRouter {
     private static let defaultMacTtl: TimeInterval = 5 * 60
     private static let remoteFrameDedupTtl: TimeInterval = 0.25
     private static let localRecoveryProbeInterval: TimeInterval = 5
+    private static let localRouteFreshnessInterval: TimeInterval = 5
     private static let defaultRemoteFloodBurstLimit: Double = 256
     private static let defaultRemoteFloodRefillPerSecond: Double = 64
 
@@ -301,8 +302,9 @@ final class PrivateNetworkTransportRouter {
             return discoverySendPlanOnQueue(logsNoReachableTransport: true)
         }
 
-        var plan = sendPlanOnQueue(for: remoteRoute, logsNoReachableTransport: false)
-        if !remoteRoute.hasLocalRoute, remoteRoute.hasWebRoute,
+        let prefersLocal = remoteRoute.prefersLocal(at: currentDate)
+        var plan = sendPlanOnQueue(prefersLocal: prefersLocal, logsNoReachableTransport: false)
+        if !prefersLocal,
            let lastProbe = remoteRoute.localProbeAt,
            currentDate.timeIntervalSince(lastProbe) >= Self.localRecoveryProbeInterval {
             plan.localRecoveryDestination = header.destination
@@ -327,13 +329,9 @@ final class PrivateNetworkTransportRouter {
 
         var entry = remoteRoutes[header.source] ?? RemoteRouteEntry()
         entry.record(route, at: currentDate)
-        if route == .webSwitch && shouldInject {
-            // The peer may have lost its LAN path even while our local switch
-            // is healthy. Follow fresh web traffic instead of blackholing replies
-            // on a five-minute-old local route. A delayed discovery duplicate
-            // must not undo local preference; a new local observation restores it.
-            entry.remove(.localSwitch)
-        }
+        // Web traffic (including distinct broadcasts and delayed duplicates)
+        // does not disprove a confirmed local path. Local freshness, not the
+        // last packet's transport or dedup result, controls preference.
         remoteRoutes[header.source] = entry
         guard shouldInject else { return .drop }
 
@@ -347,26 +345,14 @@ final class PrivateNetworkTransportRouter {
     }
 
     private func sendPlanOnQueue(
-        for remoteRoute: RemoteRouteEntry,
+        prefersLocal: Bool,
         logsNoReachableTransport: Bool
     ) -> LocalFrameSendPlan {
-        if remoteRoute.hasLocalRoute {
+        if prefersLocal {
             return LocalFrameSendPlan(
                 candidates: [
                     TransportCandidate(transport: localSwitch, route: .localSwitch),
                     TransportCandidate(transport: webSwitch, route: .webSwitch)
-                ],
-                sendsToAllReachable: false,
-                logsNoReachableTransport: logsNoReachableTransport,
-                rateLimitsFloodTraffic: false
-            )
-        }
-
-        if remoteRoute.hasWebRoute {
-            return LocalFrameSendPlan(
-                candidates: [
-                    TransportCandidate(transport: webSwitch, route: .webSwitch),
-                    TransportCandidate(transport: localSwitch, route: .localSwitch)
                 ],
                 sendsToAllReachable: false,
                 logsNoReachableTransport: logsNoReachableTransport,
@@ -392,8 +378,8 @@ final class PrivateNetworkTransportRouter {
     private func discoverySendPlanOnQueue(logsNoReachableTransport: Bool) -> LocalFrameSendPlan {
         LocalFrameSendPlan(
             candidates: [
-                TransportCandidate(transport: webSwitch, route: .webSwitch),
-                TransportCandidate(transport: localSwitch, route: .localSwitch)
+                TransportCandidate(transport: localSwitch, route: .localSwitch),
+                TransportCandidate(transport: webSwitch, route: .webSwitch)
             ],
             sendsToAllReachable: true,
             logsNoReachableTransport: logsNoReachableTransport,
@@ -440,7 +426,7 @@ final class PrivateNetworkTransportRouter {
         runOnQueue {
             let currentDate = self.now()
             guard var entry = self.remoteRoutes[destination],
-                  !entry.hasLocalRoute, entry.hasWebRoute,
+                  !entry.prefersLocal(at: currentDate),
                   let lastProbe = entry.localProbeAt,
                   currentDate.timeIntervalSince(lastProbe) >= Self.localRecoveryProbeInterval else {
                 return false

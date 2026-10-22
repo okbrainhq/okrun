@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { NetworkClient, parseLocalEndpoint } = require('./network-client');
 const LOCAL_RECOVERY_PROBE_MS = 5000;
+const LOCAL_ROUTE_FRESHNESS_MS = 5000;
 
 // Mirrors PrivateNetworkTransportRouter: per-MAC local preference, discovery
 // on both transports, cross-transport duplicate suppression, and no bridging.
@@ -32,6 +33,11 @@ class EthernetRouter {
     map.set(key, value);
   }
 
+  prefersLocal(entry, now) {
+    // Session readiness alone cannot establish per-peer LAN reachability.
+    return entry.local !== undefined && now - entry.local < LOCAL_ROUTE_FRESHNESS_MS;
+  }
+
   destinations(frame, reachable) {
     if (frame.length < 14) return [];
     const now = this.now();
@@ -43,9 +49,10 @@ class EthernetRouter {
     if (unicast && this.local.has(dest)) return [];
     const entry = unicast && this.remote.get(dest);
     if (entry) {
-      const order = entry.local !== undefined ? ['local', 'cloud'] : ['cloud', 'local'];
+      const prefersLocal = this.prefersLocal(entry, now);
+      const order = prefersLocal ? ['local', 'cloud'] : ['cloud', 'local'];
       const routes = order.filter((route) => reachable(route));
-      if (entry.local === undefined && routes.length === 2 && now - entry.localProbeAt >= LOCAL_RECOVERY_PROBE_MS) {
+      if (!prefersLocal && routes.length === 2 && now - entry.localProbeAt >= LOCAL_RECOVERY_PROBE_MS) {
         entry.localProbeAt = now;
         // A bounded copy of ordinary traffic discovers recovered LAN peers.
         // Never replace the working cloud path until local traffic is observed,
@@ -54,7 +61,7 @@ class EthernetRouter {
       }
       return routes.slice(0, 1);
     }
-    const routes = ['cloud', 'local'].filter((route) => reachable(route));
+    const routes = ['local', 'cloud'].filter((route) => reachable(route));
     return routes.length && this.allowFlood(now) ? routes : [];
   }
 
@@ -81,10 +88,8 @@ class EthernetRouter {
     // connections remain on the fallback forever after a local-switch outage.
     if (route === 'local' || routes.localProbeAt === undefined) routes.localProbeAt = now;
     routes[route] = now;
-    // A peer can lose its LAN path while our local session is still ready.
-    // Follow fresh cloud traffic, but don't let a delayed discovery duplicate
-    // override local preference. A new local observation restores that route.
-    if (route === 'cloud' && fresh) delete routes.local;
+    // Distinct cloud packets and late duplicates do not disprove a local path.
+    // Only stale local observations or an unavailable session trigger fallback.
     this.remember(this.remote, source, routes);
     return fresh;
   }
@@ -136,7 +141,7 @@ class RoutedNetworkClient extends NetworkClient {
       if (error.code === 'dhcp_range_overlap' && this.config.probeAddress) return this.fail(error);
       this.emit('log', `${route} switch unavailable: ${error.message}; retrying`);
       // Readiness gates forwarding while disconnected. Retain route observations
-      // across retries, unless fresh peer traffic relearns a different path.
+      // across retries; per-peer freshness determines whether to revalidate.
       this.retries.set(route, setTimeout(() => {
         this.retries.delete(route);
         this.join(route);

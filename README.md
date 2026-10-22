@@ -396,18 +396,24 @@ npm run start -- \
 Then open Okrun's **Private Network > Local Switch**, enable it, set the server
 to `127.0.0.1:9444` or another trusted LAN host, and click **Apply & Connect**.
 
-When both Local Switch and Web Switch are configured, discovery uses both and
-learned local peers prefer Local Switch. If either host loses its local path,
-fresh Web Switch traffic relearns that peer's return path immediately, even when
-the receiving host's Local Switch is still connected to other peers. Duplicate
-discovery copies preserve local preference; fresh local traffic restores it.
+When both Local Switch and Web Switch are configured, discovery uses both,
+sending the Local Switch copy first. Confirmed local peers prefer Local Switch;
+Web Switch traffic never overrides a recent local observation, including distinct
+broadcasts or copies arriving outside the duplicate-suppression window.
+If Local Switch disconnects, traffic immediately falls back to Web Switch. If a
+particular peer goes silent locally for five seconds, subsequent unicast traffic
+uses the backup and revalidates the local path. This also handles a peer losing
+its LAN connection while our Local Switch remains connected to other peers,
+without requiring incoming Web Switch traffic or MAC-table expiry. An idle
+peer's first packet after that interval may therefore use both paths.
 While a peer uses Web Switch, ongoing unicast traffic probes the available Local
-Switch with a packet copy at most once every five seconds per peer. The Web
-Switch copy is still sent, so an unreachable or web-only peer stays connected.
-Local replies automatically restore local preference without waiting for ARP
-refresh or MAC-table expiry. Probe copies share the discovery flood limit and
-cross-transport duplicate suppression; fresh web traffic does not reset the
-probe schedule.
+Switch with a packet copy at most once every five seconds per peer, local copy
+first. The Web Switch copy is still sent, so an unreachable or web-only peer stays
+connected. Local traffic immediately restores local preference. Probe copies
+share the discovery flood limit and cross-transport duplicate suppression; fresh
+web traffic does not reset the probe schedule. Both switches still carry broadcast
+and unknown-destination discovery; learned, active local unicast uses only Local
+Switch.
 Both transports share a host identity and outgoing sequence counter across
 reconnects, so failover traffic is not mistaken for old packets by the switch.
 The Ubuntu routed network client follows the same policy.
